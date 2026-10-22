@@ -1,0 +1,12 @@
+/target/
+/dist/
+/state/
+/runtime/
+/client-ui/node_modules/
+/client-ui/dist/
+/admin-ui/node_modules/
+/admin-ui/dist/
+*.log
+__pycache__/
+.env
+.env.*
