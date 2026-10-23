@@ -39,9 +39,7 @@ impl Default for ClientConfig {
                 "starbridge-{}",
                 hostname().to_lowercase().replace([' ', '/', '\\'], "-")
             ),
-            ssh_user: std::env::var("USERNAME")
-                .or_else(|_| std::env::var("USER"))
-                .unwrap_or_else(|_| "user".into()),
+            ssh_user: current_user(),
             allow_relay: true,
             direct_only: false,
         }
@@ -79,6 +77,8 @@ pub struct SshStatus {
     pub port: Option<u16>,
     pub public_key: String,
     pub host_key: String,
+    /// 内置 sshd 只接受运行它的系统账户登录；非空时覆盖配置里的 SSH 用户。
+    pub login_user: String,
     pub message: String,
 }
 
@@ -258,6 +258,7 @@ impl ClientApp {
             port: Some(port),
             host_key,
             public_key: String::new(),
+            login_user: current_user(),
             message: format!(
                 "内置 SSH 服务已启动：127.0.0.1:{port} · {}",
                 privilege_label(privilege)
@@ -654,7 +655,11 @@ async fn login(
         display_name: config.display_name,
         role,
         ssh_alias: config.ssh_alias,
-        ssh_user: config.ssh_user,
+        ssh_user: if ssh.login_user.is_empty() {
+            config.ssh_user
+        } else {
+            ssh.login_user.clone()
+        },
         ssh_privilege: ssh.privilege,
         ssh_public_key: ssh.public_key,
         ssh_host_key: ssh.host_key,
@@ -1219,6 +1224,12 @@ fn validate_config(config: &ClientConfig) -> Result<(), ApiError> {
         return Err(ApiError::bad_request("本机只允许直连时不能允许中继"));
     }
     Ok(())
+}
+
+fn current_user() -> String {
+    std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "user".into())
 }
 
 fn hostname() -> String {
