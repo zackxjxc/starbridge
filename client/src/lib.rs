@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use starbridge_protocol::{
     AuthRequest, AuthResponse, ConnectionPolicy, DeviceInfo, DeviceRegistration, ErrorResponse,
     FrpRoute, HealthResponse, HeartbeatRequest, Role, SessionCreateRequest, SessionInfo,
-    SessionPath, SessionStatus, SessionStatusRequest, new_token, now_unix,
+    SessionPath, SessionStatus, SessionStatusRequest, SshPrivilege, new_token, now_unix,
 };
 use std::{
     path::{Path as FsPath, PathBuf},
@@ -72,6 +72,16 @@ pub struct RuntimeStatus {
     pub message: String,
 }
 
+/// 本机 SSH 准备结果：执行端是内置 sshd，控制端是登录密钥。
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct SshStatus {
+    pub privilege: SshPrivilege,
+    pub port: Option<u16>,
+    pub public_key: String,
+    pub host_key: String,
+    pub message: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ClientSnapshot {
     pub role: Role,
@@ -85,6 +95,8 @@ pub struct ClientSnapshot {
     pub stage: String,
     pub last_error: Option<String>,
     pub runtime: RuntimeStatus,
+    pub ssh: SshStatus,
+    pub ssh_command: Option<String>,
     pub updated_at: u64,
 }
 
@@ -104,6 +116,7 @@ pub struct ClientApp {
     inner: Arc<RwLock<Inner>>,
     http: reqwest::Client,
     frpc_process: Arc<Mutex<Option<tokio::process::Child>>>,
+    sshd_process: Arc<Mutex<Option<tokio::process::Child>>>,
 }
 
 struct Inner {
@@ -117,6 +130,8 @@ struct Inner {
     stage: String,
     last_error: Option<String>,
     runtime: RuntimeStatus,
+    ssh: SshStatus,
+    visitor_port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -137,7 +152,7 @@ impl ClientApp {
         let config = load_json(&root.join("config.json"), ClientConfig::default()).await?;
         let identity = load_json(&root.join("identity.json"), Identity::default()).await?;
         let runtime = runtime_status(&root);
-        Ok(Self {
+        let app = Self {
             inner: Arc::new(RwLock::new(Inner {
                 role,
                 root,
@@ -149,10 +164,131 @@ impl ClientApp {
                 stage: "ready".into(),
                 last_error: None,
                 runtime,
+                ssh: SshStatus::default(),
+                visitor_port: None,
             })),
             http: reqwest::Client::builder().no_proxy().build()?,
             frpc_process: Arc::new(Mutex::new(None)),
+            sshd_process: Arc::new(Mutex::new(None)),
+        };
+        app.prepare_ssh().await;
+        Ok(app)
+    }
+
+    async fn prepare_ssh(&self) {
+        let (role, root, runtime) = {
+            let inner = self.inner.read().await;
+            (inner.role, inner.root.clone(), inner.runtime.clone())
+        };
+        let dir = root.join("ssh");
+        let result = match role {
+            Role::Controller => ensure_key(
+                &runtime_file(&runtime, "ssh-keygen"),
+                &dir.join("id_ed25519"),
+            )
+            .await
+            .map(|public_key| SshStatus {
+                public_key,
+                message: "本机 SSH 登录密钥已就绪".into(),
+                ..SshStatus::default()
+            }),
+            Role::Executor => self.start_sshd(&runtime, &dir).await,
+        };
+        let status = result.unwrap_or_else(|error| SshStatus {
+            message: format!("SSH 准备失败：{error}"),
+            ..SshStatus::default()
+        });
+        self.inner.write().await.ssh = status;
+    }
+
+    /// 以当前用户身份启动内置 sshd，只监听回环地址，只接受同账户控制端的公钥。
+    async fn start_sshd(&self, runtime: &RuntimeStatus, dir: &FsPath) -> anyhow::Result<SshStatus> {
+        if let Some(port) = std::env::var("STARBRIDGE_SSH_PORT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+        {
+            return Ok(SshStatus {
+                port: Some(port),
+                message: format!("使用外部 SSH 服务 127.0.0.1:{port}，权限未知"),
+                ..SshStatus::default()
+            });
+        }
+        let sshd = std::path::absolute(runtime_file(runtime, "sshd"))?;
+        if !sshd.is_file() {
+            anyhow::bail!("缺少 {}", sshd.display());
+        }
+        let dir = std::path::absolute(dir)?;
+        let host_key = ensure_key(
+            &runtime_file(runtime, "ssh-keygen"),
+            &dir.join("host_ed25519"),
+        )
+        .await?;
+        let authorized_keys = dir.join("authorized_keys");
+        if !authorized_keys.is_file() {
+            tokio::fs::write(&authorized_keys, "").await?;
+        }
+        let port = pick_port(23000, 23999)?;
+        let config_path = dir.join("sshd_config");
+        let sftp_server = std::path::absolute(runtime_file(runtime, "sftp-server"))?;
+        tokio::fs::write(&config_path, sshd_config(&dir, &sftp_server, port)).await?;
+        let log_path = dir.join("sshd.log");
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+        let mut child = tokio::process::Command::new(&sshd)
+            .arg("-D")
+            .arg("-e")
+            .arg("-f")
+            .arg(&config_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log.try_clone()?))
+            .stderr(Stdio::from(log))
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| anyhow::anyhow!("启动 sshd 失败: {error}"))?;
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("sshd 启动后退出: {status}，日志见 {}", log_path.display());
+        }
+        *self.sshd_process.lock().await = Some(child);
+        let privilege = detect_privilege();
+        Ok(SshStatus {
+            privilege,
+            port: Some(port),
+            host_key,
+            public_key: String::new(),
+            message: format!(
+                "内置 SSH 服务已启动：127.0.0.1:{port} · {}",
+                privilege_label(privilege)
+            ),
         })
+    }
+
+    async fn sync_authorized_keys(&self, devices: &[DeviceInfo]) {
+        let path = {
+            let inner = self.inner.read().await;
+            if inner.role != Role::Executor || inner.ssh.port.is_none() {
+                return;
+            }
+            inner.root.join("ssh").join("authorized_keys")
+        };
+        let keys = authorized_keys(devices);
+        if tokio::fs::read_to_string(&path).await.ok().as_deref() == Some(keys.as_str()) {
+            return;
+        }
+        if let Err(error) = tokio::fs::write(&path, keys).await {
+            self.inner.write().await.ssh.message = format!("更新 authorized_keys 失败：{error}");
+        }
+    }
+
+    pub async fn stop_sshd(&self) {
+        let mut current = self.sshd_process.lock().await;
+        if let Some(child) = current.as_mut() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+        *current = None;
     }
 
     pub fn router(&self) -> Router {
@@ -225,6 +361,7 @@ impl ClientApp {
         } else {
             Vec::new()
         };
+        self.sync_authorized_keys(&response).await;
         let mut inner = self.inner.write().await;
         inner.devices = response;
         inner.stage = "online".into();
@@ -313,9 +450,18 @@ impl ClientApp {
             .route
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("中心没有返回 FRP 路由参数"))?;
-        let (root, frpc_path) = {
+        let (root, frpc_path, ssh_port, target) = {
             let inner = self.inner.read().await;
-            (inner.root.clone(), inner.runtime.frpc_path.clone())
+            (
+                inner.root.clone(),
+                inner.runtime.frpc_path.clone(),
+                inner.ssh.port,
+                inner
+                    .devices
+                    .iter()
+                    .find(|device| device.node_id == session.target_node_id)
+                    .cloned(),
+            )
         };
         if !FsPath::new(&frpc_path).is_file() {
             anyhow::bail!("缺少 frpc: {frpc_path}");
@@ -323,8 +469,13 @@ impl ClientApp {
         let port = if controller {
             pick_port(22000, 22999)?
         } else {
-            0
+            ssh_port.unwrap_or(22)
         };
+        if controller {
+            if let Some(target) = &target {
+                write_ssh_client_files(&root, target, port).await?;
+            }
+        }
         let config = frpc_config(route, session, controller, port, force_relay);
         let routes = root.join("routes");
         tokio::fs::create_dir_all(&routes).await?;
@@ -355,6 +506,10 @@ impl ClientApp {
             let _ = old.wait().await;
         }
         *current = Some(child);
+        drop(current);
+        if controller {
+            self.inner.write().await.visitor_port = Some(port);
+        }
         Ok(())
     }
 
@@ -467,7 +622,7 @@ async fn login(
     if form.username.trim().is_empty() || form.password.len() < 4 {
         return Err(ApiError::bad_request("请输入账户名称和至少 4 位密码"));
     }
-    let (url, role, node_id, config, identity) = {
+    let (url, role, node_id, config, identity, ssh) = {
         let inner = app.inner.read().await;
         (
             inner.config.server_url.clone(),
@@ -475,6 +630,7 @@ async fn login(
             inner.identity.node_id.clone(),
             inner.config.clone(),
             inner.identity.clone(),
+            inner.ssh.clone(),
         )
     };
     let auth = app
@@ -499,6 +655,9 @@ async fn login(
         role,
         ssh_alias: config.ssh_alias,
         ssh_user: config.ssh_user,
+        ssh_privilege: ssh.privilege,
+        ssh_public_key: ssh.public_key,
+        ssh_host_key: ssh.host_key,
         capabilities: vec!["ssh".into(), "sftp".into(), "scp".into()],
         allow_relay: config.allow_relay,
         direct_only: config.direct_only,
@@ -520,6 +679,7 @@ async fn login(
         .json::<Vec<DeviceInfo>>()
         .await
         .map_err(ApiError::network)?;
+    app.sync_authorized_keys(&devices).await;
     let mut inner = app.inner.write().await;
     inner.auth = Some(auth);
     inner.devices = devices;
@@ -536,6 +696,7 @@ async fn logout(State(app): State<ClientApp>) -> Json<ClientSnapshot> {
     let mut inner = app.inner.write().await;
     inner.auth = None;
     inner.session = None;
+    inner.visitor_port = None;
     inner.stage = "ready".into();
     Json(snapshot(&inner))
 }
@@ -676,6 +837,7 @@ async fn disconnect(State(app): State<ClientApp>) -> Result<Json<ClientSnapshot>
     app.stop_frpc().await;
     let mut inner = app.inner.write().await;
     inner.session = None;
+    inner.visitor_port = None;
     inner.stage = if inner.auth.is_some() {
         "online"
     } else {
@@ -760,8 +922,26 @@ fn snapshot(inner: &Inner) -> ClientSnapshot {
         stage: inner.stage.clone(),
         last_error: inner.last_error.clone(),
         runtime: inner.runtime.clone(),
+        ssh: inner.ssh.clone(),
+        ssh_command: ssh_command(inner),
         updated_at: now_unix(),
     }
+}
+
+/// 当前会话可直接使用的 SSH 命令；只在控制端 visitor 已启动时返回。
+fn ssh_command(inner: &Inner) -> Option<String> {
+    let session = inner.session.as_ref()?;
+    inner.visitor_port?;
+    let target = inner
+        .devices
+        .iter()
+        .find(|device| device.node_id == session.target_node_id)?;
+    let config = std::path::absolute(inner.root.join("ssh").join("config")).ok()?;
+    Some(format!(
+        "ssh -F \"{}\" {}",
+        config.display(),
+        target.ssh_alias
+    ))
 }
 
 fn runtime_status(root: &FsPath) -> RuntimeStatus {
@@ -825,7 +1005,7 @@ fn frpc_config(
     route: &FrpRoute,
     session: &SessionInfo,
     controller: bool,
-    visitor_port: u16,
+    local_port: u16,
     force_relay: bool,
 ) -> String {
     let mode = if force_relay || session.policy == ConnectionPolicy::RelayOnly {
@@ -846,7 +1026,7 @@ fn frpc_config(
             mode,
             route.proxy_name,
             route.secret_key,
-            visitor_port
+            local_port
         ));
     } else {
         config.push_str(&format!(
@@ -854,10 +1034,147 @@ fn frpc_config(
             route.proxy_name,
             mode,
             route.secret_key,
-            std::env::var("STARBRIDGE_SSH_PORT").ok().and_then(|value| value.parse().ok()).unwrap_or(22u16)
+            local_port
         ));
     }
     config
+}
+
+fn runtime_file(runtime: &RuntimeStatus, name: &str) -> PathBuf {
+    let dir = FsPath::new(&runtime.frpc_path)
+        .parent()
+        .map(FsPath::to_path_buf)
+        .unwrap_or_default();
+    dir.join(if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.into()
+    })
+}
+
+/// 生成或读取 ed25519 密钥，返回单行公钥。
+async fn ensure_key(keygen: &FsPath, path: &FsPath) -> anyhow::Result<String> {
+    let public = path.with_extension("pub");
+    if !path.is_file() || !public.is_file() {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let _ = tokio::fs::remove_file(path).await;
+        let _ = tokio::fs::remove_file(&public).await;
+        let output = tokio::process::Command::new(keygen)
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "starbridge", "-f"])
+            .arg(path)
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .map_err(|error| anyhow::anyhow!("无法启动 {}: {error}", keygen.display()))?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "ssh-keygen 退出码 {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+    }
+    Ok(tokio::fs::read_to_string(&public).await?.trim().to_string())
+}
+
+fn ssh_path(path: &FsPath) -> String {
+    format!("\"{}\"", path.display().to_string().replace('\\', "/"))
+}
+
+fn sshd_config(dir: &FsPath, sftp_server: &FsPath, port: u16) -> String {
+    format!(
+        "Port {port}\nListenAddress 127.0.0.1\nHostKey {}\nPidFile {}\nAuthorizedKeysFile {}\nPubkeyAuthentication yes\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nStrictModes no\nSubsystem sftp {}\n",
+        ssh_path(&dir.join("host_ed25519")),
+        ssh_path(&dir.join("sshd.pid")),
+        ssh_path(&dir.join("authorized_keys")),
+        ssh_path(sftp_server),
+    )
+}
+
+/// 同账户控制端的公钥，每行一个。
+fn authorized_keys(devices: &[DeviceInfo]) -> String {
+    devices
+        .iter()
+        .filter(|device| device.role == Role::Controller && !device.ssh_public_key.is_empty())
+        .map(|device| format!("{}\n", device.ssh_public_key))
+        .collect()
+}
+
+fn ssh_client_config(root: &FsPath, target: &DeviceInfo, port: u16) -> String {
+    let dir = root.join("ssh");
+    format!(
+        "Host {}\n  HostName 127.0.0.1\n  Port {port}\n  User {}\n  IdentityFile {}\n  IdentitiesOnly yes\n  HostKeyAlias {}\n  UserKnownHostsFile {}\n  StrictHostKeyChecking {}\n",
+        target.ssh_alias,
+        target.ssh_user,
+        ssh_path(&dir.join("id_ed25519")),
+        target.ssh_alias,
+        ssh_path(&dir.join("known_hosts")),
+        if target.ssh_host_key.is_empty() {
+            "accept-new"
+        } else {
+            "yes"
+        },
+    )
+}
+
+async fn write_ssh_client_files(
+    root: &FsPath,
+    target: &DeviceInfo,
+    port: u16,
+) -> anyhow::Result<()> {
+    let dir = std::path::absolute(root.join("ssh"))?;
+    tokio::fs::create_dir_all(&dir).await?;
+    let root = dir.parent().map(FsPath::to_path_buf).unwrap_or_default();
+    tokio::fs::write(dir.join("config"), ssh_client_config(&root, target, port)).await?;
+    if !target.ssh_host_key.is_empty() {
+        tokio::fs::write(
+            dir.join("known_hosts"),
+            format!("{} {}\n", target.ssh_alias, target.ssh_host_key),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// 检测当前进程权限；sshd 由本进程拉起，权限相同。
+fn detect_privilege() -> SshPrivilege {
+    if cfg!(windows) {
+        let Ok(output) = std::process::Command::new("whoami")
+            .args(["/groups", "/fo", "csv", "/nh"])
+            .output()
+        else {
+            return SshPrivilege::Unknown;
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        if text.contains("S-1-16-16384") {
+            SshPrivilege::System
+        } else if text.contains("S-1-16-12288") {
+            SshPrivilege::Admin
+        } else if text.contains("S-1-16-8192") {
+            SshPrivilege::User
+        } else {
+            SshPrivilege::Unknown
+        }
+    } else {
+        match std::process::Command::new("id").arg("-u").output() {
+            Ok(output) if String::from_utf8_lossy(&output.stdout).trim() == "0" => {
+                SshPrivilege::Admin
+            }
+            Ok(output) if output.status.success() => SshPrivilege::User,
+            _ => SshPrivilege::Unknown,
+        }
+    }
+}
+
+fn privilege_label(privilege: SshPrivilege) -> &'static str {
+    match privilege {
+        SshPrivilege::User => "普通用户权限，执行可能受限",
+        SshPrivilege::Admin => "管理员权限",
+        SshPrivilege::System => "SYSTEM 权限",
+        SshPrivilege::Unknown => "权限未知",
+    }
 }
 
 fn command_available(name: &str) -> bool {
@@ -1017,9 +1334,69 @@ mod tests {
     #[test]
     fn preferred_route_starts_with_xtcp() {
         let info = session(ConnectionPolicy::DirectPreferred);
-        let config = frpc_config(info.route.as_ref().unwrap(), &info, false, 0, false);
+        let config = frpc_config(info.route.as_ref().unwrap(), &info, false, 23000, false);
         assert!(config.contains("type = \"xtcp\""));
-        assert!(config.contains("localPort = 22"));
+        assert!(config.contains("localPort = 23000"));
+    }
+
+    fn device(role: Role, public_key: &str) -> DeviceInfo {
+        DeviceInfo {
+            node_id: "node".into(),
+            account: "alice".into(),
+            display_name: "node".into(),
+            role,
+            ssh_alias: "node-alias".into(),
+            ssh_user: "alice".into(),
+            ssh_privilege: SshPrivilege::User,
+            ssh_public_key: public_key.into(),
+            ssh_host_key: String::new(),
+            capabilities: vec!["ssh".into()],
+            allow_relay: true,
+            direct_only: false,
+            version: "test".into(),
+            os: "windows".into(),
+            arch: "x86_64".into(),
+            hostname: "node".into(),
+            online: true,
+            last_heartbeat: 0,
+        }
+    }
+
+    #[test]
+    fn authorized_keys_only_trust_controllers() {
+        let keys = authorized_keys(&[
+            device(Role::Controller, "ssh-ed25519 AAAA controller"),
+            device(Role::Executor, "ssh-ed25519 BBBB executor"),
+            device(Role::Controller, ""),
+        ]);
+        assert_eq!(keys, "ssh-ed25519 AAAA controller\n");
+    }
+
+    #[test]
+    fn sshd_config_listens_on_loopback_with_keys_only() {
+        let config = sshd_config(
+            FsPath::new("D:\\sb\\ssh"),
+            FsPath::new("D:\\rt\\sftp-server.exe"),
+            23000,
+        );
+        assert!(config.contains("Port 23000\nListenAddress 127.0.0.1\n"));
+        assert!(config.contains("PasswordAuthentication no"));
+        assert!(config.contains("AuthorizedKeysFile \"D:/sb/ssh/authorized_keys\""));
+    }
+
+    #[test]
+    fn ssh_client_config_pins_host_key_when_known() {
+        let mut target = device(Role::Executor, "");
+        assert!(
+            ssh_client_config(FsPath::new("root"), &target, 22000)
+                .contains("StrictHostKeyChecking accept-new")
+        );
+        target.ssh_host_key = "ssh-ed25519 CCCC".into();
+        let config = ssh_client_config(FsPath::new("root"), &target, 22000);
+        assert!(
+            config.contains("Host node-alias\n  HostName 127.0.0.1\n  Port 22000\n  User alice\n")
+        );
+        assert!(config.contains("StrictHostKeyChecking yes"));
     }
 
     #[test]

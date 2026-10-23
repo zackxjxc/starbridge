@@ -52,5 +52,6 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
     app.stop_frpc().await;
+    app.stop_sshd().await;
     Ok(())
 }

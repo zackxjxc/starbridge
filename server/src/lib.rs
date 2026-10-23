@@ -501,6 +501,12 @@ fn validate_registration(registration: &DeviceRegistration) -> Result<(), ApiErr
     if registration.capabilities.is_empty() {
         return Err(ApiError::bad_request("设备至少需要声明一种能力"));
     }
+    if [&registration.ssh_public_key, &registration.ssh_host_key]
+        .iter()
+        .any(|key| key.len() > 1024 || key.contains(['\r', '\n']))
+    {
+        return Err(ApiError::bad_request("SSH 公钥格式错误"));
+    }
     Ok(())
 }
 
@@ -541,6 +547,9 @@ fn list_devices(inner: &Inner, account: Option<&str>) -> Vec<DeviceInfo> {
             role: device.registration.role,
             ssh_alias: device.registration.ssh_alias.clone(),
             ssh_user: device.registration.ssh_user.clone(),
+            ssh_privilege: device.registration.ssh_privilege,
+            ssh_public_key: device.registration.ssh_public_key.clone(),
+            ssh_host_key: device.registration.ssh_host_key.clone(),
             capabilities: device.registration.capabilities.clone(),
             allow_relay: device.registration.allow_relay,
             direct_only: device.registration.direct_only,
@@ -642,6 +651,7 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use starbridge_protocol::SshPrivilege;
 
     fn device(direct_only: bool, allow_relay: bool) -> DeviceRegistration {
         DeviceRegistration {
@@ -651,6 +661,9 @@ mod tests {
             role: Role::Controller,
             ssh_alias: "node".into(),
             ssh_user: "user".into(),
+            ssh_privilege: SshPrivilege::User,
+            ssh_public_key: String::new(),
+            ssh_host_key: String::new(),
             capabilities: vec!["ssh".into()],
             allow_relay,
             direct_only,
@@ -689,6 +702,9 @@ mod tests {
                 role: Role::Executor,
                 ssh_alias: node_id.into(),
                 ssh_user: "user".into(),
+                ssh_privilege: SshPrivilege::User,
+                ssh_public_key: String::new(),
+                ssh_host_key: String::new(),
                 capabilities: vec!["ssh".into()],
                 allow_relay: true,
                 direct_only: false,

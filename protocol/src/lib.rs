@@ -53,6 +53,17 @@ pub enum SessionStatus {
     Closed,
 }
 
+/// 执行端 SSH 服务进程拥有的权限，决定远程命令能做什么。
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SshPrivilege {
+    #[default]
+    Unknown,
+    User,
+    Admin,
+    System,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AuthRequest {
     pub username: String,
@@ -74,6 +85,14 @@ pub struct DeviceRegistration {
     pub role: Role,
     pub ssh_alias: String,
     pub ssh_user: String,
+    #[serde(default)]
+    pub ssh_privilege: SshPrivilege,
+    /// 控制端用于登录执行端的 SSH 公钥。
+    #[serde(default)]
+    pub ssh_public_key: String,
+    /// 执行端 sshd 的主机公钥，控制端据此校验主机身份。
+    #[serde(default)]
+    pub ssh_host_key: String,
     pub capabilities: Vec<String>,
     pub allow_relay: bool,
     pub direct_only: bool,
@@ -91,6 +110,14 @@ pub struct DeviceInfo {
     pub role: Role,
     pub ssh_alias: String,
     pub ssh_user: String,
+    #[serde(default)]
+    pub ssh_privilege: SshPrivilege,
+    /// 控制端用于登录执行端的 SSH 公钥。
+    #[serde(default)]
+    pub ssh_public_key: String,
+    /// 执行端 sshd 的主机公钥，控制端据此校验主机身份。
+    #[serde(default)]
+    pub ssh_host_key: String,
     pub capabilities: Vec<String>,
     pub allow_relay: bool,
     pub direct_only: bool,
