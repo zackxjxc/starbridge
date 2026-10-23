@@ -69,7 +69,7 @@ def main() -> int:
             for member in bundle.namelist():
                 if Path(member).name in names:
                     (destination / Path(member).name).write_bytes(bundle.read(member))
-    for script in Path("deploy/windows").glob("*.bat"):
+    for script in [*Path("deploy/windows").glob("*.bat"), *Path("deploy/windows").glob("*.ps1")]:
         shutil.copy2(script, args.output / script.name)
 
     archive = shutil.make_archive(str(args.output), "zip", args.output.parent, args.output.name)
