@@ -2,16 +2,16 @@
 
 ## 本地工作区
 
-当前工作区为 `D:/Work/starbridge`。旧版 wstunnel 演示项目已保存为 `D:/Work/starbridge-reference-20261022`，不参与新版本构建。当前仓库是新建的本地 Git 仓库，开发阶段只提交本地，不自动推送远程。
+当前工作区为 `E:/Work/starbridge`。旧版 wstunnel 验证项目位于 `E:/Work/starbridge_old/StarBridge`，不参与新版本构建。当前仓库是本地 Git 仓库，开发阶段只提交本地，不自动推送远程。
 
 已验证的本机工具版本：
 
 ```text
-rustc 1.93.0
-cargo 1.93.0
+rustc 1.94.1
+cargo 1.94.1
 node v25.2.1
-npm 11.19.0
-git 2.55.0.windows.4
+npm 11.6.2
+git 2.56.0.windows.2
 ```
 
 ## 本地测试拓扑
@@ -69,3 +69,5 @@ starbridge.zackxjxc.de5.net:17851             frps 原生入口
 - 用户填写无端口的 HTTPS URL，FRP 地址由服务端配置下发。
 - 17850 不是公网服务端口；公网 FRP 端口为 17851。
 - 依赖二进制由构建流程锁定和校验，不在用户运行时静默下载。
+
+线上启动中心时，`--frps-bind-addr` 用于设置服务器本地的 FRPS 监听地址，`--frps-addr` 用于设置下发给端侧的公网可达地址。例如服务器直接监听公网 FRP 端口时使用 `--frps-bind-addr 0.0.0.0 --frps-addr 168.110.58.38`。

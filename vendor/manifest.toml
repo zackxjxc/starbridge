@@ -1,0 +1,16 @@
+# Windows x86_64 开发/发布清单。版本和 SHA-256 来自官方 Release 页面；
+# 更新依赖时必须重新校验压缩包、许可证和连接回归测试。
+
+[[artifact]]
+name = "frp"
+version = "v0.71.1"
+platform = "windows-x86_64"
+url = "https://github.com/fatedier/frp/releases/download/v0.71.1/frp_0.71.1_windows_amd64.zip"
+sha256 = "b90074b2b6a1d792a7a40f085ac6d276bcab2d1bc60201f8a86ca53ce65ce821"
+
+[[artifact]]
+name = "openssh"
+version = "10.4.0.0p1-Preview"
+platform = "windows-x86_64"
+url = "https://github.com/PowerShell/Win32-OpenSSH/releases/download/10.4.0.0p1-Preview/OpenSSH-Win64.zip"
+sha256 = "b67ff8becd203502190ec42ac7787c24c2cd3325ed7700485fe7a1c83d2a7957"

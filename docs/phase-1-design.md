@@ -10,7 +10,7 @@
 
 中心服务器只需要一个 `starbridge-server` 和一个 `frps`。StarBridge 不为每一对节点启动独立 frps，也不通过 CLI 逐连接启动新的 frps；frps 本身支持多节点、多会话和中继。
 
-每个端侧只需要一个 StarBridge 核心进程和一个由核心管理的 frpc。核心通过本机回环 API、配置文件或受控子进程接口驱动 frpc，执行 `route.apply`、`route.remove`、`route.status` 等幂等操作。SSH 客户端仍是独立进程，连接核心为本次会话分配的本地 visitor 端口。
+每个端侧只需要一个 StarBridge 核心进程和一个由核心管理的 frpc。核心通过本机回环 API、配置文件或受控子进程接口驱动 frpc，生成带会话随机数的 XTCP/STCP 路由配置并执行幂等的启动、替换和停止操作。SSH 客户端仍是独立进程，连接核心为本次会话分配的本地 visitor 端口。
 
 ## 连接策略
 

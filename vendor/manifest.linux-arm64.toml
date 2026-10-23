@@ -1,0 +1,8 @@
+# Linux ARM64 中心服务清单。服务器部署前按同样流程下载、校验并保存许可证。
+
+[[artifact]]
+name = "frp"
+version = "v0.71.1"
+platform = "linux-arm64"
+url = "https://github.com/fatedier/frp/releases/download/v0.71.1/frp_0.71.1_linux_arm64.tar.gz"
+sha256 = "8edf590b0c396fa42f9c147121a76af83cfc2002b08f5aef0ea1008c43482019"

@@ -1,0 +1,10 @@
+[package]
+name = "starbridge-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+uuid.workspace = true

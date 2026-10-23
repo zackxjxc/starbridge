@@ -2,6 +2,7 @@
 /dist/
 /state/
 /runtime/
+/.cache/
 /client-ui/node_modules/
 /client-ui/dist/
 /admin-ui/node_modules/

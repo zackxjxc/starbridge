@@ -1,0 +1,19 @@
+[package]
+name = "starbridge-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+starbridge-protocol = { path = "../protocol" }
+tokio = { workspace = true, features = ["process"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
