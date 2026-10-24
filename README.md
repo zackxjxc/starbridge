@@ -61,3 +61,14 @@ cargo run -p starbridge-client -- --role executor --data-dir state/executor-a
 程序会监听动态分配的 `127.0.0.1` 端口并输出本地控制台 URL。登录时使用同一账户名称和密码；开发阶段中心服务会在首次登录时创建本地账户。端侧会完成登录、设备登记、心跳、设备列表和会话策略校验。
 
 目前还没有把真实 `frpc/frps` 二进制提交到仓库。先运行 `python tools/fetch_runtime.py --manifest vendor/manifest.toml --output state/runtime` 准备经过 SHA-256 校验的本机运行时，再用 `starbridge-server --frps-path state/runtime/frps.exe` 启动中心和本地 `frps`。`--frps-bind-addr`（默认 `127.0.0.1`）控制本机 frps 的监听地址，`--frps-addr`（也可写作 `--frps-advertised-addr`）是下发给客户端用于连接 frps 的可达地址；两者可按部署拓扑分别设置。端侧会自动寻找实例目录旁的共享 `state/runtime`，为 `direct_only`、`relay_only` 和 `direct_preferred` 生成受控的 XTCP/STCP 配置并监督 `frpc`；缺少运行时或启动失败时，控制台会明确显示原因。如果 Windows 安全软件拦截 `frpc.exe`，请根据界面提示手动检查并放行。
+
+### macOS（Apple Silicon）
+
+macOS 使用 `vendor/manifest.darwin-arm64.toml`。FRP 下载官方预编译包；OpenSSH 没有官方 macOS 预编译包，系统自带的 `/usr/sbin/sshd` 复制出 `/usr` 后会被系统终止，所以构建时下载 portable 源码，编译出执行端内置 sshd 需要的 `sshd`、`sshd-session`、`sshd-auth`、`ssh-keygen` 和 `sftp-server`。需要先安装 Xcode 命令行工具，用 Python 3.11+ 运行，或者在旧版本里安装 `tomli`：
+
+```sh
+python3 tools/fetch_runtime.py --manifest vendor/manifest.darwin-arm64.toml --output state/runtime
+cargo run -p starbridge-server -- --frps-path state/runtime/frps
+```
+
+如果编译时报 `C compiler cannot create executables`，通常是命令行工具里的 SDK 和编译器版本不匹配，改用 Xcode 自带的 SDK：`SDKROOT=$(xcrun --sdk macosx --show-sdk-path) python3 tools/fetch_runtime.py ...`。

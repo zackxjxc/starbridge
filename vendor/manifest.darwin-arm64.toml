@@ -1,0 +1,20 @@
+# macOS ARM64 开发/发布清单。FRP 的 SHA-256 来自官方 Release 的 frp_sha256_checksums.txt；
+# OpenSSH 的 SHA-256 由 cdn.openbsd.org 和 mirrors.aliyun.com 两个来源下载结果一致后锁定。
+#
+# macOS 没有官方预编译的 OpenSSH，系统自带的 /usr/sbin/sshd 复制出 /usr 后会被系统终止，
+# 因此执行端内置 sshd 在构建时从 portable 源码编译（需要 Xcode 命令行工具）。
+
+[[artifact]]
+name = "frp"
+version = "v0.71.1"
+platform = "darwin-arm64"
+url = "https://github.com/fatedier/frp/releases/download/v0.71.1/frp_0.71.1_darwin_arm64.tar.gz"
+sha256 = "d15d0324b99e14619c9aa46e37f6db588c06a09be4bc6f7948890b6b61077842"
+
+[[artifact]]
+name = "openssh"
+version = "10.6p1"
+platform = "darwin-arm64"
+url = "https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-10.6p1.tar.gz"
+sha256 = "a9dc9565dffe8640f64d863cd29a32bc4a3dbdec0566a7fc44c5d6ee767d5f39"
+build = "openssh-portable"

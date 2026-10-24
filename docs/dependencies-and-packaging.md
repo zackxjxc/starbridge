@@ -101,6 +101,25 @@ StarBridge/
 
 一期优先支持 Windows x86_64 客户端和 Linux ARM64 中心服务器，同时保留 Linux x86_64、Windows ARM64 和 macOS 的目录与清单扩展点。每个平台必须单独锁定 FRP 和 OpenSSH 包，不能把 Windows 可执行文件复制到 Linux 包中。
 
+macOS ARM64 的清单是 `vendor/manifest.darwin-arm64.toml`：
+
+- FRP 使用官方 `frp_<版本>_darwin_arm64.tar.gz`，SHA-256 取自同一 Release 的 `frp_sha256_checksums.txt`。
+- OpenSSH 没有官方 macOS 预编译包；系统自带的 `/usr/sbin/sshd` 带 Apple 平台签名，复制到其他目录后启动会被系统终止（退出码 137）。因此清单下载 `openssh-portable` 源码，`build = "openssh-portable"` 让 `tools/fetch_runtime.py` 在构建时用 `--without-openssl` 编译。StarBridge 只用 ed25519 密钥，OpenSSH 内置的加密实现足够，不依赖 macOS 不提供头文件的 OpenSSL。
+- 源码构建的 `sshd` 会把 `sshd-session` 和 `sshd-auth` 的路径编译成安装前缀，端侧生成 `sshd_config` 时用 `SshdSessionPath`、`SshdAuthPath` 指回运行时目录。
+- OpenSSH 源码包的 SHA-256 是从 `cdn.openbsd.org` 和 `mirrors.aliyun.com` 分别下载、结果一致后锁定的。上游还提供 `.asc` 签名，当前开发机没有 `gpg`，签名尚未校验。
+
+## 待处理项
+
+### 调试联通文件下载路径
+
+在 macOS 开发机上，GitHub Release 下载 FRP 很不稳定：多次出现 `Failed to connect to github.com port 443`、`Connection reset by peer` 和 HTTP/2 帧错误，12.9 MB 的包靠断点续传约 15 分钟才下完。OpenSSH 从 `cdn.openbsd.org` 和 `mirrors.aliyun.com` 下载都正常。
+
+需要确认的事项：
+
+- 构建机访问 `github.com/fatedier/frp/releases` 的稳定方式，例如允许在清单里配置备用镜像地址，SHA-256 保持不变。
+- `tools/fetch_runtime.py` 目前用 `urllib.request.urlretrieve` 一次性下载，没有超时、重试和断点续传，网络差时会长时间卡住或失败。
+- 用 `gpg` 校验 OpenSSH 源码包的 `.asc` 签名，并把校验步骤加进构建流程。
+
 ## 许可证和升级责任
 
 发布物必须包含 FRP、OpenSSH 及其打包中实际携带的第三方许可证和 NOTICE 文件。每次依赖升级都要记录上游版本、下载 URL、SHA-256、发布日期和测试结果。安全漏洞修复优先升级依赖并重新发布，不能在运行时静默替换二进制。

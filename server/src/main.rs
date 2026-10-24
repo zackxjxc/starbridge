@@ -51,15 +51,35 @@ async fn main() -> anyhow::Result<()> {
             args.data_dir.clone(),
         )),
     )
-    .with_graceful_shutdown(async {
-        tokio::signal::ctrl_c().await.ok();
-    })
+    .with_graceful_shutdown(shutdown_signal())
     .await?;
     if let Some(child) = frps.as_mut() {
         let _ = child.kill().await;
         let _ = child.wait().await;
     }
     Ok(())
+}
+
+/// 等待 Ctrl+C；Unix 上同时处理 SIGTERM（kill、systemctl stop）和 SIGHUP，确保 frps 被清理。
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(mut term), Ok(mut hangup)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+        ) else {
+            tokio::signal::ctrl_c().await.ok();
+            return;
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+            _ = hangup.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await.ok();
 }
 
 async fn start_frps(args: &Args) -> anyhow::Result<Option<tokio::process::Child>> {
