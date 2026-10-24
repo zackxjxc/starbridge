@@ -398,11 +398,7 @@ impl ClientApp {
                 .await
             {
                 Ok(()) => {
-                    let path = if session.policy == ConnectionPolicy::RelayOnly {
-                        SessionPath::Relay
-                    } else {
-                        SessionPath::Unknown
-                    };
+                    let path = initial_session_path(session.policy);
                     if let Ok(updated) =
                         update_remote_session(self, &session, SessionStatus::Connected, path, None)
                             .await
@@ -515,7 +511,7 @@ impl ClientApp {
     }
 
     fn spawn_direct_fallback_monitor(&self, session: SessionInfo) {
-        if session.policy != ConnectionPolicy::DirectPreferred {
+        if session.policy == ConnectionPolicy::RelayOnly {
             return;
         }
         let app = self.clone();
@@ -548,7 +544,23 @@ impl ClientApp {
                         }
                     }
                     Some(SessionPath::Relay) => {
-                        if app.start_frpc_mode(&session, true, true).await.is_ok() {
+                        if session.policy == ConnectionPolicy::DirectOnly {
+                            if let Ok(updated) = update_remote_session(
+                                &app,
+                                &session,
+                                SessionStatus::Failed,
+                                SessionPath::Unknown,
+                                Some("XTCP 直连失败，direct_only 策略禁止中继".into()),
+                            )
+                            .await
+                            {
+                                let mut inner = app.inner.write().await;
+                                inner.session = Some(updated);
+                                inner.stage = "direct_failed".into();
+                                inner.last_error =
+                                    Some("XTCP 直连失败，direct_only 策略禁止中继".into());
+                            }
+                        } else if app.start_frpc_mode(&session, true, true).await.is_ok() {
                             if let Ok(updated) = update_remote_session(
                                 &app,
                                 &session,
@@ -782,11 +794,7 @@ async fn connect(
     } else {
         match app.start_frpc(&info, true).await {
             Ok(()) => {
-                let path = if info.policy == ConnectionPolicy::RelayOnly {
-                    SessionPath::Relay
-                } else {
-                    SessionPath::Unknown
-                };
+                let path = initial_session_path(info.policy);
                 if let Ok(updated) =
                     update_remote_session(&app, &info, SessionStatus::Connected, path, None).await
                 {
@@ -1210,6 +1218,13 @@ fn frpc_path_from_log(log: &str) -> Option<SessionPath> {
     }
 }
 
+fn initial_session_path(policy: ConnectionPolicy) -> SessionPath {
+    match policy {
+        ConnectionPolicy::RelayOnly => SessionPath::Relay,
+        ConnectionPolicy::DirectOnly | ConnectionPolicy::DirectPreferred => SessionPath::Unknown,
+    }
+}
+
 fn validate_config(config: &ClientConfig) -> Result<(), ApiError> {
     if config.server_url.trim().is_empty()
         || config.display_name.trim().is_empty()
@@ -1425,5 +1440,17 @@ mod tests {
             Some(SessionPath::Relay)
         );
         assert_eq!(frpc_path_from_log("login to server success"), None);
+    }
+
+    #[test]
+    fn relay_only_is_known_before_connecting() {
+        assert_eq!(
+            initial_session_path(ConnectionPolicy::RelayOnly),
+            SessionPath::Relay
+        );
+        assert_eq!(
+            initial_session_path(ConnectionPolicy::DirectOnly),
+            SessionPath::Unknown
+        );
     }
 }
