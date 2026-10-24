@@ -10,7 +10,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import tarfile
@@ -23,8 +25,11 @@ from pathlib import Path
 def parse_manifest(path: Path) -> list[dict[str, str]]:
     try:
         import tomllib
-    except ModuleNotFoundError as exc:  # pragma: no cover
-        raise SystemExit("Python 3.11+ is required for TOML manifest parsing") from exc
+    except ModuleNotFoundError:  # pragma: no cover
+        try:
+            import tomli as tomllib
+        except ModuleNotFoundError as exc:
+            raise SystemExit("需要 Python 3.11+，或在旧版本中安装 tomli") from exc
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     artifacts = data.get("artifact", [])
     if not isinstance(artifacts, list):
@@ -51,6 +56,35 @@ def sha256(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+# 执行端内置 sshd 需要的程序；macOS 上没有官方预编译包，只能从源码构建。
+OPENSSH_TARGETS = ("sshd", "sshd-session", "sshd-auth", "ssh-keygen", "sftp-server")
+
+
+def build_openssh(unpacked: Path) -> None:
+    sources = [path.parent for path in unpacked.rglob("configure")]
+    if len(sources) != 1:
+        raise SystemExit("OpenSSH 源码包中没有唯一的 configure")
+    source = sources[0]
+    # StarBridge 只用 ed25519 密钥，内置加密实现足够，不依赖系统没有提供头文件的 OpenSSL。
+    steps = (
+        ["./configure", "--without-openssl", "--prefix=/opt/starbridge-openssh"],
+        ["make", f"-j{os.cpu_count() or 2}", *OPENSSH_TARGETS],
+    )
+    for step in steps:
+        print(f"构建 OpenSSH: {' '.join(step)}")
+        result = subprocess.run(step, cwd=source, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise SystemExit(f"OpenSSH 构建失败（{step[0]}）：{(result.stdout + result.stderr)[-2000:]}")
+    for name in OPENSSH_TARGETS:
+        built = source / name
+        if not built.is_file():
+            raise SystemExit(f"OpenSSH 构建后缺少 {name}")
+    # 只保留构建产物，避免源码树里的同名文件被复制进运行时目录。
+    for candidate in list(unpacked.rglob("*")):
+        if candidate.is_file() and candidate.name in OPENSSH_TARGETS and candidate.parent != source:
+            candidate.unlink()
 
 
 def fetch(artifact: dict[str, str], cache: Path, output: Path) -> dict[str, str]:
@@ -81,6 +115,8 @@ def fetch(artifact: dict[str, str], cache: Path, output: Path) -> dict[str, str]
                 bundle.extractall(unpacked, filter="data")
         else:
             raise SystemExit(f"不支持的运行时归档格式: {archive.name}")
+        if artifact.get("build") == "openssh-portable":
+            build_openssh(unpacked)
         output.mkdir(parents=True, exist_ok=True)
         allowed = {
             "frpc.exe",
@@ -100,11 +136,18 @@ def fetch(artifact: dict[str, str], cache: Path, output: Path) -> dict[str, str]
             "ssh",
             "sftp",
             "scp",
+            "ssh-keygen",
+            "sshd",
+            "sshd-session",
+            "sshd-auth",
+            "sftp-server",
         }
         copied: list[str] = []
         for candidate in unpacked.rglob("*"):
             if candidate.is_file() and candidate.name in allowed:
                 destination = output / candidate.name
+                # 先删除旧文件，避免目标是软链接时写穿到链接指向的位置。
+                destination.unlink(missing_ok=True)
                 shutil.copy2(candidate, destination)
                 copied.append(candidate.name)
         if not copied:

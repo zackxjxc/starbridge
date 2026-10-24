@@ -365,9 +365,21 @@ impl ClientApp {
         self.sync_authorized_keys(&response).await;
         let mut inner = self.inner.write().await;
         inner.devices = response;
-        inner.stage = "online".into();
-        inner.last_error = None;
+        // 有会话时保留建联阶段和回退原因，只在空闲或从心跳失败恢复时回到 online。
+        if inner.session.is_none() || inner.stage == "heartbeat_failed" {
+            inner.stage = "online".into();
+            inner.last_error = None;
+        }
         let assigned_session = assigned.first().cloned();
+        // 中心只返回未结束的会话；本地还有会话但中心已经不再分配，说明控制端已断开或会话已失败。
+        if role == Role::Executor && assigned_session.is_none() && inner.session.is_some() {
+            inner.session = None;
+            inner.stage = "online".into();
+            inner.last_error = None;
+            drop(inner);
+            self.stop_frpc().await;
+            return Ok(());
+        }
         let should_start = assigned_session.as_ref().is_some_and(|session| {
             inner.session.as_ref().is_none_or(|old| {
                 old.session_id != session.session_id
@@ -398,7 +410,12 @@ impl ClientApp {
                 .await
             {
                 Ok(()) => {
-                    let path = initial_session_path(session.policy);
+                    // 路径由控制端根据 visitor 日志判定，执行端不能把已判定的路径覆盖回 unknown。
+                    let path = if session.policy == ConnectionPolicy::RelayOnly {
+                        SessionPath::Relay
+                    } else {
+                        session.path
+                    };
                     if let Ok(updated) =
                         update_remote_session(self, &session, SessionStatus::Connected, path, None)
                             .await
@@ -416,7 +433,8 @@ impl ClientApp {
                     }
                     .into();
                     inner.last_error = Some(format!(
-                        "执行端 frpc 路由启动失败：{error}。请检查 Windows Defender、杀毒软件或企业安全策略；StarBridge 不会自动修改白名单。"
+                        "执行端 frpc 路由启动失败：{error}。{}",
+                        security_hint()
                     ));
                     drop(inner);
                     let _ = update_remote_session(
@@ -510,6 +528,8 @@ impl ClientApp {
         Ok(())
     }
 
+    /// 跟踪 visitor 日志判定实际路径。XTCP 要等第一条 SSH 连接才开始打洞，
+    /// 所以一直跟踪到会话结束，而不是只看启动后的固定时长。
     fn spawn_direct_fallback_monitor(&self, session: SessionInfo) {
         if session.policy == ConnectionPolicy::RelayOnly {
             return;
@@ -520,8 +540,19 @@ impl ClientApp {
             let log_path = root
                 .join("routes")
                 .join(format!("{}.log", session.session_id));
-            for _ in 0..60 {
+            let mut reported_failure = false;
+            loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let active = app
+                    .inner
+                    .read()
+                    .await
+                    .session
+                    .as_ref()
+                    .is_some_and(|current| current.session_id == session.session_id);
+                if !active {
+                    break;
+                }
                 let log = match tokio::fs::read_to_string(&log_path).await {
                     Ok(log) => log,
                     Err(_) => continue,
@@ -542,25 +573,12 @@ impl ClientApp {
                             inner.stage = "direct".into();
                             inner.last_error = None;
                         }
+                        break;
                     }
-                    Some(SessionPath::Relay) => {
-                        if session.policy == ConnectionPolicy::DirectOnly {
-                            if let Ok(updated) = update_remote_session(
-                                &app,
-                                &session,
-                                SessionStatus::Failed,
-                                SessionPath::Unknown,
-                                Some("XTCP 直连失败，direct_only 策略禁止中继".into()),
-                            )
-                            .await
-                            {
-                                let mut inner = app.inner.write().await;
-                                inner.session = Some(updated);
-                                inner.stage = "direct_failed".into();
-                                inner.last_error =
-                                    Some("XTCP 直连失败，direct_only 策略禁止中继".into());
-                            }
-                        } else if app.start_frpc_mode(&session, true, true).await.is_ok() {
+                    Some(SessionPath::Relay)
+                        if session.policy == ConnectionPolicy::DirectPreferred =>
+                    {
+                        if app.start_frpc_mode(&session, true, true).await.is_ok() {
                             if let Ok(updated) = update_remote_session(
                                 &app,
                                 &session,
@@ -576,10 +594,26 @@ impl ClientApp {
                                 inner.last_error = Some("XTCP 直连失败，已回退到 FRPS 中转".into());
                             }
                         }
+                        break;
                     }
-                    _ => continue,
+                    // 只允许直连时不回退；记录失败原因，visitor 会在下一条连接时重新打洞。
+                    Some(SessionPath::Relay) if !reported_failure => {
+                        reported_failure = true;
+                        let reason = "XTCP 直连失败，本次连接只允许直连，不会回退到中转";
+                        let _ = update_remote_session(
+                            &app,
+                            &session,
+                            SessionStatus::Connected,
+                            SessionPath::Unknown,
+                            Some(reason.into()),
+                        )
+                        .await;
+                        let mut inner = app.inner.write().await;
+                        inner.stage = "direct_failed".into();
+                        inner.last_error = Some(reason.into());
+                    }
+                    _ => {}
                 }
-                break;
             }
         });
     }
@@ -760,9 +794,10 @@ async fn connect(
     if !runtime.frpc_available {
         let mut inner = app.inner.write().await;
         inner.stage = "runtime_missing".into();
-        inner.last_error = Some(
-            "未找到 runtime/frpc.exe。请先按 vendor/manifest.toml 准备并校验 FRP 运行时。".into(),
-        );
+        inner.last_error = Some(format!(
+            "未找到 {}。请先运行 tools/fetch_runtime.py，按本平台的 vendor/manifest*.toml 准备并校验 FRP 运行时。",
+            runtime.frpc_path
+        ));
         drop(inner);
         if let Ok(updated) = update_remote_session(
             &app,
@@ -779,9 +814,7 @@ async fn connect(
     } else if let Err(error) = probe_frpc(&runtime.frpc_path) {
         let mut inner = app.inner.write().await;
         inner.stage = "frpc_blocked".into();
-        inner.last_error = Some(format!(
-            "frpc 启动检查失败：{error}。请检查 Windows Defender、杀毒软件或企业安全策略；StarBridge 不会自动修改白名单。"
-        ));
+        inner.last_error = Some(format!("frpc 启动检查失败：{error}。{}", security_hint()));
         drop(inner);
         let _ = update_remote_session(
             &app,
@@ -808,9 +841,7 @@ async fn connect(
             Err(error) => {
                 let mut inner = app.inner.write().await;
                 inner.stage = "frpc_failed".into();
-                inner.last_error = Some(format!(
-                    "frpc 路由启动失败：{error}。请检查 Windows Defender、杀毒软件或企业安全策略；StarBridge 不会自动修改白名单。"
-                ));
+                inner.last_error = Some(format!("frpc 路由启动失败：{error}。{}", security_hint()));
                 drop(inner);
                 let _ = update_remote_session(
                     &app,
@@ -1097,13 +1128,23 @@ fn ssh_path(path: &FsPath) -> String {
 }
 
 fn sshd_config(dir: &FsPath, sftp_server: &FsPath, port: u16) -> String {
-    format!(
+    let mut config = format!(
         "Port {port}\nListenAddress 127.0.0.1\nHostKey {}\nPidFile {}\nAuthorizedKeysFile {}\nPubkeyAuthentication yes\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nStrictModes no\nSubsystem sftp {}\n",
         ssh_path(&dir.join("host_ed25519")),
         ssh_path(&dir.join("sshd.pid")),
         ssh_path(&dir.join("authorized_keys")),
         ssh_path(sftp_server),
-    )
+    );
+    // 源码构建的 sshd 把 sshd-session/sshd-auth 的路径编译成安装前缀，需要改指运行时目录。
+    if !cfg!(windows) {
+        let runtime = sftp_server.parent().unwrap_or(FsPath::new(""));
+        config.push_str(&format!(
+            "SshdSessionPath {}\nSshdAuthPath {}\n",
+            ssh_path(&runtime.join("sshd-session")),
+            ssh_path(&runtime.join("sshd-auth")),
+        ));
+    }
+    config
 }
 
 /// 同账户控制端的公钥，每行一个。
@@ -1250,7 +1291,37 @@ fn current_user() -> String {
 fn hostname() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "starbridge-node".into())
+        .ok()
+        .or_else(system_hostname)
+        .unwrap_or_else(|| "starbridge-node".into())
+}
+
+/// macOS 和多数 Linux 默认不导出 HOSTNAME 环境变量，向系统查询主机名。
+fn system_hostname() -> Option<String> {
+    let mut command = if cfg!(target_os = "macos") {
+        let mut command = std::process::Command::new("scutil");
+        command.args(["--get", "LocalHostName"]);
+        command
+    } else {
+        std::process::Command::new("hostname")
+    };
+    let output = command
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// frpc/sshd 被拦截时给用户的人工排查提示；StarBridge 不自动修改系统安全设置。
+fn security_hint() -> &'static str {
+    if cfg!(windows) {
+        "请检查 Windows Defender、杀毒软件或企业安全策略；StarBridge 不会自动修改白名单。"
+    } else if cfg!(target_os = "macos") {
+        "请检查“系统设置 → 隐私与安全性”或企业安全软件是否阻止了该程序；StarBridge 不会自动修改安全设置。"
+    } else {
+        "请检查安全软件或系统策略是否阻止了该程序；StarBridge 不会自动修改安全设置。"
+    }
 }
 
 async fn load_json<T: for<'de> Deserialize<'de> + Serialize>(
