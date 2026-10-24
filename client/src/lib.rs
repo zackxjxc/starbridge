@@ -151,6 +151,10 @@ impl ClientApp {
         tokio::fs::create_dir_all(&root).await?;
         let config = load_json(&root.join("config.json"), ClientConfig::default()).await?;
         let identity = load_json(&root.join("identity.json"), Identity::default()).await?;
+        let persisted_auth: Option<AuthResponse> =
+            load_json(&root.join("auth.json"), None::<AuthResponse>).await?;
+        let auth = persisted_auth.filter(|value| value.expires_at > now_unix());
+        let restoring = auth.is_some();
         let runtime = runtime_status(&root);
         let app = Self {
             inner: Arc::new(RwLock::new(Inner {
@@ -158,10 +162,10 @@ impl ClientApp {
                 root,
                 config,
                 identity,
-                auth: None,
+                auth,
                 devices: Vec::new(),
                 session: None,
-                stage: "ready".into(),
+                stage: if restoring { "restoring" } else { "ready" }.into(),
                 last_error: None,
                 runtime,
                 ssh: SshStatus::default(),
@@ -315,8 +319,18 @@ impl ClientApp {
                 if let Err(error) = app.heartbeat_once().await {
                     let mut inner = app.inner.write().await;
                     if inner.auth.is_some() {
+                        if error
+                            .downcast_ref::<reqwest::Error>()
+                            .and_then(reqwest::Error::status)
+                            == Some(StatusCode::UNAUTHORIZED)
+                        {
+                            inner.auth = None;
+                            let _ = tokio::fs::remove_file(inner.root.join("auth.json")).await;
+                            inner.stage = "ready".into();
+                        } else {
+                            inner.stage = "heartbeat_failed".into();
+                        }
                         inner.last_error = Some(error.to_string());
-                        inner.stage = "heartbeat_failed".into();
                     }
                 }
             }
@@ -732,11 +746,14 @@ async fn login(
         .map_err(ApiError::network)?;
     app.sync_authorized_keys(&devices).await;
     let mut inner = app.inner.write().await;
-    inner.auth = Some(auth);
+    inner.auth = Some(auth.clone());
     inner.devices = devices;
     inner.stage = "online".into();
     inner.last_error = None;
     save_json(&inner.root.join("identity.json"), &identity)
+        .await
+        .map_err(ApiError::internal)?;
+    save_json(&inner.root.join("auth.json"), &auth)
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(snapshot(&inner)))
@@ -749,6 +766,7 @@ async fn logout(State(app): State<ClientApp>) -> Json<ClientSnapshot> {
     inner.session = None;
     inner.visitor_port = None;
     inner.stage = "ready".into();
+    let _ = tokio::fs::remove_file(inner.root.join("auth.json")).await;
     Json(snapshot(&inner))
 }
 
