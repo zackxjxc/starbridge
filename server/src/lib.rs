@@ -8,7 +8,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use starbridge_protocol::{
-    AuthRequest, AuthResponse, ConnectionPolicy, DeviceInfo, DeviceRegistration, ErrorResponse,
+    AuthRequest, AuthResponse, AuthRefreshRequest, AuthLogoutRequest, ConnectionPolicy,
+    DeviceInfo, DeviceRegistration, DeviceMetadataUpdate, ErrorResponse,
     FrpRoute, HealthResponse, HeartbeatRequest, SessionCreateRequest, SessionInfo,
     SessionPath, SessionStatus, SessionStatusRequest, new_id, now_unix,
 };
@@ -17,7 +18,10 @@ use std::{
     path::{Path as FsPath, PathBuf},
     sync::Arc,
 };
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
+
+mod diagnostics;
+pub use diagnostics::{DiagnosticIntegration, diagnostic_plugin_app};
 
 const ADMIN_HTML: &str = include_str!("../../admin-ui/index.html");
 
@@ -25,6 +29,8 @@ const ADMIN_HTML: &str = include_str!("../../admin-ui/index.html");
 pub struct AppState {
     inner: Arc<RwLock<Inner>>,
     data_path: Arc<PathBuf>,
+    persist_lock: Arc<Mutex<()>>,
+    diagnostics: Arc<RwLock<Option<DiagnosticIntegration>>>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -39,14 +45,25 @@ struct StoredDevice {
     registration: DeviceRegistration,
     last_heartbeat: u64,
     status: String,
+    #[serde(default)]
+    metadata_edited: bool,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct RefreshGrant {
+    username: String,
+    expires_at: u64,
+    access_token_hash: String,
 }
 
 #[derive(Default)]
 struct Inner {
     accounts: HashMap<String, Account>,
     tokens: HashMap<String, (String, u64)>,
+    refresh_grants: HashMap<String, RefreshGrant>,
     devices: HashMap<String, StoredDevice>,
     sessions: HashMap<String, SessionInfo>,
+    diagnostics: HashMap<String, diagnostics::DiagnosticRecord>,
     frp_server_addr: String,
     frp_server_port: u16,
     frp_auth_token: String,
@@ -57,6 +74,8 @@ struct PersistedState {
     accounts: HashMap<String, Account>,
     devices: HashMap<String, StoredDevice>,
     sessions: HashMap<String, SessionInfo>,
+    #[serde(default)]
+    refresh_grants: HashMap<String, RefreshGrant>,
 }
 
 impl AppState {
@@ -108,16 +127,20 @@ impl AppState {
                     .map(|state| state.devices.clone())
                     .unwrap_or_default(),
                 sessions,
+                refresh_grants: persisted.as_ref().map(|state| state.refresh_grants.clone()).unwrap_or_default(),
                 frp_server_addr: address,
                 frp_server_port: port,
                 frp_auth_token: token,
                 ..Inner::default()
             })),
             data_path: Arc::new(data_path),
+            persist_lock: Arc::new(Mutex::new(())),
+            diagnostics: Arc::new(RwLock::new(None)),
         }
     }
 
     async fn persist(&self) {
+        let _writing = self.persist_lock.lock().await;
         let inner = self.inner.read().await;
         if let Err(error) = persist_inner(&self.data_path, &inner) {
             tracing::error!(%error, "保存中心服务状态失败");
@@ -155,6 +178,7 @@ fn persist_inner(data_path: &FsPath, inner: &Inner) -> anyhow::Result<()> {
         accounts: inner.accounts.clone(),
         devices: inner.devices.clone(),
         sessions: inner.sessions.clone(),
+        refresh_grants: inner.refresh_grants.clone(),
     })?;
     let path = data_path.join("server-state.json");
     let pending = data_path.join("server-state.pending");
@@ -173,9 +197,13 @@ pub fn app(state: AppState) -> Router {
         .route("/admin", get(admin))
         .route("/api/health", get(health))
         .route("/api/v1/auth/login", post(login))
+        .route("/api/v1/auth/register", post(register_account))
+        .route("/api/v1/auth/refresh", post(refresh_auth))
+        .route("/api/v1/auth/logout", post(logout_auth))
         .route("/api/v1/devices/register", post(register_device))
         .route("/api/v1/devices/heartbeat", post(heartbeat))
         .route("/api/v1/devices", get(devices))
+        .route("/api/v1/devices/{id}", axum::routing::put(update_device_metadata))
         .route("/api/v1/admin/summary", get(admin_summary))
         .route("/api/v1/sessions", post(create_session))
         .route(
@@ -187,6 +215,10 @@ pub fn app(state: AppState) -> Router {
             get(get_session).delete(delete_session),
         )
         .route("/api/v1/sessions/{id}/status", post(update_session))
+        .route("/api/v1/diagnostics", post(diagnostics::create))
+        .route("/api/v1/diagnostics/current/{node_id}", get(diagnostics::current).delete(diagnostics::close_current))
+        .route("/api/v1/diagnostics/{id}", get(diagnostics::get).delete(diagnostics::close))
+        .route("/api/v1/diagnostics/{id}/status", post(diagnostics::update))
         .with_state(state)
 }
 
@@ -212,39 +244,95 @@ async fn login(
             "用户名不能为空，密码至少需要 4 个字符",
         ));
     }
-    let password_hash = password_digest(&request.password);
     let mut inner = state.inner.write().await;
-    if let Some(account) = inner.accounts.get(&username) {
-        if account.password != password_hash {
-            return Err(ApiError::unauthorized("账户密码不正确"));
-        }
-    } else {
-        inner.accounts.insert(
-            username.clone(),
-            Account {
-                password: password_hash,
-            },
-        );
+    if !inner.accounts.get(&username).is_some_and(|account| account.password == password_digest(&request.password)) {
+        return Err(ApiError::unauthorized("账户不存在或密码不正确，请检查后登录或注册"));
     }
+    let response = issue_auth(&mut inner, username);
+    persist_inner(&state.data_path, &inner).map_err(ApiError::internal)?;
+    Ok(Json(response))
+}
+
+async fn register_account(
+    State(state): State<AppState>,
+    Json(request): Json<AuthRequest>,
+) -> Result<Json<AuthResponse>, ApiError> {
+    let username = request.username.trim().to_string();
+    if username.is_empty() || username.len() > 128 || request.password.len() < 4 {
+        return Err(ApiError::bad_request("用户名不能为空，密码至少需要 4 个字符"));
+    }
+    let mut inner = state.inner.write().await;
+    if inner.accounts.contains_key(&username) {
+        return Err(ApiError::conflict("账户名称已存在，请直接登录"));
+    }
+    inner.accounts.insert(username.clone(), Account { password: password_digest(&request.password) });
+    let response = issue_auth(&mut inner, username);
+    persist_inner(&state.data_path, &inner).map_err(ApiError::internal)?;
+    Ok(Json(response))
+}
+
+fn issue_auth(inner: &mut Inner, username: String) -> AuthResponse {
+    let now = now_unix();
+    inner.tokens.retain(|_, (_, deadline)| *deadline > now);
+    inner.refresh_grants.retain(|_, grant| grant.expires_at > now);
     let token = starbridge_protocol::new_token();
-    let expires_at = now_unix() + 86_400;
-    inner
-        .tokens
-        .insert(token.clone(), (username.clone(), expires_at));
-    let response = Json(AuthResponse {
+    let refresh_token = starbridge_protocol::new_token();
+    let expires_at = now + 86_400;
+    let refresh_expires_at = now + 30 * 86_400;
+    inner.tokens.insert(token.clone(), (username.clone(), expires_at));
+    inner.refresh_grants.insert(password_digest(&refresh_token), RefreshGrant {
+        username: username.clone(), expires_at: refresh_expires_at, access_token_hash: password_digest(&token),
+    });
+    AuthResponse {
         access_token: token,
         username,
         expires_at,
-    });
-    drop(inner);
-    state.persist().await;
-    Ok(response)
+        refresh_token: Some(refresh_token),
+        refresh_expires_at: Some(refresh_expires_at),
+    }
+}
+
+async fn refresh_auth(
+    State(state): State<AppState>,
+    Json(request): Json<AuthRefreshRequest>,
+) -> Result<Json<AuthResponse>, ApiError> {
+    let mut inner = state.inner.write().await;
+    let key = password_digest(&request.refresh_token);
+    let grant = inner.refresh_grants.get(&key).cloned()
+        .filter(|grant| grant.expires_at > now_unix() && inner.accounts.contains_key(&grant.username))
+        .ok_or_else(|| ApiError::unauthorized("登录状态已失效，请重新登录"))?;
+    // Rotation and old-access revocation occur under the same write lock.
+    inner.refresh_grants.remove(&key);
+    inner.tokens.retain(|token, _| password_digest(token) != grant.access_token_hash);
+    let response = issue_auth(&mut inner, grant.username);
+    persist_inner(&state.data_path, &inner).map_err(ApiError::internal)?;
+    Ok(Json(response))
+}
+
+async fn logout_auth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AuthLogoutRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut inner = state.inner.write().await;
+    if let Some(token) = request.refresh_token {
+        if let Some(grant) = inner.refresh_grants.remove(&password_digest(&token)) {
+            inner.tokens.retain(|access, _| password_digest(access) != grant.access_token_hash);
+        }
+    }
+    if let Some(access) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")) {
+        inner.tokens.remove(access);
+        let digest = password_digest(access);
+        inner.refresh_grants.retain(|_, grant| grant.access_token_hash != digest);
+    }
+    persist_inner(&state.data_path, &inner).map_err(ApiError::internal)?;
+    Ok(Json(serde_json::json!({"ok": true})))
 }
 
 async fn register_device(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(registration): Json<DeviceRegistration>,
+    Json(mut registration): Json<DeviceRegistration>,
 ) -> Result<Json<Vec<DeviceInfo>>, ApiError> {
     let account = authenticate(&state, &headers).await?;
     validate_registration(&registration)?;
@@ -252,11 +340,16 @@ async fn register_device(
     if registration.direct_only && registration.allow_relay {
         return Err(ApiError::bad_request("只允许直连的节点不能同时允许中继"));
     }
-    if let Some(existing) = inner.devices.get(&registration.node_id) {
+    let metadata_edited = if let Some(existing) = inner.devices.get(&registration.node_id) {
         if existing.account != account || existing.device_token != registration.device_token {
             return Err(ApiError::conflict("设备身份凭据与已有登记不一致"));
         }
-    }
+        if existing.metadata_edited {
+            registration.display_name = existing.registration.display_name.clone();
+            registration.purpose = existing.registration.purpose.clone();
+        }
+        existing.metadata_edited
+    } else { false };
     let account_name = account.clone();
     inner.devices.insert(
         registration.node_id.clone(),
@@ -266,12 +359,32 @@ async fn register_device(
             registration,
             last_heartbeat: now_unix(),
             status: "online".to_string(),
+            metadata_edited,
         },
     );
     let response = Json(list_devices(&inner, Some(&account_name)));
     drop(inner);
     state.persist().await;
     Ok(response)
+}
+
+async fn update_device_metadata(
+    State(state): State<AppState>, headers: HeaderMap, Path(id): Path<String>,
+    Json(request): Json<DeviceMetadataUpdate>,
+) -> Result<Json<Vec<DeviceInfo>>, ApiError> {
+    let account = authenticate(&state, &headers).await?;
+    if request.display_name.as_ref().is_some_and(|name| name.trim().is_empty() || name.chars().count() > 80)
+        || request.purpose.as_ref().is_some_and(|purpose| purpose.chars().count() > 240) {
+        return Err(ApiError::bad_request("设备名称不能为空且最多80字，用途最多240字"));
+    }
+    let mut inner = state.inner.write().await;
+    let device = inner.devices.get_mut(&id).ok_or_else(|| ApiError::not_found("设备不存在"))?;
+    if device.account != account { return Err(ApiError::forbidden("不能修改其他账户的设备")); }
+    if let Some(name) = request.display_name { device.registration.display_name = name.trim().into(); }
+    if let Some(purpose) = request.purpose { device.registration.purpose = purpose.trim().into(); }
+    device.metadata_edited = true;
+    persist_inner(&state.data_path, &inner).map_err(ApiError::internal)?;
+    Ok(Json(list_devices(&inner, Some(&account))))
 }
 
 async fn heartbeat(
@@ -290,6 +403,8 @@ async fn heartbeat(
     }
     device.last_heartbeat = now_unix();
     device.status = request.status;
+    expire_sessions(&mut inner, now_unix());
+    diagnostics::expire(&mut inner, now_unix());
     Ok(Json(list_devices(&inner, Some(&account))))
 }
 
@@ -298,7 +413,9 @@ async fn devices(
     headers: HeaderMap,
 ) -> Result<Json<Vec<DeviceInfo>>, ApiError> {
     let account = authenticate(&state, &headers).await?;
-    let inner = state.inner.read().await;
+    let mut inner = state.inner.write().await;
+    expire_sessions(&mut inner, now_unix());
+    diagnostics::expire(&mut inner, now_unix());
     Ok(Json(list_devices(&inner, Some(&account))))
 }
 
@@ -344,6 +461,8 @@ async fn create_session(
 ) -> Result<Json<SessionInfo>, ApiError> {
     let account = authenticate(&state, &headers).await?;
     let mut inner = state.inner.write().await;
+    expire_sessions(&mut inner, now_unix());
+    diagnostics::expire(&mut inner, now_unix());
     let initiator = authenticate_device(
         &inner,
         &account,
@@ -353,10 +472,8 @@ async fn create_session(
     if !is_online(initiator) {
         return Err(ApiError::conflict("发起节点当前离线"));
     }
-    if !has_capability(&initiator.registration, "ssh_client")
-        || initiator.registration.ssh_public_key.is_empty()
-    {
-        return Err(ApiError::conflict("发起节点的 SSH 登录密钥尚未就绪"));
+    if !has_capability(&initiator.registration, "ssh_client") {
+        return Err(ApiError::conflict("发起节点不支持 SSH 连接"));
     }
     if request.initiator_node_id == request.target_node_id {
         return Err(ApiError::bad_request("不能连接本机节点"));
@@ -376,18 +493,22 @@ async fn create_session(
         return Err(ApiError::conflict("目标节点尚未允许 SSH 访问或 SSH 服务未就绪"));
     }
     let target_registration = target.registration.clone();
+    if let Some(existing) = inner.sessions.values().find(|session| is_active(session)
+        && session.initiator_node_id == request.initiator_node_id && session.target_node_id == request.target_node_id) {
+        return Ok(Json(existing.clone()));
+    }
+    if diagnostics::occupied(&inner, &request.initiator_node_id) || diagnostics::occupied(&inner, &request.target_node_id) {
+        return Err(ApiError::conflict("设备正在连接测试，请等待测试结束"));
+    }
+    if inner.sessions.values().any(|session| is_active(session) && session.target_node_id == request.initiator_node_id) {
+        return Err(ApiError::conflict("本机正在被其他设备连接，不能发起新连接"));
+    }
+    if inner.sessions.values().any(|session| is_active(session)
+        && (session.target_node_id == request.target_node_id || session.initiator_node_id == request.target_node_id)) {
+        return Err(ApiError::conflict("目标设备已参与其他连接，当前被占用"));
+    }
     let policy = effective_policy(request.policy, &initiator_registration, &target_registration)?;
     let created_at = now_unix();
-    expire_sessions(&mut inner, created_at);
-    for session in inner.sessions.values_mut() {
-        if session.initiator_node_id == request.initiator_node_id
-            && session.target_node_id == request.target_node_id
-            && is_active(session)
-        {
-            session.status = SessionStatus::Closed;
-            session.failure_reason = Some("已由新的同向连接替换".into());
-        }
-    }
     let session_id = new_id();
     let proxy_name = format!(
         "sb-{}-{}",
@@ -454,7 +575,8 @@ async fn get_session(
     Path(id): Path<String>,
 ) -> Result<Json<SessionInfo>, ApiError> {
     let account = authenticate(&state, &headers).await?;
-    let inner = state.inner.read().await;
+    let mut inner = state.inner.write().await;
+    expire_sessions(&mut inner, now_unix());
     let session = inner
         .sessions
         .get(&id)
@@ -471,6 +593,7 @@ async fn update_session(
 ) -> Result<Json<SessionInfo>, ApiError> {
     let account = authenticate(&state, &headers).await?;
     let mut inner = state.inner.write().await;
+    expire_sessions(&mut inner, now_unix());
     let existing = inner
         .sessions
         .get(&id)
@@ -516,7 +639,8 @@ fn validate_registration(registration: &DeviceRegistration) -> Result<(), ApiErr
         || registration.node_id.len() > 128
         || registration.device_token.trim().is_empty()
         || registration.display_name.trim().is_empty()
-        || registration.display_name.len() > 80
+        || registration.display_name.chars().count() > 80
+        || registration.purpose.chars().count() > 240
         || registration.ssh_alias.trim().is_empty()
     {
         return Err(ApiError::bad_request("设备身份或显示名称格式错误"));
@@ -564,6 +688,10 @@ fn list_devices(inner: &Inner, account: Option<&str>) -> Vec<DeviceInfo> {
             node_id: device.registration.node_id.clone(),
             account: device.account.clone(),
             display_name: device.registration.display_name.clone(),
+            purpose: device.registration.purpose.clone(),
+            occupancy: occupancy(inner, &device.registration.node_id).0,
+            occupied_by: occupancy(inner, &device.registration.node_id).1,
+            outgoing_count: inner.sessions.values().filter(|session| is_active(session) && session.initiator_node_id == device.registration.node_id).count(),
             role: device.registration.role,
             ssh_alias: device.registration.ssh_alias.clone(),
             ssh_user: device.registration.ssh_user.clone(),
@@ -581,6 +709,17 @@ fn list_devices(inner: &Inner, account: Option<&str>) -> Vec<DeviceInfo> {
             last_heartbeat: device.last_heartbeat,
         })
         .collect()
+}
+
+fn occupancy(inner: &Inner, node: &str) -> (String, Option<String>) {
+    if diagnostics::occupied(inner, node) { return ("diagnostic".into(), None); }
+    if let Some(session) = inner.sessions.values().find(|session| is_active(session) && session.target_node_id == node) {
+        return ("incoming".into(), Some(session.initiator_node_id.clone()));
+    }
+    if inner.sessions.values().any(|session| is_active(session) && session.initiator_node_id == node) {
+        return ("outgoing".into(), None);
+    }
+    ("idle".into(), None)
 }
 
 fn is_online(device: &StoredDevice) -> bool {
@@ -707,6 +846,10 @@ impl ApiError {
     fn conflict(message: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, message)
     }
+    fn internal(error: impl std::fmt::Display) -> Self {
+        tracing::error!(%error, "保存服务状态失败");
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "保存服务状态失败，请稍后重试")
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -726,11 +869,12 @@ mod tests {
     use super::*;
     use starbridge_protocol::{Role, SshPrivilege};
 
-    fn device(direct_only: bool, allow_relay: bool) -> DeviceRegistration {
+    pub(super) fn device(direct_only: bool, allow_relay: bool) -> DeviceRegistration {
         DeviceRegistration {
             node_id: "node".into(),
             device_token: "token".into(),
             display_name: "node".into(),
+            purpose: String::new(),
             role: Role::Controller,
             ssh_alias: "node".into(),
             ssh_user: "user".into(),
@@ -747,8 +891,8 @@ mod tests {
         }
     }
 
-    struct TestApp {
-        state: AppState,
+    pub(super) struct TestApp {
+        pub state: AppState,
     }
 
     impl Drop for TestApp {
@@ -757,7 +901,7 @@ mod tests {
         }
     }
 
-    fn test_app() -> TestApp {
+    pub(super) fn test_app() -> TestApp {
         let directory = std::env::temp_dir().join(format!("starbridge-peer-test-{}", new_id()));
         let state = AppState::with_frp_and_data("localhost".into(), 17851, "frp-token".into(), directory);
         {
@@ -766,7 +910,7 @@ mod tests {
                 inner.accounts.insert(account.into(), Account { password: password_digest("test1234") });
                 inner.tokens.insert(format!("{account}-access"), (account.into(), now_unix() + 3600));
             }
-            for (node_id, account) in [("a", "alice"), ("b", "alice"), ("c", "alice"), ("d", "bob")] {
+            for (node_id, account) in [("a", "alice"), ("b", "alice"), ("c", "alice"), ("d", "alice"), ("z", "bob")] {
                 let mut registration = device(false, true);
                 registration.node_id = node_id.into();
                 registration.device_token = format!("{node_id}-token");
@@ -780,13 +924,14 @@ mod tests {
                     registration,
                     last_heartbeat: now_unix(),
                     status: "online".into(),
+                    metadata_edited: false,
                 });
             }
         }
         TestApp { state }
     }
 
-    fn peer_headers(node_id: &str) -> HeaderMap {
+    pub(super) fn peer_headers(node_id: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(header::AUTHORIZATION, "Bearer alice-access".parse().unwrap());
         headers.insert("x-starbridge-node-id", node_id.parse().unwrap());
@@ -794,7 +939,7 @@ mod tests {
         headers
     }
 
-    fn session_request(initiator: &str, target: &str) -> SessionCreateRequest {
+    pub(super) fn session_request(initiator: &str, target: &str) -> SessionCreateRequest {
         SessionCreateRequest {
             initiator_node_id: initiator.into(),
             device_token: format!("{initiator}-token"),
@@ -809,16 +954,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peers_connect_both_directions_and_replace_only_the_same_direction() {
+    async fn one_to_many_admission_reuses_same_direction_and_rejects_mixed_roles() {
         let app = test_app();
         let first = create_peer_session(&app.state, "a", "b").await;
-        let reverse = create_peer_session(&app.state, "b", "a").await;
-        let replacement = create_peer_session(&app.state, "a", "b").await;
-        assert_eq!(replacement.initiator_node_id, "a");
+        let duplicate = create_peer_session(&app.state, "a", "b").await;
+        assert_eq!(duplicate.session_id, first.session_id);
+        assert_eq!(duplicate.route.as_ref().unwrap().secret_key, first.route.as_ref().unwrap().secret_key);
+        for (from, to) in [("b", "a"), ("b", "c"), ("c", "a"), ("c", "b"), ("d", "a"), ("d", "b")] {
+            assert_eq!(create_session(State(app.state.clone()), peer_headers(from), Json(session_request(from, to)))
+                .await.unwrap_err().status, StatusCode::CONFLICT, "{from}->{to}");
+        }
+        create_peer_session(&app.state, "a", "c").await;
+        create_peer_session(&app.state, "a", "d").await;
         let inner = app.state.inner.read().await;
-        assert_eq!(inner.sessions[&first.session_id].status, SessionStatus::Closed);
-        assert!(is_active(&inner.sessions[&reverse.session_id]));
-        assert!(is_active(&inner.sessions[&replacement.session_id]));
+        assert_eq!(inner.sessions.values().filter(|s| is_active(s)).count(), 3);
+        assert_eq!(occupancy(&inner, "a").0, "outgoing");
+        assert_eq!(occupancy(&inner, "b"), ("incoming".into(), Some("a".into())));
     }
 
     #[tokio::test]
@@ -840,8 +991,8 @@ mod tests {
         assert_eq!(error.status, StatusCode::FORBIDDEN);
         for (initiator, target, expected) in [
             ("a", "a", StatusCode::BAD_REQUEST),
-            ("a", "d", StatusCode::FORBIDDEN),
-            ("d", "a", StatusCode::FORBIDDEN),
+            ("a", "z", StatusCode::FORBIDDEN),
+            ("z", "a", StatusCode::FORBIDDEN),
         ] {
             let error = create_session(State(app.state.clone()), peer_headers(initiator), Json(session_request(initiator, target)))
                 .await.unwrap_err();
@@ -856,21 +1007,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn assigned_lists_both_directions_in_creation_order_and_requires_device_token() {
+    async fn assigned_lists_outgoing_and_incoming_views_and_requires_device_token() {
         let app = test_app();
         let outgoing = create_peer_session(&app.state, "a", "b").await;
-        let incoming = create_peer_session(&app.state, "b", "a").await;
-        create_peer_session(&app.state, "b", "c").await;
+        let second = create_peer_session(&app.state, "a", "c").await;
         {
             let mut inner = app.state.inner.write().await;
             inner.sessions.get_mut(&outgoing.session_id).unwrap().created_at = 2;
-            inner.sessions.get_mut(&incoming.session_id).unwrap().created_at = 1;
+            inner.sessions.get_mut(&second.session_id).unwrap().created_at = 1;
         }
         let sessions = assigned_sessions(State(app.state.clone()), peer_headers("a"), Path("a".into()))
             .await.unwrap().0;
         assert_eq!(sessions.len(), 2);
-        assert_eq!(sessions[0].session_id, incoming.session_id);
+        assert_eq!(sessions[0].session_id, second.session_id);
         assert_eq!(sessions[1].session_id, outgoing.session_id);
+        let incoming = assigned_sessions(State(app.state.clone()), peer_headers("b"), Path("b".into())).await.unwrap().0;
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].session_id, outgoing.session_id);
         let error = assigned_sessions(State(app.state.clone()), peer_headers("b"), Path("a".into()))
             .await.unwrap_err();
         assert_eq!(error.status, StatusCode::FORBIDDEN);
@@ -974,6 +1127,7 @@ mod tests {
                 node_id: node_id.into(),
                 device_token: format!("{node_id}-token"),
                 display_name: node_id.into(),
+                purpose: String::new(),
                 role: Role::Executor,
                 ssh_alias: node_id.into(),
                 ssh_user: "user".into(),
@@ -996,6 +1150,7 @@ mod tests {
                     registration,
                     last_heartbeat: now_unix(),
                     status: "online".into(),
+                    metadata_edited: false,
                 },
             );
         }
@@ -1022,5 +1177,117 @@ mod tests {
             password_digest("test1234")
         );
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_cannot_both_reserve_target() {
+        let app = test_app();
+        let (first, second) = tokio::join!(
+            create_session(State(app.state.clone()), peer_headers("a"), Json(session_request("a", "b"))),
+            create_session(State(app.state.clone()), peer_headers("c"), Json(session_request("c", "b"))),
+        );
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        assert_eq!(first.err().or(second.err()).unwrap().status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn release_is_per_session_and_expired_updates_cannot_revive() {
+        let app = test_app();
+        let b = create_peer_session(&app.state, "a", "b").await;
+        let c = create_peer_session(&app.state, "a", "c").await;
+        let _ = delete_session(State(app.state.clone()), peer_headers("a"), Path(b.session_id)).await.unwrap();
+        {
+            let inner = app.state.inner.read().await;
+            assert_eq!(occupancy(&inner, "b").0, "idle");
+            assert_eq!(occupancy(&inner, "a").0, "outgoing");
+        }
+        app.state.inner.write().await.sessions.get_mut(&c.session_id).unwrap().expires_at = now_unix() - 1;
+        assert_eq!(update_session(State(app.state.clone()), peer_headers("a"), Path(c.session_id), Json(SessionStatusRequest {
+            status: SessionStatus::Connected, path: SessionPath::Relay, failure_reason: None,
+        })).await.unwrap_err().status, StatusCode::CONFLICT);
+        assert_eq!(occupancy(&*app.state.inner.read().await, "a").0, "idle");
+        create_peer_session(&app.state, "d", "a").await;
+    }
+
+    #[tokio::test]
+    async fn metadata_survives_reregistration_and_does_not_rebuild_connections() {
+        let app = test_app();
+        let session = create_peer_session(&app.state, "a", "b").await;
+        let original = app.state.inner.read().await.devices["b"].registration.clone();
+        let _ = update_device_metadata(State(app.state.clone()), peer_headers("a"), Path("b".into()), Json(DeviceMetadataUpdate {
+            display_name: Some("Build server".into()), purpose: Some("Build releases".into()),
+        })).await.unwrap();
+        let _ = register_device(State(app.state.clone()), peer_headers("b"), Json(original)).await.unwrap();
+        let inner = app.state.inner.read().await;
+        assert_eq!(inner.devices["b"].registration.display_name, "Build server");
+        assert_eq!(inner.devices["b"].registration.purpose, "Build releases");
+        assert!(is_active(&inner.sessions[&session.session_id]));
+    }
+
+    #[tokio::test]
+    async fn metadata_and_registration_accept_chinese_character_boundaries() {
+        let app = test_app();
+        let name = "设".repeat(80);
+        let purpose = "用".repeat(240);
+        let mut registration = app.state.inner.read().await.devices["b"].registration.clone();
+        registration.display_name = name.clone();
+        registration.purpose = purpose.clone();
+        assert!(validate_registration(&registration).is_ok());
+        let _ = update_device_metadata(State(app.state.clone()), peer_headers("a"), Path("b".into()), Json(DeviceMetadataUpdate {
+            display_name: Some(name.clone()), purpose: Some(purpose.clone()),
+        })).await.unwrap();
+        {
+            let inner = app.state.inner.read().await;
+            assert_eq!(inner.devices["b"].registration.display_name, name);
+            assert_eq!(inner.devices["b"].registration.purpose, purpose);
+        }
+        for (name, purpose) in [("设".repeat(81), "用".repeat(240)), ("设".repeat(80), "用".repeat(241))] {
+            registration.display_name = name.clone();
+            registration.purpose = purpose.clone();
+            assert_eq!(validate_registration(&registration).unwrap_err().status, StatusCode::BAD_REQUEST);
+            assert_eq!(update_device_metadata(State(app.state.clone()), peer_headers("a"), Path("b".into()), Json(DeviceMetadataUpdate {
+                display_name: Some(name), purpose: Some(purpose),
+            })).await.unwrap_err().status, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_login_refresh_rotation_restart_and_logout() {
+        let app = test_app();
+        let credentials = || AuthRequest { username: "new-user".into(), password: "test-password".into() };
+        assert_eq!(login(State(app.state.clone()), Json(credentials())).await.unwrap_err().status, StatusCode::UNAUTHORIZED);
+        let auth = register_account(State(app.state.clone()), Json(credentials())).await.unwrap().0;
+        assert_eq!(register_account(State(app.state.clone()), Json(credentials())).await.unwrap_err().status, StatusCode::CONFLICT);
+        assert!(login(State(app.state.clone()), Json(credentials())).await.is_ok());
+        let old_refresh = auth.refresh_token.unwrap();
+        let restored = AppState::with_frp_and_data("localhost".into(), 17851, "token".into(), app.state.data_path.as_ref().clone());
+        let refreshed = refresh_auth(State(restored.clone()), Json(AuthRefreshRequest { refresh_token: old_refresh.clone() })).await.unwrap().0;
+        assert!(refresh_auth(State(restored.clone()), Json(AuthRefreshRequest { refresh_token: old_refresh })).await.is_err());
+        let new_refresh = refreshed.refresh_token.clone().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, format!("Bearer {}", refreshed.access_token).parse().unwrap());
+        assert_eq!(authenticate(&restored, &headers).await.unwrap(), "new-user");
+        let _ = logout_auth(State(restored.clone()), headers.clone(), Json(AuthLogoutRequest { refresh_token: Some(new_refresh.clone()) })).await.unwrap();
+        assert!(authenticate(&restored, &headers).await.is_err());
+        assert!(refresh_auth(State(restored), Json(AuthRefreshRequest { refresh_token: new_refresh })).await.is_err());
+        let persisted = std::fs::read_to_string(app.state.data_path.join("server-state.json")).unwrap();
+        assert!(!persisted.contains("test-password"));
+        assert!(!persisted.contains(&refreshed.refresh_token.unwrap()));
+    }
+
+    #[tokio::test]
+    async fn refresh_expiration_and_racing_rotation_are_enforced() {
+        let app = test_app();
+        let auth = login(State(app.state.clone()), Json(AuthRequest { username: "alice".into(), password: "test1234".into() })).await.unwrap().0;
+        let token = auth.refresh_token.unwrap();
+        let (a, b) = tokio::join!(
+            refresh_auth(State(app.state.clone()), Json(AuthRefreshRequest { refresh_token: token.clone() })),
+            refresh_auth(State(app.state.clone()), Json(AuthRefreshRequest { refresh_token: token.clone() })),
+        );
+        assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+        let auth = a.ok().or(b.ok()).unwrap().0;
+        let token = auth.refresh_token.unwrap();
+        app.state.inner.write().await.refresh_grants.get_mut(&password_digest(&token)).unwrap().expires_at = now_unix() - 1;
+        assert!(refresh_auth(State(app.state.clone()), Json(AuthRefreshRequest { refresh_token: token })).await.is_err());
     }
 }

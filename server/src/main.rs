@@ -1,5 +1,5 @@
 use clap::Parser;
-use starbridge_server::{AppState, app};
+use starbridge_server::{AppState, DiagnosticIntegration, app, diagnostic_plugin_app};
 use std::{net::SocketAddr, path::PathBuf, process::Stdio};
 use tracing::info;
 
@@ -38,25 +38,44 @@ async fn main() -> anyhow::Result<()> {
         .with_ansi(false)
         .init();
     let args = Args::parse();
-    let mut frps = start_frps(&args).await?;
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     info!(address = %listener.local_addr()?, "StarBridge central server listening");
     let frps_token = frp_token(&args);
-    axum::serve(
-        listener,
-        app(AppState::with_frp_and_data(
+    let state = AppState::with_frp_and_data(
             args.frps_addr.clone(),
             args.frps_port,
             frps_token,
             args.data_dir.clone(),
-        )),
-    )
+        );
+    let managed = if args.frps_path.as_ref().is_some_and(|path| path.is_file()) {
+        let plugin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let plugin_address = plugin_listener.local_addr()?;
+        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let admin_port = admin_listener.local_addr()?.port();
+        let integration = DiagnosticIntegration {
+            admin_url: format!("http://127.0.0.1:{admin_port}"), admin_user: "starbridge".into(),
+            admin_password: starbridge_protocol::new_token(), plugin_token: starbridge_protocol::new_token(),
+        };
+        let router = diagnostic_plugin_app(state.clone(), &integration.plugin_token);
+        let task = tokio::spawn(async move { axum::serve(plugin_listener, router).await });
+        drop(admin_listener);
+        Some((integration, plugin_address, admin_port, task))
+    } else { None };
+    let mut frps = start_frps(&args, managed.as_ref().map(|(integration, address, port, _)| (integration, *address, *port))).await?;
+    if let Some((integration, _, _, _)) = &managed {
+        state.configure_diagnostics(integration.clone()).await;
+    }
+    let maintenance = state.start_diagnostic_maintenance();
+    let result = axum::serve(listener, app(state))
     .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    .await;
+    maintenance.abort();
     if let Some(child) = frps.as_mut() {
         let _ = child.kill().await;
         let _ = child.wait().await;
     }
+    if let Some((_, _, _, task)) = managed { task.abort(); }
+    result?;
     Ok(())
 }
 
@@ -82,7 +101,7 @@ async fn shutdown_signal() {
     tokio::signal::ctrl_c().await.ok();
 }
 
-async fn start_frps(args: &Args) -> anyhow::Result<Option<tokio::process::Child>> {
+async fn start_frps(args: &Args, diagnostic: Option<(&DiagnosticIntegration, SocketAddr, u16)>) -> anyhow::Result<Option<tokio::process::Child>> {
     let Some(path) = args.frps_path.as_ref() else {
         tracing::warn!("未配置 frps，中心服务以控制面模式启动；需要数据面时传入 --frps-path");
         return Ok(None);
@@ -95,7 +114,13 @@ async fn start_frps(args: &Args) -> anyhow::Result<Option<tokio::process::Child>
     tokio::fs::create_dir_all(&config_dir).await?;
     let config_path = config_dir.join("frps.toml");
     let token = frp_token(args);
-    let config = render_frps_config(&args.frps_bind_addr, args.frps_port, &token);
+    let mut config = render_frps_config(&args.frps_bind_addr, args.frps_port, &token);
+    if let Some((integration, address, port)) = diagnostic {
+        config.push_str(&format!(
+            "webServer.addr = \"127.0.0.1\"\nwebServer.port = {port}\nwebServer.user = \"starbridge\"\nwebServer.password = \"{}\"\n\n[[httpPlugins]]\nname = \"starbridge-diagnostics\"\naddr = \"{address}\"\npath = \"/frp/{}\"\nops = [\"Login\", \"NewProxy\", \"NewUserConn\", \"NewWorkConn\", \"Ping\", \"CloseProxy\"]\n",
+            integration.admin_password, integration.plugin_token,
+        ));
+    }
     tokio::fs::write(&config_path, config).await?;
     let mut command = tokio::process::Command::new(path);
     command

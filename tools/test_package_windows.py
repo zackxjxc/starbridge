@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -27,7 +28,9 @@ class PortablePackageTests(unittest.TestCase):
         for name in package_windows.CLIENT_RUNTIME:
             (self.runtime / name).write_bytes(name.encode())
         (self.runtime / "runtime-manifest.json").write_text(json.dumps([
-            {"component": "client", "files": [*package_windows.CLIENT_RUNTIME, "frps.exe"]},
+            {"component": "client", "files": [*package_windows.CLIENT_RUNTIME, "frps.exe"],
+             "file_sha256": {name: hashlib.sha256(name.encode()).hexdigest()
+                             for name in package_windows.CLIENT_RUNTIME}},
             {"component": "server", "files": ["frps.exe"]},
         ]), encoding="utf-8")
         self.cache = self.root / "cache"
@@ -52,6 +55,11 @@ class PortablePackageTests(unittest.TestCase):
         manifest = json.loads((self.output / "runtime-manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(len(manifest), 1)
         self.assertNotIn("frps.exe", manifest[0]["files"])
+        self.assertNotIn("frps.exe", manifest[0]["file_sha256"])
+        self.assertEqual(manifest[0]["file_sha256"]["frpc.exe"],
+                         hashlib.sha256(b"frpc.exe").hexdigest())
+        self.assertEqual((self.output / "runtime" / "runtime-manifest.json").read_bytes(),
+                         (self.output / "runtime-manifest.json").read_bytes())
         self.assertTrue((self.output / "licenses" / "frp" / "LICENSE").is_file())
         self.assertTrue((self.output / "licenses" / "openssh" / "NOTICE.txt").is_file())
         self.assertIn("Tauri", (self.output / "README.txt").read_text(encoding="utf-8"))
@@ -74,6 +82,15 @@ class PortablePackageTests(unittest.TestCase):
         sentinel.write_text("keep", encoding="utf-8")
         (self.runtime / "frpc.exe").unlink()
         with self.assertRaisesRegex(SystemExit, "运行时缺少文件"):
+            self.package()
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+
+    def test_changed_runtime_is_rejected_before_replacing_output(self):
+        self.output.mkdir()
+        sentinel = self.output / "previous.txt"
+        sentinel.write_text("keep", encoding="utf-8")
+        (self.runtime / "frpc.exe").write_bytes(b"changed-after-download")
+        with self.assertRaisesRegex(SystemExit, "文件校验失败"):
             self.package()
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
 

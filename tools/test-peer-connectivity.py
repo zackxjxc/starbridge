@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run real, isolated FRP/SSH peer regressions using only Python's stdlib.
+"""Run real, isolated FRP/SSH ownership regressions using Python's stdlib.
 
 Build first: cargo build -p starbridge-client -p starbridge-server --no-default-features
 Run: python tools/test-peer-connectivity.py
@@ -197,6 +197,8 @@ def active_sessions(snapshot):
 
 def ssh_result(runtime, command, marker):
   argv = shlex.split(command)
+  if os.name == "nt" and argv and argv[0] == "&":
+    argv = argv[1:]
   if not argv or Path(argv[0]).name.lower() not in {"ssh", "ssh.exe"}:
     raise RegressionError("Unexpected SSH command in the local snapshot")
   options = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
@@ -220,16 +222,20 @@ class PeerRegression:
     self.runtime = work / "runtime"
     self.processes = []
     self.environment = os.environ.copy()
+    for key in list(self.environment):
+      if key.lower() in {"http_proxy", "https_proxy", "all_proxy"}:
+        self.environment.pop(key)
+    self.environment["NO_PROXY"] = "127.0.0.1,localhost,::1"
     self.environment.pop("STARBRIDGE_SSH_PORT", None)
     self.environment["STARBRIDGE_FRP_TOKEN"] = secrets.token_urlsafe(24)
     self.environment["RUST_LOG"] = "info"
     self.username = "peer-test-" + secrets.token_hex(6)
     self.password = secrets.token_urlsafe(24)
-    ports = free_ports(4)
+    ports = free_ports(5)
     self.center = f"http://127.0.0.1:{ports[0]}"
     self.frps_port = ports[1]
     self.urls = [f"http://127.0.0.1:{port}" for port in ports[2:]]
-    self.nodes = [None, None]
+    self.nodes = [None, None, None]
     self.token = None
 
   def launch(self, name, command):
@@ -238,7 +244,7 @@ class PeerRegression:
     return process
 
   def start_node(self, index):
-    name = "node-" + "ab"[index]
+    name = "node-" + "abc"[index]
     self.nodes[index] = self.launch(name, [
       self.args.client, "--headless", "--listen", self.urls[index][7:],
       "--data-dir", self.work / name])
@@ -252,24 +258,31 @@ class PeerRegression:
     expected = set(ids)
 
     def synchronized():
-      snapshots = [self.state(index) for index in range(2)]
+      snapshots = [self.state(index) for index in range(3)]
+      summary = api(self.center, "/api/v1/admin/summary", token=self.token)
+      records = [session for session in summary["sessions"]
+                 if session["session_id"] in expected and session["status"] in ACTIVE]
+      if len(records) != len(expected):
+        return False
       return snapshots if all(
-        {session["session_id"] for session in active_sessions(snapshot)} == expected
-        for snapshot in snapshots) else False
+        {session["session_id"] for session in active_sessions(snapshot)} == {
+          session["session_id"] for session in records
+          if snapshot["node_id"] in (session["initiator_node_id"], session["target_node_id"])
+        } for snapshot in snapshots) else False
 
-    return wait_for(f"both nodes to report {len(expected)} active session(s)",
+    return wait_for(f"nodes to report {len(expected)} active session(s) with correct ownership",
                     synchronized, self.processes, self.args.timeout)
 
   def visible(self):
     def synchronized():
-      snapshots = [self.state(index) for index in range(2)]
+      snapshots = [self.state(index) for index in range(3)]
       ids = {snapshot["node_id"] for snapshot in snapshots}
       return snapshots if all(
         snapshot["logged_in"] and snapshot["username"] == self.username
         and ids <= {device["node_id"] for device in snapshot["devices"] if device["online"]}
         for snapshot in snapshots) else False
 
-    return wait_for("both logged-in peers to see each other online", synchronized,
+    return wait_for("three logged-in peers to see each other online", synchronized,
                     self.processes, self.args.timeout)
 
   def connect(self, index, target):
@@ -283,7 +296,8 @@ class PeerRegression:
                   and session["target_node_id"] == target]
       if len(sessions) > 1:
         raise FatalRegressionError("Repeated connect created multiple active outbound sessions")
-      if sessions and sessions[0]["status"] == "connected" and sessions[0].get("ssh_command"):
+      if (sessions and sessions[0]["status"] == "connected"
+          and sessions[0].get("ssh_ready") and sessions[0].get("ssh_command")):
         if sessions[0]["policy"] != self.args.policy:
           raise FatalRegressionError("The effective session policy changed unexpectedly")
         if self.args.policy == "relay_only" and sessions[0]["path"] != "relay":
@@ -344,6 +358,18 @@ class PeerRegression:
   def disconnect(self, index, session):
     api(self.urls[index], "/api/v1/sessions/" + session["session_id"], "DELETE")
 
+  def assert_occupied(self, index, target):
+    identity = json.loads((self.work / ("node-" + "abc"[index]) / "identity.json").read_text(encoding="utf-8"))
+    try:
+      api(self.center, "/api/v1/sessions", "POST", {
+        "initiator_node_id": identity["node_id"], "device_token": identity["device_token"],
+        "target_node_id": target, "policy": self.args.policy}, token=self.token)
+    except RegressionError as error:
+      if not any(word in str(error).lower() for word in ("占用", "连接", "控制", "busy", "occupied", "incoming")):
+        raise RegressionError(f"Expected an occupancy rejection, received: {error}") from None
+      return
+    raise RegressionError("The center accepted a session involving an occupied device")
+
   def assert_closed_route(self, session):
     try:
       connection = socket.create_connection(("127.0.0.1", session["_visitor_port"]), timeout=1)
@@ -395,7 +421,7 @@ class PeerRegression:
     def collect(value):
       if isinstance(value, dict):
         for key, child in value.items():
-          if key in {"access_token", "device_token", "secret_key", "auth_token", "password"}:
+          if key in {"access_token", "refresh_token", "device_token", "secret_key", "auth_token", "password"}:
             if isinstance(child, str):
               sensitive.add(child)
           collect(child)
@@ -423,85 +449,103 @@ class PeerRegression:
       "--data-dir", self.work / "center"])
     wait_for("center HTTP service", lambda: api(self.center, "/api/health"),
              self.processes, self.args.timeout)
-    for index in range(2):
+    self.token = api(self.center, "/api/v1/auth/register", "POST", {
+      "username": self.username, "password": self.password})["access_token"]
+    for index in range(3):
       self.start_node(index)
       config = api(self.urls[index], "/api/v1/config")
-      config.update({"server_url": self.center, "display_name": "Peer Test " + "AB"[index],
-                     "ssh_alias": "peer-test-" + "ab"[index],
+      config.update({"server_url": self.center, "display_name": "Peer Test " + "ABC"[index],
+                     "ssh_alias": "peer-test-" + "abc"[index],
                      "allow_relay": True, "direct_only": False})
       api(self.urls[index], "/api/v1/config", "PUT", config)
       api(self.urls[index], "/api/v1/login", "POST", {
-        "username": self.username, "password": self.password})
+        "username": self.username, "password": self.password, "remember": True})
     self.token = api(self.center, "/api/v1/auth/login", "POST", {
       "username": self.username, "password": self.password})["access_token"]
     snapshots = self.visible()
     ids = [snapshot["node_id"] for snapshot in snapshots]
-    if ids[0] == ids[1]:
-      raise RegressionError("The two data directories produced the same node identity")
-    keys = [(snapshot["ssh"].get("public_key"), snapshot["ssh"].get("host_key"))
-            for snapshot in snapshots]
-    if not all(public and host for public, host in keys):
-      messages = "; ".join(snapshot["ssh"].get("message", "") for snapshot in snapshots)
-      raise RegressionError("Both peers need SSH client and host keys: " + messages)
-    print("PASS: A and B see the same two online peers", flush=True)
+    if len(set(ids)) != 3:
+      raise RegressionError("Independent data directories produced the same node identity")
+    print("PASS: A, B and C see the same three online peers", flush=True)
 
+    api(self.urls[0], "/api/v1/connect/all", "POST", {
+      "policy": self.args.policy, "rebuild_relay": False})
     ab = self.connect(0, ids[1])
-    ba = self.connect(1, ids[0])
-    self.wait_sessions([ab["session_id"], ba["session_id"]])
-    self.verify_ssh([("A -> B", ab), ("B -> A", ba)])
-    print(f"PASS: simultaneous {self.args.policy} sessions execute real SSH commands both ways", flush=True)
+    ac = self.connect(0, ids[2])
+    if ab["_visitor_port"] == ac["_visitor_port"]:
+      raise RegressionError("Parallel connections allocated the same local SSH visitor port")
+    self.wait_sessions([ab["session_id"], ac["session_id"]])
+    self.verify_ssh([("parallel A -> B", ab), ("parallel A -> C", ac)])
+    self.disconnect(0, ac)
+    self.wait_sessions([ab["session_id"]])
+    self.assert_occupied(1, ids[0])
+    self.assert_occupied(1, ids[2])
+    self.assert_occupied(2, ids[0])
+    self.assert_occupied(2, ids[1])
+    ac = self.connect(0, ids[2])
+    self.wait_sessions([ab["session_id"], ac["session_id"]])
+    self.verify_ssh([("A -> B", ab), ("A -> C", ac)])
+    print("PASS: A controls B/C while incoming and occupied-target requests are rejected", flush=True)
+    keys = [(self.work / ("node-" + name) / "ssh" / filename).read_bytes()
+            for name in "abc" for filename in ("id_ed25519.pub", "host_ed25519.pub")]
 
     self.disconnect(0, ab)
-    self.wait_sessions([ba["session_id"]])
+    self.wait_sessions([ac["session_id"]])
     self.assert_closed_route(ab)
-    self.verify_ssh([("B -> A after A -> B disconnect", ba)])
-    print("PASS: disconnecting A -> B preserves B -> A", flush=True)
+    self.verify_ssh([("A -> C after A -> B terminates", ac)])
+    print("PASS: terminating A -> B preserves A -> C", flush=True)
 
-    first_repeat = self.connect(1, ids[0])
-    second_repeat = self.connect(1, ids[0])
-    self.wait_sessions([second_repeat["session_id"]])
-    self.verify_ssh([("B -> A after repeated connect", second_repeat)])
-    self.disconnect(1, second_repeat)
+    first_repeat = self.connect(0, ids[2])
+    second_repeat = self.connect(0, ids[2])
+    if (first_repeat["session_id"] != ac["session_id"]
+        or second_repeat["session_id"] != ac["session_id"]
+        or second_repeat["_visitor_port"] != ac["_visitor_port"]
+        or second_repeat["ssh_command"] != ac["ssh_command"]):
+      raise RegressionError("Same-direction reuse replaced the session, port or SSH configuration")
+    self.verify_ssh([("A -> C after repeated connect", second_repeat)])
+    api(self.urls[0], "/api/v1/terminate", "POST", {"target_node_id": None})
     self.wait_sessions([])
     self.center_idle()
+    api(self.urls[0], "/api/v1/connect/all", "POST", {
+      "policy": self.args.policy, "rebuild_relay": False})
+    api(self.urls[0], "/api/v1/terminate", "POST", {"target_node_id": None})
+    self.wait_sessions([])
     print(f"Checking for stale-session revival for {self.args.settle_seconds:g}s...", flush=True)
     deadline = time.monotonic() + self.args.settle_seconds
     while time.monotonic() < deadline:
-      for index in range(2):
+      for index in range(3):
         if active_sessions(self.state(index)):
           raise RegressionError("A disconnected/superseded session revived after a heartbeat")
       self.center_idle()
       time.sleep(0.5)
-    for session in {item["session_id"]: item for item in (ba, first_repeat, second_repeat)}.values():
+    for session in {item["session_id"]: item for item in (ab, ac, first_repeat, second_repeat)}.values():
       self.assert_closed_route(session)
     print("PASS: repeated connect leaves no active or revived old session", flush=True)
 
     self.verify_offline_disconnect(ids[1])
 
-    identities = [(self.work / ("node-" + name) / "identity.json").read_bytes() for name in "ab"]
+    identities = [(self.work / ("node-" + name) / "identity.json").read_bytes() for name in "abc"]
     for process in self.nodes:
       process.stop()
       self.processes.remove(process)
-    for index in range(2):
+    for index in range(3):
       self.start_node(index)
     restored = self.visible()
     if [snapshot["node_id"] for snapshot in restored] != ids:
       raise RegressionError("Node identity changed after restart")
-    if [(snapshot["ssh"].get("public_key"), snapshot["ssh"].get("host_key"))
-        for snapshot in restored] != keys:
+    if [(self.work / ("node-" + name) / "ssh" / filename).read_bytes()
+        for name in "abc" for filename in ("id_ed25519.pub", "host_ed25519.pub")] != keys:
       raise RegressionError("SSH client/host identity changed after restart")
-    if [(self.work / ("node-" + name) / "identity.json").read_bytes() for name in "ab"] != identities:
+    if [(self.work / ("node-" + name) / "identity.json").read_bytes() for name in "abc"] != identities:
       raise RegressionError("Persisted device credentials changed after restart")
     self.wait_sessions([])
-    ab = self.connect(0, ids[1])
     ba = self.connect(1, ids[0])
-    self.wait_sessions([ab["session_id"], ba["session_id"]])
-    self.verify_ssh([("A -> B after restart", ab), ("B -> A after restart", ba)])
-    self.disconnect(0, ab)
+    self.wait_sessions([ba["session_id"]])
+    self.verify_ssh([("B -> A after restart, when both devices are idle", ba)])
     self.disconnect(1, ba)
     self.wait_sessions([])
     self.center_idle()
-    print("PASS: restart restores account/device identities and both SSH capabilities", flush=True)
+    print("PASS: restart restores login/device identity; an idle device can reverse the connection direction", flush=True)
 
   def close(self):
     failure = None

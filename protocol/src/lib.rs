@@ -77,6 +77,27 @@ pub struct AuthResponse {
     pub access_token: String,
     pub username: String,
     pub expires_at: u64,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    #[serde(default)]
+    pub refresh_expires_at: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AuthRefreshRequest {
+    pub refresh_token: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct AuthLogoutRequest {
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct DeviceMetadataUpdate {
+    pub display_name: Option<String>,
+    pub purpose: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -84,6 +105,8 @@ pub struct DeviceRegistration {
     pub node_id: String,
     pub device_token: String,
     pub display_name: String,
+    #[serde(default)]
+    pub purpose: String,
     #[serde(default)]
     pub role: Role,
     pub ssh_alias: String,
@@ -111,6 +134,14 @@ pub struct DeviceInfo {
     pub account: String,
     pub display_name: String,
     #[serde(default)]
+    pub purpose: String,
+    #[serde(default = "idle_occupancy")]
+    pub occupancy: String,
+    #[serde(default)]
+    pub occupied_by: Option<String>,
+    #[serde(default)]
+    pub outgoing_count: usize,
+    #[serde(default)]
     pub role: Role,
     pub ssh_alias: String,
     pub ssh_user: String,
@@ -132,6 +163,8 @@ pub struct DeviceInfo {
     pub online: bool,
     pub last_heartbeat: u64,
 }
+
+fn idle_occupancy() -> String { "idle".into() }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HeartbeatRequest {
@@ -177,6 +210,41 @@ pub struct FrpRoute {
 pub struct SessionStatusRequest {
     pub status: SessionStatus,
     pub path: SessionPath,
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DiagnosticCreateRequest {
+    pub node_id: String,
+    pub device_token: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct DiagnosticUpdateRequest {
+    #[serde(default)]
+    pub phase: String,
+    #[serde(default)]
+    pub ssh_verified: bool,
+    #[serde(default)]
+    pub cleanup_complete: bool,
+    pub outcome: Option<String>,
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DiagnosticSession {
+    pub test_id: String,
+    pub node_id: String,
+    pub status: String,
+    pub phase: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub challenge: String,
+    pub route: FrpRoute,
+    pub relay_verified: bool,
+    pub ssh_verified: bool,
+    pub cleanup_complete: bool,
+    pub local_relay: bool,
     pub failure_reason: Option<String>,
 }
 

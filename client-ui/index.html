@@ -1,111 +1,17 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>StarBridge · 设备中心</title>
-  <style>
-    :root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#e9eef8;background:#0b1020;--panel:#151c31;--panel2:#1b2540;--line:#293556;--muted:#91a0ba;--primary:#6d8cff;--green:#5ee0a0;--orange:#ffbf70;--red:#ff7d8b}
-    *{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 80% -10%,#263665 0,#11182b 38%,#0b1020 72%);letter-spacing:.01em}.shell{max-width:1220px;margin:auto;padding:28px 24px 56px}.topbar{display:flex;justify-content:space-between;align-items:center;gap:20px;margin-bottom:30px}.brand{display:flex;align-items:center;gap:13px}.logo{width:42px;height:42px;border-radius:13px;background:linear-gradient(135deg,#7897ff,#6a51d8);display:grid;place-items:center;font-weight:800;box-shadow:0 10px 30px #596fd344}.brand h1{font-size:21px;margin:0}.brand p{margin:3px 0 0;color:var(--muted);font-size:12px}.account{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:13px}.avatar{width:30px;height:30px;border-radius:50%;background:#2a3761;color:#becbff;display:grid;place-items:center;font-weight:700}.hero{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;margin-bottom:24px}.hero h2{font-size:32px;line-height:1.15;margin:0 0 8px;letter-spacing:-.04em}.hero p{color:var(--muted);margin:0}.actions{display:flex;gap:10px;flex-wrap:wrap}.btn{border:0;border-radius:10px;padding:11px 16px;background:var(--primary);color:#fff;cursor:pointer;font-weight:650;box-shadow:0 7px 18px #637df533}.btn:hover{filter:brightness(1.1)}.btn.ghost{background:#202b48;color:#c9d4ee;box-shadow:none}.btn.danger{background:#4a2638;color:#ffb3bf;box-shadow:none}.layout{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(300px,.75fr);gap:18px}.panel{background:linear-gradient(180deg,#172039e8,#131a2de8);border:1px solid var(--line);border-radius:17px;padding:20px;box-shadow:0 16px 45px #00000022}.panel+.panel{margin-top:18px}.panel-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:16px}.panel-head h3{margin:0;font-size:16px}.panel-head p{margin:5px 0 0;color:var(--muted);font-size:12px}.pill{padding:5px 9px;border-radius:999px;font-size:11px;background:#223054;color:#aebeff}.pill.online{background:#153d36;color:#7beab2}.pill.offline{background:#412b25;color:#ffc38d}.devices{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}.device{border:1px solid #2a385b;background:#19233c;border-radius:13px;padding:15px;transition:.2s}.device:hover{border-color:#526ba8;transform:translateY(-1px)}.device-top{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}.device-name{font-weight:700}.device-meta{margin-top:8px;color:var(--muted);font-size:12px;line-height:1.65}.device-foot{border-top:1px solid #2a385b;margin-top:13px;padding-top:12px;display:flex;align-items:center;justify-content:space-between;gap:8px}.device-foot .btn{padding:8px 12px;font-size:12px}.empty{border:1px dashed #344363;border-radius:12px;padding:28px;text-align:center;color:var(--muted);grid-column:1/-1}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:18px}.stat{background:#18233c;border:1px solid #273657;border-radius:12px;padding:14px}.stat strong{display:block;font-size:22px}.stat span{color:var(--muted);font-size:11px}.form-row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.field{margin-bottom:13px}.field label{display:block;color:#aebbd3;font-size:12px;margin-bottom:6px}.field input,.field select{width:100%;border:1px solid #334361;background:#0e1528;color:#ecf2ff;padding:10px 11px;border-radius:9px;outline:none}.field input[type=checkbox]{width:auto;margin-right:7px}.field input:focus,.field select:focus{border-color:#718cff;box-shadow:0 0 0 3px #718cff22}.hint{font-size:11px;color:var(--muted);line-height:1.55}.status{display:flex;gap:10px;align-items:flex-start;padding:13px;border-radius:11px;background:#17253a;border:1px solid #2c4267;color:#cdd8ec;font-size:13px;line-height:1.5}.status-dot{width:8px;height:8px;border-radius:50%;background:var(--green);margin-top:5px;flex:none;box-shadow:0 0 0 4px #5ee0a01c}.status-dot.warn{background:var(--orange);box-shadow:0 0 0 4px #ffbf701c}.status-dot.error{background:var(--red);box-shadow:0 0 0 4px #ff7d8b1c}.session{background:#18233c;border:1px solid #2b3b60;border-radius:12px;padding:14px}.session+.session{margin-top:12px}.session-title{display:flex;justify-content:space-between;gap:8px}.session p{color:var(--muted);font-size:12px;line-height:1.6;margin:8px 0 0}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px;overflow-wrap:anywhere}.error{color:#ff9fac}.muted{color:var(--muted)}pre{white-space:pre-wrap;background:#0e1528;border-radius:9px;padding:11px;color:#aebeff}.hidden{display:none!important}@media(max-width:850px){.layout{grid-template-columns:1fr}.hero{align-items:flex-start;flex-direction:column}.topbar{align-items:flex-start;flex-direction:column}.account{align-self:flex-end}}@media(max-width:500px){.shell{padding:20px 14px 40px}.stats{grid-template-columns:1fr 1fr}.form-row{grid-template-columns:1fr}.hero h2{font-size:27px}}
-  </style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>StarBridge</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
 </head>
 <body>
-  <main class="shell">
-    <header class="topbar"><div class="brand"><div class="logo">S</div><div><h1>StarBridge</h1><p>可信赖的跨设备连接</p></div></div><div class="account"><span id="accountText">尚未登录</span><div class="avatar" id="avatar">?</div></div></header>
-    <section class="hero"><div><h2>设备中心</h2><p>选择一台设备开始连接，也可以指定本次连接的路径。</p></div><div class="actions"><button class="btn ghost" data-action="copyNodes">复制设备信息</button><button class="btn" data-action="refresh">刷新设备</button></div></section>
-    <div class="layout">
-      <div>
-        <section class="panel"><div class="panel-head"><div><h3>我的设备</h3><p>在线设备会自动同步到这里</p></div><span class="pill" id="deviceCount">0 台设备</span></div><div class="stats"><div class="stat"><strong id="onlineCount">0</strong><span>在线设备</span></div><div class="stat"><strong id="sessionCount">0</strong><span>进行中会话</span></div><div class="stat"><strong id="pathText">—</strong><span>当前连接路径</span></div></div><div class="field"><label for="connectionPolicy">新连接的路径</label><select id="connectionPolicy"><option value="direct_preferred">优先直连，失败后使用中转</option><option value="direct_only">只使用直连</option><option value="relay_only">直接使用中转</option></select><p class="hint">对新连接生效，仍需符合双方设备的路径限制。</p></div><div class="devices" id="devices"><div class="empty">正在读取设备…</div></div></section>
-        <section class="panel"><div class="panel-head"><div><h3>当前连接</h3><p>连接状态和访问方式会显示在这里</p></div></div><div id="session"><div class="empty">暂无活动连接</div></div><div class="actions" style="margin-top:12px"><button class="btn danger hidden" id="disconnect" data-action="disconnect">断开全部</button></div></section>
-      </div>
-      <aside>
-        <section class="panel"><div class="panel-head"><div><h3>连接中心</h3><p>登录后会记住服务器和设备信息</p></div></div><div class="field"><label>服务器 URL</label><input id="server" placeholder="https://your-server.example.com"></div><div class="form-row"><div class="field"><label>账户名称</label><input id="username" autocomplete="username" placeholder="输入账户"></div><div class="field"><label>密码</label><input id="password" type="password" autocomplete="current-password" placeholder="至少 4 位"></div></div><div class="actions"><button class="btn" data-action="login">登录并同步设备</button><button class="btn ghost" data-action="logout">退出</button></div><p class="hint" style="margin-top:13px">登录成功后，服务器 URL、账户、本机名称和连接偏好会自动保存。有效登录状态会在下次打开时恢复。</p></section>
-        <section class="panel"><div class="panel-head"><div><h3>本机信息</h3><p>别人看到的设备名称</p></div></div><div class="field"><label>设备名称</label><input id="display" placeholder="例如：我的工作电脑"></div><div class="field"><label>连接别名</label><input id="alias" placeholder="starbridge-my-pc"></div><div class="field"><label>SSH 用户</label><input id="sshuser"></div><div class="field"><label><input id="directOnly" type="checkbox">本机只允许直连</label><label><input id="allowRelay" type="checkbox" checked>允许本机使用中转</label><p class="hint">本机发起或接收连接时均遵循这些限制，保存后生效。</p></div><button class="btn ghost" data-action="saveConfig">保存本机信息</button></section>
-        <section class="panel"><div class="panel-head"><div><h3>服务状态</h3><p>本机连接组件</p></div></div><div id="status" class="status"><span class="status-dot warn"></span><span>正在检查服务…</span></div><p id="runtime" class="hint mono" style="margin-bottom:0"></p><p id="ssh" class="hint" style="margin-bottom:0"></p></section>
-      </aside>
-    </div>
-    <pre id="copied" class="hidden"></pre>
-  </main>
-  <script>
-    let snapshot={};let preferences={allow_relay:true,direct_only:false};
-    const labels={direct:'直连',relay:'中转',unknown:'协商中'};
-    const statuses={negotiating:'协商中',connected:'已连接',failed:'连接失败',closed:'已断开'};
-    function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-    const desktop=window.__TAURI__?.core;
-    async function api(path,options={}){
-      if(desktop){
-        const key=`${options.method||'GET'} ${path}`;
-        const routes={
-          'GET /api/v1/state':['client_state'],
-          'GET /api/v1/config':['client_config'],
-          'PUT /api/v1/config':['client_save_config','config'],
-          'POST /api/v1/login':['client_login','form'],
-          'POST /api/v1/logout':['client_logout'],
-          'POST /api/v1/connect':['client_connect','form'],
-          'DELETE /api/v1/disconnect':['client_disconnect'],
-          'GET /api/v1/copy/nodes':['client_copy_nodes']
-        };
-        let route=routes[key];let params=route?.[1]?{[route[1]]:JSON.parse(options.body)}:{};
-        const sessionPath=/^\/api\/v1\/sessions\/([^/]+)$/.exec(path);
-        if(options.method==='DELETE'&&sessionPath){route=['client_disconnect_session'];params={sessionId:decodeURIComponent(sessionPath[1])}}
-        if(!route)throw new Error('不支持的客户端操作');
-        try{return await desktop.invoke(route[0],params)}
-        catch(e){throw new Error(typeof e==='string'?e:e.message||String(e))}
-      }
-      const r=await fetch(path,{headers:{'Content-Type':'application/json'},...options});
-      const j=await r.json();if(!r.ok)throw new Error(j.error||r.statusText);return j
-    }
-    function render(){
-      const s=snapshot;const devices=s.devices||[];const sessions=s.sessions||[];
-      const active=sessions.filter(session=>session.status==='connected'||session.status==='negotiating');
-      document.querySelector('#accountText').textContent=s.logged_in?`${s.username||'已登录'} · 已同步`:'尚未登录';
-      document.querySelector('#avatar').textContent=(s.username||'?').slice(0,1).toUpperCase();
-      document.querySelector('#server').value=s.server_url||'';
-      document.querySelector('#username').value=s.username||'';
-      document.querySelector('#display').value=s.display_name||'';
-      document.querySelector('#deviceCount').textContent=`${devices.length} 台设备`;
-      document.querySelector('#onlineCount').textContent=devices.filter(d=>d.online).length;
-      document.querySelector('#sessionCount').textContent=active.length;
-      const paths=[...new Set(active.map(session=>labels[session.path]||session.path))];
-      document.querySelector('#pathText').textContent=paths.length>1?'多种路径':paths[0]||'—';
-      const statusClass=s.last_error?'error':s.logged_in?'':'warn';
-      document.querySelector('#status').innerHTML=`<span class="status-dot ${statusClass}"></span><span>${esc(s.logged_in?'已连接到中心服务':s.stage==='restoring'?'正在恢复登录状态':'等待登录')}${s.last_error?`<br><span class="error">${esc(s.last_error)}</span>`:''}</span>`;
-      document.querySelector('#runtime').textContent=s.runtime?`${s.runtime.message} · frpc ${s.runtime.frpc_available?'可用':'未找到'}`:'';
-      document.querySelector('#ssh').textContent=s.ssh?.message||'';
-      document.querySelector('#devices').innerHTML=devices.length?devices.map(d=>{
-        const local=d.node_id===s.node_id;const accepts=(d.capabilities||[]).includes('ssh_server');
-        const available=d.online&&!local&&accepts;
-        const hint=local?'本机':!d.online?'等待上线':accepts?'可以连接':'连接服务未就绪';
-        return `<article class="device"><div class="device-top"><div><div class="device-name">${esc(d.display_name)}${local?' · 本机':''}</div><div class="device-meta">${esc(d.os)}/${esc(d.arch)} · ${esc(d.ssh_alias)}<br>${esc((d.capabilities||[]).filter(c=>!['ssh_client','ssh_server'].includes(c)).join(' · '))}</div></div><span class="pill ${d.online?'online':'offline'}">${d.online?'在线':'离线'}</span></div><div class="device-foot"><span class="muted">${hint}</span>${available?`<button class="btn" data-action="connect" data-node="${esc(d.node_id)}">连接</button>`:''}</div></article>`
-      }).join(''):'<div class="empty">登录后即可看到你的设备</div>';
-      document.querySelector('#session').innerHTML=sessions.length?sessions.map(session=>{
-        const outgoing=session.initiator_node_id===s.node_id;
-        const peerId=outgoing?session.target_node_id:session.initiator_node_id;
-        const peer=devices.find(d=>d.node_id===peerId)?.display_name||'其他设备';
-        const direction=outgoing?`本机 → ${peer}`:`${peer} → 本机`;
-        return `<div class="session"><div class="session-title"><strong>${esc(direction)}</strong><span class="pill ${session.status==='connected'?'online':''}">${esc(statuses[session.status]||session.status)}</span></div><p>路径：${esc(labels[session.path]||session.path)}<br><span class="mono">会话 ${esc(session.session_id)}</span>${session.failure_reason?`<br><span class="error">${esc(session.failure_reason)}</span>`:''}</p>${session.ssh_command?`<pre>${esc(session.ssh_command)}</pre>`:''}<div class="actions" style="margin-top:12px"><button class="btn danger" data-action="disconnectSession" data-session="${esc(session.session_id)}">${session.status==='failed'||session.status==='closed'?'移除记录':'断开连接'}</button></div></div>`
-      }).join(''):'<div class="empty">暂无活动连接</div>';
-      document.querySelector('#disconnect').classList.toggle('hidden',sessions.length<2);
-    }
-    async function refresh(){try{snapshot=await api('/api/v1/state');render()}catch(e){document.querySelector('#status').innerHTML=`<span class="status-dot error"></span><span class="error">${esc(e.message)}</span>`}}
-    async function login(){try{await saveConfig();snapshot=await api('/api/v1/login',{method:'POST',body:JSON.stringify({username:document.querySelector('#username').value,password:document.querySelector('#password').value})});document.querySelector('#password').value='';render()}catch(e){alert(e.message)}}
-    async function logout(){try{snapshot=await api('/api/v1/logout',{method:'POST'});render()}catch(e){alert(e.message)}}
-    async function saveConfig(){preferences={allow_relay:document.querySelector('#allowRelay').checked,direct_only:document.querySelector('#directOnly').checked};await api('/api/v1/config',{method:'PUT',body:JSON.stringify({server_url:document.querySelector('#server').value.trim(),display_name:document.querySelector('#display').value.trim(),ssh_alias:document.querySelector('#alias').value.trim(),ssh_user:document.querySelector('#sshuser').value.trim(),...preferences})})}
-    async function connect(id){try{const policy=document.querySelector('#connectionPolicy').value;snapshot=await api('/api/v1/connect',{method:'POST',body:JSON.stringify({target_node_id:id,policy})});render()}catch(e){alert(e.message);refresh()}}
-    async function disconnect(){try{snapshot=await api('/api/v1/disconnect',{method:'DELETE'});render()}catch(e){alert(e.message)}}
-    async function disconnectSession(id){try{snapshot=await api(`/api/v1/sessions/${encodeURIComponent(id)}`,{method:'DELETE'});render()}catch(e){alert(e.message);refresh()}}
-    async function copyNodes(){try{const j=await api('/api/v1/copy/nodes');document.querySelector('#copied').classList.remove('hidden');document.querySelector('#copied').textContent=j.text||'暂无在线设备';if(desktop)await desktop.invoke('plugin:clipboard-manager|write_text',{text:j.text});else await navigator.clipboard.writeText(j.text)}catch(e){alert(e.message)}}
-    async function loadConfig(){try{const c=await api('/api/v1/config');preferences={allow_relay:c.allow_relay,direct_only:c.direct_only};document.querySelector('#alias').value=c.ssh_alias||'';document.querySelector('#sshuser').value=c.ssh_user||'';document.querySelector('#server').value=c.server_url||'';document.querySelector('#directOnly').checked=c.direct_only;document.querySelector('#allowRelay').checked=c.allow_relay}catch{}}
-    document.addEventListener('change',event=>{
-      if(event.target.id==='directOnly'&&event.target.checked)document.querySelector('#allowRelay').checked=false;
-      if(event.target.id==='allowRelay'&&event.target.checked)document.querySelector('#directOnly').checked=false;
-    });
-    document.addEventListener('click',async event=>{
-      const button=event.target.closest('button[data-action]');if(!button)return;
-      const actions={copyNodes,refresh,login,logout,saveConfig,disconnect,disconnectSession:()=>disconnectSession(button.dataset.session),connect:()=>connect(button.dataset.node)};
-      const action=actions[button.dataset.action];if(!action)return;
-      button.disabled=true;try{await action()}catch(e){alert(e.message)}finally{button.disabled=false}
-    });
-    loadConfig();refresh();setInterval(refresh,4000);
-  </script>
+  <div id="app" aria-busy="true"><div class="startup" role="status">正在读取登录状态…</div></div>
+  <div id="toast" role="status" aria-live="polite" hidden></div>
+  <div id="context-menu" class="context-menu" role="menu" aria-label="设备操作" hidden></div>
+  <dialog id="modal" aria-labelledby="modal-title"></dialog>
 </body>
 </html>

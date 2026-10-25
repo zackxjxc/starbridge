@@ -21,6 +21,7 @@ fs2 = "0.4"
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 starbridge-protocol = { path = "../protocol" }
 tauri = { version = "2", optional = true }
 tauri-plugin-clipboard-manager = { version = "2", optional = true }

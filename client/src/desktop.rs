@@ -35,8 +35,90 @@ async fn client_login(
 }
 
 #[tauri::command]
+async fn client_register(
+    app: tauri::State<'_, ClientApp>,
+    form: RegisterForm,
+) -> Result<ClientSnapshot, String> {
+    register(State(app.inner().clone()), Json(form))
+        .await
+        .map(|value| value.0)
+        .map_err(|error| error.message)
+}
+
+#[tauri::command]
+async fn client_update_device(
+    app: tauri::State<'_, ClientApp>,
+    form: DeviceMetadataForm,
+) -> Result<ClientSnapshot, String> {
+    update_device(State(app.inner().clone()), Json(form))
+        .await
+        .map(|value| value.0)
+        .map_err(|error| error.message)
+}
+
+#[tauri::command]
+async fn client_connect_all(
+    app: tauri::State<'_, ClientApp>,
+    form: BatchConnectForm,
+) -> Result<ClientSnapshot, String> {
+    connect_all(State(app.inner().clone()), Json(form))
+        .await
+        .map(|value| value.0)
+        .map_err(|error| error.message)
+}
+
+#[tauri::command]
+async fn client_terminate(
+    app: tauri::State<'_, ClientApp>,
+    form: TerminateForm,
+) -> Result<ClientSnapshot, String> {
+    terminate(State(app.inner().clone()), Json(form))
+        .await
+        .map(|value| value.0)
+        .map_err(|error| error.message)
+}
+
+#[tauri::command]
+async fn client_export(
+    app: tauri::State<'_, ClientApp>,
+    form: ExportForm,
+) -> Result<serde_json::Value, String> {
+    export_connections(State(app.inner().clone()), Json(form))
+        .await
+        .map(|value| value.0)
+        .map_err(|error| error.message)
+}
+
+#[tauri::command]
+async fn client_start_test(app: tauri::State<'_, ClientApp>) -> Result<ClientSnapshot, String> {
+    start_test(State(app.inner().clone()))
+        .await
+        .map(|value| value.0)
+        .map_err(|error| error.message)
+}
+
+#[tauri::command]
+async fn client_cancel_test(app: tauri::State<'_, ClientApp>) -> Result<ClientSnapshot, String> {
+    cancel_test(State(app.inner().clone()))
+        .await
+        .map(|value| value.0)
+        .map_err(|error| error.message)
+}
+
+#[tauri::command]
+async fn client_components(app: tauri::State<'_, ClientApp>) -> Result<serde_json::Value, String> {
+    components(State(app.inner().clone()))
+        .await
+        .map(|value| value.0)
+        .map_err(|error| error.message)
+}
+
+#[tauri::command]
 async fn client_logout(app: tauri::State<'_, ClientApp>) -> Result<ClientSnapshot, String> {
-    Ok(logout(State(app.inner().clone())).await.0)
+    logout(State(app.inner().clone()))
+        .await
+        .map(|value| value.0)
+        .map_err(|error| error.message)
 }
 
 #[tauri::command]
@@ -85,6 +167,14 @@ pub fn run(app: ClientApp, _role: Role, root: PathBuf) -> anyhow::Result<()> {
             client_config,
             client_save_config,
             client_login,
+            client_register,
+            client_update_device,
+            client_connect_all,
+            client_terminate,
+            client_export,
+            client_start_test,
+            client_cancel_test,
+            client_components,
             client_logout,
             client_connect,
             client_disconnect,
@@ -94,9 +184,12 @@ pub fn run(app: ClientApp, _role: Role, root: PathBuf) -> anyhow::Result<()> {
         .build(tauri::generate_context!())?;
     // Build before run so startup failures return to main's error dialog and cleanup.
     WebviewWindowBuilder::new(&desktop, "main", WebviewUrl::App("index.html".into()))
-        .title("StarBridge · 设备中心")
-        .inner_size(1200.0, 820.0)
-        .min_inner_size(780.0, 600.0)
+        .title("StarBridge")
+        .inner_size(900.0, 600.0)
+        .min_inner_size(900.0, 600.0)
+        .max_inner_size(900.0, 600.0)
+        .resizable(false)
+        .maximizable(false)
         .data_directory(root.join("webview"))
         .on_navigation(|url| {
             (url.scheme() == "tauri" && url.host_str() == Some("localhost"))

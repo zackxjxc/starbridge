@@ -152,7 +152,11 @@ def fetch(artifact: dict[str, str], cache: Path, output: Path) -> dict[str, str]
                 copied.append(candidate.name)
         if not copied:
             raise SystemExit(f"{artifact['name']} 压缩包中没有允许的运行时文件")
-    return {"name": artifact["name"], "version": artifact["version"], "url": artifact["url"], "sha256": actual, "files": copied}
+    return {
+        "name": artifact["name"], "version": artifact["version"], "url": artifact["url"],
+        "sha256": actual, "files": copied,
+        "file_sha256": {name: sha256(output / name) for name in copied},
+    }
 
 
 def main() -> int:
