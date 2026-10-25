@@ -3,6 +3,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{RunEvent, WebviewUrl, WebviewWindowBuilder};
 
 #[tauri::command]
+fn client_window_action(window: tauri::WebviewWindow, action: String) -> Result<(), String> {
+    match action.as_str() {
+        "drag" => window.start_dragging(),
+        "minimize" => window.minimize(),
+        "close" => window.close(),
+        _ => return Err("不支持的窗口操作".into()),
+    }
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn client_state(app: tauri::State<'_, ClientApp>) -> Result<ClientSnapshot, String> {
     Ok(state(State(app.inner().clone())).await.0)
 }
@@ -163,6 +174,7 @@ pub fn run(app: ClientApp, _role: Role, root: PathBuf) -> anyhow::Result<()> {
         .manage(app)
         .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![
+            client_window_action,
             client_state,
             client_config,
             client_save_config,
@@ -183,7 +195,7 @@ pub fn run(app: ClientApp, _role: Role, root: PathBuf) -> anyhow::Result<()> {
         ])
         .build(tauri::generate_context!())?;
     // Build before run so startup failures return to main's error dialog and cleanup.
-    WebviewWindowBuilder::new(&desktop, "main", WebviewUrl::App("index.html".into()))
+    let window = WebviewWindowBuilder::new(&desktop, "main", WebviewUrl::App("index.html".into()))
         .title("StarBridge")
         .inner_size(900.0, 600.0)
         .min_inner_size(900.0, 600.0)
@@ -195,8 +207,13 @@ pub fn run(app: ClientApp, _role: Role, root: PathBuf) -> anyhow::Result<()> {
             (url.scheme() == "tauri" && url.host_str() == Some("localhost"))
                 || (matches!(url.scheme(), "http" | "https")
                     && url.host_str() == Some("tauri.localhost"))
-        })
-        .build()?;
+        });
+    #[cfg(windows)]
+    let window = window
+        .decorations(false)
+        .shadow(true)
+        .initialization_script("Object.defineProperty(window, '__STARBRIDGE_FRAMELESS__', { value: true });");
+    window.build()?;
     let closing = AtomicBool::new(false);
     desktop.run(move |handle, event| {
         if let RunEvent::ExitRequested { api, .. } = event {

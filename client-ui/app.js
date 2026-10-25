@@ -6,6 +6,7 @@
   const modal = document.getElementById('modal');
   const toastNode = document.getElementById('toast');
   const desktop = window.__TAURI__?.core;
+  const frameless = !!desktop && window.__STARBRIDGE_FRAMELESS__ === true;
   const activeStates = new Set(['negotiating', 'connected']);
   const workingStates = new Set(['queued', 'connecting', 'verifying']);
   const ui = {
@@ -59,7 +60,7 @@
     arrow: 'm9 5 7 7-7 7', back: 'm15 5-7 7 7 7', grid: 'M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z',
     test: 'M9 3h6 M10 3v6L4 19q-1 2 2 2h12q3 0 2-2L14 9V3 M8 14h8',
     more: 'M5 12h.01 M12 12h.01 M19 12h.01', check: 'm5 12 4 4L19 6', close: 'm6 6 12 12 M18 6 6 18',
-    copy: 'M9 9h11v12H9z M15 9V3H3v12h6', refresh: 'M20 7A9 9 0 1 0 21 15 M20 2v5h-5',
+    copy: 'M9 9h11v12H9z M15 9V3H3v12h6', refresh: 'M20 7A9 9 0 1 0 21 15 M20 2v5h-5', minimize: 'M5 12h14',
   };
   function icon(name) {
     const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -220,7 +221,7 @@
       item ? button('', 'menu', { class: 'icon-button', 'aria-label': `更多设备操作：${item.display_name}`, 'aria-haspopup': 'menu', 'data-id': item.node_id }, 'more') : null);
   }
   function banner(title, detail, tone = '') {
-    return h('div', { class: `banner ${tone}`, 'data-key': 'status-banner' }, h('p', { class: 'banner-title' }, title), detail ? h('p', { class: 'muted' }, detail) : null);
+    return h('div', { class: `banner ${tone}`, 'data-key': 'status-banner' }, h('p', { class: 'banner-title', title }, title), detail ? h('p', { class: 'muted' }, detail) : null);
   }
   function connectionError(error, stage) {
     const detail = message(error || '连接未完成，请重试。');
@@ -255,7 +256,11 @@
         h('label', { class: 'search' }, icon('search'), h('input', { type: 'search', id: 'device-search', value: ui.query, placeholder: '搜索名称或用途', 'aria-label': '搜索设备名称或用途', autocomplete: 'off' }))),
       h('div', { class: 'local-block' }, row(device(localId()), true), button(`连接测试 · ${testLabel()}`, 'test', { class: `local-test ${testTone()}`, 'aria-label': `连接测试，${testLabel()}` })),
       h('div', { class: 'device-list', 'data-key': 'device-list', 'aria-label': '其他设备' }, shown.length ? shown.map(item => row(item)) : h('div', { class: 'empty' }, query ? '没有匹配的设备' : '登录其他电脑后，设备会显示在这里。')),
-      button(h('span', { class: 'identity' }, h('span', {}, '连接所有设备'), h('span', { class: 'muted' }, '配置连接方式，查看进度与结果')), 'all', { class: `nav-all${ui.view === 'all' ? ' active' : ''}`, 'aria-current': ui.view === 'all' ? 'page' : undefined }, 'grid'));
+      h('div', { class: 'nav-all-area' }, button([
+        h('span', { class: 'nav-all-icon' }, icon('grid')),
+        h('span', { class: 'identity' }, h('span', { class: 'nav-all-title' }, '连接所有设备'), h('span', { class: 'muted' }, '配置连接方式，查看进度与结果')),
+        icon('arrow'),
+      ], 'all', { class: `nav-all${ui.view === 'all' ? ' active' : ''}`, 'aria-current': ui.view === 'all' ? 'page' : undefined })));
   }
   function draftFor(item) {
     return ui.drafts.get(item.node_id) || { display_name: item.display_name || '', purpose: item.purpose || '' };
@@ -279,13 +284,14 @@
     return h('div', { 'data-key': `device-page-${item.node_id}` },
       ui.failureGroup ? h('div', { class: 'backline' }, button('返回连接结果', 'all', { class: 'link' }, 'back'),
         h('div', { class: 'actions' }, button('上一台', 'failure-prev', { class: 'link' }), button('下一台同类设备', 'failure-next', { class: 'link' }))) : null,
-      heading(local ? '本机信息' : item.display_name, local ? item.display_name : item.purpose || '设备详情', item),
+      heading(local ? '本机信息' : item.display_name, local ? '这台电脑' : item.purpose || '设备详情', item),
       banner(status.text, stateDetail, status.tone === 'good' ? 'good' : status.tone === 'bad' ? 'bad' : ''),
       failure?.detail ? h('details', { class: 'details', 'data-key': 'connection-error-details' }, h('summary', {}, '技术详情'),
         h('pre', { class: 'command' }, failure.detail)) : null,
-      local ? button(h('span', { class: 'identity' }, h('strong', {}, '连接测试'), h('p', { class: testTone() }, testLabel()),
-        h('p', { class: 'muted' }, test().finished_at ? `最近一次测试：${formatTime(test().finished_at)}` : '检查本机能否正常发起和接收连接')), 'test', { class: 'test-entry', 'data-key': 'local-test-entry' }, 'test') : null,
-      local ? h('div', { 'data-key': 'local-actions' },
+      local ? button(h('span', { class: 'identity' }, h('strong', {}, '连接测试'), h('p', { class: testTone() }, testLabel())), 'test', {
+        class: 'test-entry', 'data-key': 'local-test-entry', title: test().finished_at ? `最近一次测试：${formatTime(test().finished_at)}` : '检查本机能否正常发起和接收连接',
+      }, 'test') : null,
+      local ? h('div', { class: 'local-actions actions', 'data-key': 'local-actions' },
         incoming().length ? button('终止连接', 'terminate-one', { class: 'button danger', 'data-id': incoming()[0].initiator_node_id, disabled: ui.busy.has('terminate') }) : null,
         outgoing().length ? button('管理本机连接', 'all', { class: 'link' }) : null) :
       h('div', { class: 'actions stretch', 'data-key': 'connection-actions' },
@@ -470,13 +476,17 @@
     return ({ device: devicePage, configure: configurePage, all: allPage, test: testPage, components: componentsPage, export: exportPage })[ui.view]?.() || devicePage();
   }
   function header(loggedIn) {
-    return h('header', { class: 'app-header' }, h('span', { class: 'brand-mark', 'aria-hidden': 'true' }, 'S'), h('span', {}, 'StarBridge'),
-      loggedIn ? h('div', { class: 'account' }, h('span', { class: 'account-name' }, s().username || ''), button('退出登录', 'logout', { class: 'link', disabled: ui.busy.has('logout') })) : null);
+    return h('header', { class: 'app-header', 'data-key': 'app-header' }, h('span', { class: 'brand-mark', 'aria-hidden': 'true' }, 'S'), h('span', {}, 'StarBridge'),
+      h('div', { class: 'account' }, loggedIn ? [h('span', { class: 'account-name', title: s().username || '' }, s().username || ''),
+        button('退出登录', 'logout', { class: 'link', disabled: ui.busy.has('logout') })] : null),
+      frameless ? h('div', { class: 'window-controls', 'aria-label': '窗口操作' },
+        button('', 'window-minimize', { class: 'window-button', 'aria-label': '最小化窗口', title: '最小化' }, 'minimize'),
+        button('', 'window-close', { class: 'window-button window-close', 'aria-label': '关闭窗口', title: '关闭' }, 'close')) : null);
   }
   function authPage() {
     const registering = ui.authMode === 'register';
     return h('div', { class: 'shell', 'data-key': 'auth-shell' }, header(false), h('main', { class: 'auth' },
-      h('form', { class: 'auth-form', 'data-form': 'auth' }, h('h1', {}, registering ? '创建账号' : '登录 StarBridge'), h('p', { class: 'intro' }, '登录后，在你的电脑之间建立连接。'),
+      h('form', { class: 'auth-form', 'data-form': 'auth' }, h('h1', {}, registering ? '创建账号' : '登录账号'), h('p', { class: 'intro' }, '登录后，在你的电脑之间建立连接。'),
         field('用户名', 'auth-username', ui.auth.username, { name: 'username', autocomplete: 'username', required: true, maxlength: 80 }),
         field('密码', 'auth-password', ui.auth.password, { name: 'password', type: 'password', autocomplete: registering ? 'new-password' : 'current-password', required: true, minlength: 4 }),
         registering ? field('确认密码', 'auth-confirm', ui.auth.confirm_password, { name: 'confirm_password', type: 'password', autocomplete: 'new-password', required: true, minlength: 4 }) : null,
@@ -487,16 +497,17 @@
   }
   function render() {
     if (!s()) {
-      patchChildren(root, [h('div', { class: 'startup', role: 'status' }, ui.loadError || '正在读取登录状态…', ui.loadError ? button('重试', 'retry') : null)]);
+      patchChildren(root, [h('div', { class: 'shell', 'data-key': 'startup-shell' }, header(false),
+        h('main', { class: 'startup', role: 'status' }, ui.loadError || '正在读取登录状态…', ui.loadError ? button('重试', 'retry') : null))]);
       return;
     }
     root.setAttribute('aria-busy', 'false');
     if (!s().logged_in) { patchChildren(root, [authPage()]); return; }
     const content = h('div', { class: 'shell', 'data-key': 'main-shell' }, header(true), h('div', { class: 'workspace' }, sidebar(),
-      h('main', { class: 'detail', 'data-key': `detail-${ui.view}-${ui.selected || ''}`, 'aria-label': '设备详情与操作' }, renderDetail())),
+      h('main', { class: `detail${ui.view === 'device' && ui.selected === localId() ? ' local-detail' : ''}`, 'data-key': `detail-${ui.view}-${ui.selected || ''}`, 'aria-label': '设备详情与操作' }, renderDetail())),
       h('footer', { class: 'footbar' }, h('span', { class: ui.syncError || s().stage === 'heartbeat_failed' ? 'bad' : '', title: s().stage === 'heartbeat_failed' ? '暂时无法更新账号设备状态，请检查网络连接。' : undefined },
         ui.syncError ? '状态更新失败，正在重试；复制操作暂不可用。' : s().stage === 'heartbeat_failed' ? '暂时无法更新账号设备状态，正在重试。' : `在线设备 ${peers().filter(item => item.online).length + 1} · SSH 已就绪 ${readySessions().length}`),
-        ui.syncError ? button('重新读取', 'retry', { class: 'link' }) : h('span', {}, 'StarBridge')));
+        ui.syncError ? button('重新读取', 'retry', { class: 'link' }) : null));
     patchChildren(root, [content]);
   }
   function toast(text) {
@@ -607,6 +618,9 @@
     if (target.disabled) return;
     if (actionName !== 'menu') closeMenu();
     switch (actionName) {
+      case 'window-minimize': case 'window-close':
+        if (frameless) await desktop.invoke('client_window_action', { action: actionName === 'window-close' ? 'close' : 'minimize' });
+        break;
       case 'retry': await refresh(); break;
       case 'select-device': ui.failureGroup = null; navigate('device', id, false); break;
       case 'device': navigate('device'); break;
@@ -668,6 +682,15 @@
       default: break;
     }
   }
+  document.addEventListener('mousedown', event => {
+    if (!frameless || event.button !== 0 || event.detail > 1 || !event.target.closest('.app-header')
+      || event.target.closest('button, a, input, textarea, select, [contenteditable], [role="button"]')) return;
+    event.preventDefault();
+    desktop.invoke('client_window_action', { action: 'drag' }).catch(error => toast(message(error)));
+  });
+  document.addEventListener('dblclick', event => {
+    if (frameless && event.target.closest('.app-header') && !event.target.closest('button, a, input, textarea, select')) event.preventDefault();
+  });
   document.addEventListener('click', event => {
     const target = event.target.closest('[data-action]');
     if (target) action(target, event).catch(error => toast(message(error)));
@@ -743,5 +766,6 @@
     } catch (error) { ui.loadError = message(error); }
     render(); ui.poll = setTimeout(polling, 1200);
   }
+  render();
   init();
 })();
