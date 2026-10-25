@@ -17,7 +17,8 @@ use tracing::info;
 #[derive(Parser, Debug)]
 #[command(name = "starbridge", about = "StarBridge desktop node console")]
 struct Args {
-    #[arg(long, default_value = "controller")]
+    /// Legacy role names are accepted only to locate existing data directories.
+    #[arg(long, default_value = "peer", hide = true)]
     role: String,
     /// Used only in headless mode.
     #[arg(long, default_value = "127.0.0.1:0")]
@@ -52,20 +53,26 @@ fn run() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
     let role = match args.role.to_ascii_lowercase().as_str() {
-        "controller" => Role::Controller,
-        "executor" => Role::Executor,
-        _ => anyhow::bail!("--role 只能是 controller 或 executor"),
+        "peer" | "controller" | "executor" => Role::Peer,
+        _ => anyhow::bail!("不支持的兼容启动参数；请省略 --role"),
     };
     let headless = args.headless || args.no_browser || !cfg!(feature = "desktop");
+    let directory = match args.role.to_ascii_lowercase().as_str() {
+        "controller" => "controller",
+        "executor" => "executor",
+        _ => "node",
+    };
+    let default_peer_directory = args.data_dir.is_none() && directory == "node";
     let root = match args.data_dir {
         Some(path) => std::path::absolute(path)?,
-        None if headless => std::env::current_dir()?.join("state").join(role_name(role)),
+        None if headless => std::env::current_dir()?.join("state").join(directory),
         None => std::env::current_exe()?
             .parent()
             .ok_or_else(|| anyhow::anyhow!("无法确定程序目录"))?
             .join("state")
-            .join(role_name(role)),
+            .join(directory),
     };
+    let root = if default_peer_directory { compatible_data_dir(root) } else { root };
     // Keep the lock open for the entire lifetime of this instance.
     let _instance = lock_data_dir(&root)?;
     let runtime = tokio::runtime::Runtime::new()?;
@@ -86,11 +93,15 @@ fn run() -> anyhow::Result<()> {
     result
 }
 
-fn role_name(role: Role) -> &'static str {
-    match role {
-        Role::Controller => "controller",
-        Role::Executor => "executor",
+/// Reuse an existing portable installation without copying identities or keys.
+fn compatible_data_dir(root: PathBuf) -> PathBuf {
+    if !root.exists() {
+        let legacy = root.with_file_name("controller");
+        if legacy.join("identity.json").is_file() {
+            return legacy;
+        }
     }
+    root
 }
 
 fn lock_data_dir(root: &Path) -> anyhow::Result<File> {
@@ -164,6 +175,19 @@ fn show_error(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_directory_reuses_existing_identity_without_overriding_new_profile() {
+        let parent = std::env::temp_dir().join(format!("starbridge-profile-{}", uuid::Uuid::new_v4()));
+        let legacy = parent.join("controller");
+        let root = parent.join("node");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("identity.json"), "{}").unwrap();
+        assert_eq!(compatible_data_dir(root.clone()), legacy);
+        std::fs::create_dir(&root).unwrap();
+        assert_eq!(compatible_data_dir(root.clone()), root);
+        std::fs::remove_dir_all(parent).unwrap();
+    }
 
     #[test]
     fn data_directory_is_exclusive_until_instance_exits() {

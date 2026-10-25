@@ -49,16 +49,18 @@ docs/         架构、打包和开发文档
 cargo run -p starbridge-server
 ```
 
-再分别启动控制端和执行端。每个实例必须使用独立的数据目录：
+再启动两台设备的客户端。本机联调使用两个独立数据目录：
 
 ```powershell
-cargo run -p starbridge-client -- --role controller --data-dir state/controller-a
-cargo run -p starbridge-client -- --role executor --data-dir state/executor-a
+cargo run -p starbridge-client -- --data-dir state/node-a
+cargo run -p starbridge-client -- --data-dir state/node-b
 ```
 
-以上命令分别打开控制端、执行端窗口。登录时使用同一账户名称和密码；开发阶段中心服务会在首次登录时创建本地账户。端侧会完成登录、设备登记、心跳、设备列表和会话策略校验。关闭窗口会停止客户端的心跳任务和受管的 `frpc`、`sshd` 子进程。
+两个实例使用同一套客户端，都能发起和接受连接。登录时使用同一账户名称和密码；开发阶段中心服务会在首次登录时创建本地账户。设备列表会显示同账户设备，任意一台都可点击另一台发起连接，也支持两个方向同时连接。关闭窗口会停止客户端的心跳任务和受管的 `frpc`、`sshd` 子进程。
 
-联调或自动化可添加 `--headless`，启动原有的本地 HTTP 控制台；`--no-browser` 保留为兼容入口。`powershell -ExecutionPolicy Bypass -File tools/start-local.ps1` 使用这种模式一次启动本地中心、控制端和执行端。若只需要无界面客户端，可用 `cargo run -p starbridge-client --no-default-features -- --headless --data-dir state/controller-a`，无需 Tauri 系统依赖。
+统一节点版本需要同步升级中心服务和客户端；历史设备身份和 SSH 密钥继续复用。构建后可运行 `python tools/test-peer-connectivity.py`，在隔离数据目录中验证真实 FRP/SSH 双向连接、独立断开、重复连接和重启恢复。
+
+联调或自动化可添加 `--headless`，启动原有的本地 HTTP 控制台；`--no-browser` 保留为兼容入口。`powershell -ExecutionPolicy Bypass -File tools/start-local.ps1` 使用这种模式一次启动本地中心和两个设备实例。若只需要无界面客户端，可用 `cargo run -p starbridge-client --no-default-features -- --headless --data-dir state/node-a`，无需 Tauri 系统依赖。
 
 目前还没有把真实 `frpc/frps` 二进制提交到仓库。先运行 `python tools/fetch_runtime.py --manifest vendor/manifest.toml --output state/runtime` 准备经过 SHA-256 校验的本机运行时，再用 `starbridge-server --frps-path state/runtime/frps.exe` 启动中心和本地 `frps`。`--frps-bind-addr`（默认 `127.0.0.1`）控制本机 frps 的监听地址，`--frps-addr`（也可写作 `--frps-advertised-addr`）是下发给客户端用于连接 frps 的可达地址；两者可按部署拓扑分别设置。端侧会自动寻找实例目录旁的共享 `state/runtime`，为 `direct_only`、`relay_only` 和 `direct_preferred` 生成受控的 XTCP/STCP 配置并监督 `frpc`；缺少运行时或启动失败时，控制台会明确显示原因。如果 Windows 安全软件拦截 `frpc.exe`，请根据界面提示手动检查并放行。
 
@@ -74,13 +76,13 @@ python tools/package_windows.py
 
 输出为 `dist/StarBridge-test/` 和 `dist/StarBridge-test.zip`。构建默认启用桌面和 `custom-protocol` 功能，将 UI 嵌入可执行文件；打包仅组装便携目录与 zip，不生成 MSI 或 NSIS 安装包。
 
-解压到可写目录后，双击 `starbridge.exe` 即可打开控制端；双击 `start-executor.bat` 打开执行端。首次在界面填写服务器地址，默认是本机开发地址。需要保留整个目录中的 `runtime/` 和许可证文件。运行电脑需要已安装 WebView2 Runtime；不需要安装 StarBridge 或 Rust。
+解压到可写目录后，双击 `starbridge.exe` 或 `start-node.bat` 打开设备中心，同账户设备可互相发起连接。首次在界面填写服务器地址，默认是本机开发地址。需要保留整个目录中的 `runtime/` 和许可证文件。运行电脑需要已安装 WebView2 Runtime；不需要安装 StarBridge 或 Rust。
 
-默认数据分别保存到可执行文件旁的 `state/controller/` 和 `state/executor/`，不依赖启动时的工作目录；可通过 `--data-dir` 指定其他位置。`runtime/` 从数据目录及其父目录、可执行文件旁依次查找，兼容开发环境的 `state/runtime/`。升级时请保留数据目录，不要把配置、身份或登录状态打进分发 zip。
+新设备默认数据保存在可执行文件旁的 `state/node/`；升级时若该目录不存在且检测到旧 `state/controller/identity.json`，会继续使用旧目录。旧启动脚本继续使用各自的原数据目录。数据位置不依赖启动时的工作目录；可通过 `--data-dir` 指定其他位置。`runtime/` 从数据目录及其父目录、可执行文件旁依次查找，兼容开发环境的 `state/runtime/`。升级时请保留数据目录，不要把配置、身份或登录状态打进分发 zip。
 
 ### macOS（Apple Silicon）
 
-macOS 使用 `vendor/manifest.darwin-arm64.toml`。FRP 下载官方预编译包；OpenSSH 没有官方 macOS 预编译包，系统自带的 `/usr/sbin/sshd` 复制出 `/usr` 后会被系统终止，所以构建时下载 portable 源码，编译出执行端内置 sshd 需要的 `sshd`、`sshd-session`、`sshd-auth`、`ssh-keygen` 和 `sftp-server`。需要先安装 Xcode 命令行工具，用 Python 3.11+ 运行，或者在旧版本里安装 `tomli`：
+macOS 使用 `vendor/manifest.darwin-arm64.toml`。FRP 下载官方预编译包；OpenSSH 没有官方 macOS 预编译包，系统自带的 `/usr/sbin/sshd` 复制出 `/usr` 后会被系统终止，所以构建时下载 portable 源码，编译出设备内置 sshd 需要的 `sshd`、`sshd-session`、`sshd-auth`、`ssh-keygen` 和 `sftp-server`。需要先安装 Xcode 命令行工具，用 Python 3.11+ 运行，或者在旧版本里安装 `tomli`：
 
 ```sh
 python3 tools/fetch_runtime.py --manifest vendor/manifest.darwin-arm64.toml --output state/runtime

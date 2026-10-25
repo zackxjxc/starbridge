@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-title StarBridge 控制端
+title StarBridge 设备中心
 cd /d "%~dp0"
 
 if not exist "%~dp0starbridge.exe" (
@@ -9,5 +9,5 @@ if not exist "%~dp0starbridge.exe" (
   exit /b 1
 )
 
-start "" "%~dp0starbridge.exe" --role controller --data-dir "%~dp0state\controller"
+start "" "%~dp0starbridge.exe" --data-dir "%~dp0state\controller"
 exit /b %ERRORLEVEL%

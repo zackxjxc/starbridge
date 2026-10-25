@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
@@ -12,6 +12,7 @@ use starbridge_protocol::{
     SessionPath, SessionStatus, SessionStatusRequest, SshPrivilege, new_token, now_unix,
 };
 use std::{
+    collections::{HashMap, HashSet},
     path::{Path as FsPath, PathBuf},
     process::Stdio,
     sync::{
@@ -76,7 +77,7 @@ pub struct RuntimeStatus {
     pub message: String,
 }
 
-/// 本机 SSH 准备结果：执行端是内置 sshd，控制端是登录密钥。
+/// 本机同时具备 SSH 登录密钥和接收连接的服务能力。
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct SshStatus {
     pub privilege: SshPrivilege,
@@ -98,6 +99,7 @@ pub struct ClientSnapshot {
     pub display_name: String,
     pub devices: Vec<DeviceInfo>,
     pub session: Option<SessionView>,
+    pub sessions: Vec<SessionView>,
     pub stage: String,
     pub last_error: Option<String>,
     pub runtime: RuntimeStatus,
@@ -109,19 +111,23 @@ pub struct ClientSnapshot {
 #[derive(Clone, Debug, Serialize)]
 pub struct SessionView {
     pub session_id: String,
+    pub initiator_node_id: String,
+    pub target_node_id: String,
     pub policy: ConnectionPolicy,
     pub path: SessionPath,
     pub status: SessionStatus,
     pub created_at: u64,
     pub expires_at: u64,
     pub failure_reason: Option<String>,
+    pub ssh_command: Option<String>,
 }
 
 #[derive(Clone)]
 pub struct ClientApp {
     inner: Arc<RwLock<Inner>>,
     http: reqwest::Client,
-    frpc_process: Arc<Mutex<Option<tokio::process::Child>>>,
+    frpc_processes: Arc<Mutex<HashMap<String, tokio::process::Child>>>,
+    session_operations: Arc<Mutex<()>>,
     sshd_process: Arc<Mutex<Option<tokio::process::Child>>>,
     shutting_down: Arc<AtomicBool>,
     background_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
@@ -134,12 +140,14 @@ struct Inner {
     identity: Identity,
     auth: Option<AuthResponse>,
     devices: Vec<DeviceInfo>,
-    session: Option<SessionInfo>,
+    sessions: HashMap<String, SessionInfo>,
+    pending_closes: HashSet<String>,
     stage: String,
     last_error: Option<String>,
     runtime: RuntimeStatus,
     ssh: SshStatus,
-    visitor_port: Option<u16>,
+    visitor_ports: HashMap<String, u16>,
+    route_generations: HashMap<String, u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,32 +163,36 @@ pub struct ConnectForm {
 }
 
 impl ClientApp {
-    pub async fn load(role: Role, root: PathBuf) -> anyhow::Result<Self> {
+    pub async fn load(_role: Role, root: PathBuf) -> anyhow::Result<Self> {
         tokio::fs::create_dir_all(&root).await?;
         let config = load_json(&root.join("config.json"), ClientConfig::default()).await?;
         let identity = load_json(&root.join("identity.json"), Identity::default()).await?;
         let persisted_auth: Option<AuthResponse> =
             load_json(&root.join("auth.json"), None::<AuthResponse>).await?;
         let auth = persisted_auth.filter(|value| value.expires_at > now_unix());
+        let pending_closes = load_json(&root.join("pending-closes.json"), HashSet::new()).await?;
         let restoring = auth.is_some();
         let runtime = runtime_status(&root);
         let app = Self {
             inner: Arc::new(RwLock::new(Inner {
-                role,
+                role: Role::Peer,
                 root,
                 config,
                 identity,
                 auth,
                 devices: Vec::new(),
-                session: None,
+                sessions: HashMap::new(),
+                pending_closes,
                 stage: if restoring { "restoring" } else { "ready" }.into(),
                 last_error: None,
                 runtime,
                 ssh: SshStatus::default(),
-                visitor_port: None,
+                visitor_ports: HashMap::new(),
+                route_generations: HashMap::new(),
             })),
-            http: reqwest::Client::builder().no_proxy().build()?,
-            frpc_process: Arc::new(Mutex::new(None)),
+            http: reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(15)).build()?,
+            frpc_processes: Arc::new(Mutex::new(HashMap::new())),
+            session_operations: Arc::new(Mutex::new(())),
             sshd_process: Arc::new(Mutex::new(None)),
             shutting_down: Arc::new(AtomicBool::new(false)),
             background_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -190,32 +202,30 @@ impl ClientApp {
     }
 
     async fn prepare_ssh(&self) {
-        let (role, root, runtime) = {
+        let (root, runtime) = {
             let inner = self.inner.read().await;
-            (inner.role, inner.root.clone(), inner.runtime.clone())
+            (inner.root.clone(), inner.runtime.clone())
         };
         let dir = root.join("ssh");
-        let result = match role {
-            Role::Controller => ensure_key(
-                &runtime_file(&runtime, "ssh-keygen"),
-                &dir.join("id_ed25519"),
-            )
-            .await
-            .map(|public_key| SshStatus {
-                public_key,
-                message: "本机 SSH 登录密钥已就绪".into(),
-                ..SshStatus::default()
-            }),
-            Role::Executor => self.start_sshd(&runtime, &dir).await,
-        };
-        let status = result.unwrap_or_else(|error| SshStatus {
-            message: format!("SSH 准备失败：{error}"),
+        let key = ensure_key(
+            &runtime_file(&runtime, "ssh-keygen"),
+            &dir.join("id_ed25519"),
+        ).await;
+        let mut status = self.start_sshd(&runtime, &dir).await.unwrap_or_else(|error| SshStatus {
+            message: format!("接收 SSH 连接暂不可用：{error}"),
             ..SshStatus::default()
         });
+        match key {
+            Ok(public_key) => {
+                status.public_key = public_key;
+                status.message = format!("SSH 登录密钥已就绪 · {}", status.message);
+            }
+            Err(error) => status.message = format!("SSH 登录密钥准备失败：{error} · {}", status.message),
+        }
         self.inner.write().await.ssh = status;
     }
 
-    /// 以当前用户身份启动内置 sshd，只监听回环地址，只接受同账户控制端的公钥。
+    /// 以当前用户身份启动内置 sshd，只监听回环地址，只接受同账户设备的公钥。
     async fn start_sshd(&self, runtime: &RuntimeStatus, dir: &FsPath) -> anyhow::Result<SshStatus> {
         if let Some(port) = std::env::var("STARBRIDGE_SSH_PORT")
             .ok()
@@ -283,7 +293,7 @@ impl ClientApp {
     async fn sync_authorized_keys(&self, devices: &[DeviceInfo]) {
         let path = {
             let inner = self.inner.read().await;
-            if inner.role != Role::Executor || inner.ssh.port.is_none() {
+            if inner.ssh.port.is_none() {
                 return;
             }
             inner.root.join("ssh").join("authorized_keys")
@@ -316,6 +326,7 @@ impl ClientApp {
             .route("/api/v1/logout", post(logout))
             .route("/api/v1/connect", post(connect))
             .route("/api/v1/disconnect", delete(disconnect))
+            .route("/api/v1/sessions/{id}", delete(disconnect_session))
             .route("/api/v1/copy/nodes", get(copy_nodes))
             .with_state(self.clone())
     }
@@ -326,16 +337,22 @@ impl ClientApp {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
             loop {
                 interval.tick().await;
+                let attempted_auth = app.inner.read().await.auth.as_ref().map(|auth| auth.access_token.clone());
                 if let Err(error) = app.heartbeat_once().await {
+                    let _operation = app.session_operations.lock().await;
                     let mut inner = app.inner.write().await;
+                    if inner.auth.as_ref().map(|auth| &auth.access_token) != attempted_auth.as_ref() {
+                        continue;
+                    }
                     if inner.auth.is_some() {
-                        if error
-                            .downcast_ref::<reqwest::Error>()
-                            .and_then(reqwest::Error::status)
-                            == Some(StatusCode::UNAUTHORIZED)
-                        {
+                        if error.downcast_ref::<reqwest::Error>().and_then(reqwest::Error::status)
+                            == Some(StatusCode::UNAUTHORIZED) {
                             inner.auth = None;
                             let _ = tokio::fs::remove_file(inner.root.join("auth.json")).await;
+                            drop(inner);
+                            app.close_sessions(None).await;
+                            app.sync_authorized_keys(&[]).await;
+                            inner = app.inner.write().await;
                             inner.stage = "ready".into();
                         } else {
                             inner.stage = "heartbeat_failed".into();
@@ -377,134 +394,103 @@ impl ClientApp {
         }
         self.stop_frpc().await;
         self.stop_sshd().await;
+        // 退出先完成本地回收，中心通知最多等待一秒。
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let _operation = self.session_operations.lock().await;
+            self.close_sessions(None).await;
+            self.mark_offline().await;
+        }).await;
     }
 
     async fn heartbeat_once(&self) -> anyhow::Result<()> {
-        let (auth, url, node_id, role) = {
+        let _operation = self.session_operations.lock().await;
+        let (auth, url, identity, registration) = {
             let inner = self.inner.read().await;
-            let auth = inner
-                .auth
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("未登录"))?;
             (
-                auth,
+                inner.auth.clone().ok_or_else(|| anyhow::anyhow!("未登录"))?,
                 inner.config.server_url.clone(),
-                inner.identity.node_id.clone(),
-                inner.role,
+                inner.identity.clone(),
+                device_registration(&inner),
             )
         };
-        let response = self
-            .http
-            .post(format!("{url}/api/v1/devices/heartbeat"))
+        // 恢复登录或重启后重新发布本机密钥和能力，旧身份也升级为统一节点。
+        let devices = self.http
+            .post(format!("{url}/api/v1/devices/register"))
             .bearer_auth(&auth.access_token)
-            .json(&HeartbeatRequest {
-                node_id: node_id.clone(),
-                status: "online".into(),
-            })
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Vec<DeviceInfo>>()
-            .await?;
-        let assigned = if role == Role::Executor {
-            self.http
-                .get(format!("{url}/api/v1/sessions/assigned/{node_id}"))
-                .bearer_auth(&auth.access_token)
-                .send()
-                .await?
-                .error_for_status()?
-                .json::<Vec<SessionInfo>>()
-                .await?
-        } else {
-            Vec::new()
-        };
-        self.sync_authorized_keys(&response).await;
+            .json(&registration)
+            .send().await?.error_for_status()?
+            .json::<Vec<DeviceInfo>>().await?;
+        self.sync_authorized_keys(&devices).await;
+        self.inner.write().await.devices = devices;
+        // 断网时的断开意图持久保存；先补发撤销，不能把它当作待恢复连接。
+        self.retry_pending_closes().await;
+        let assigned = self.http
+            .get(format!("{url}/api/v1/sessions/assigned/{}", identity.node_id))
+            .bearer_auth(&auth.access_token)
+            .header("x-starbridge-device-token", &identity.device_token)
+            .send().await?.error_for_status()?
+            .json::<Vec<SessionInfo>>().await?;
+        let active: HashSet<_> = assigned.iter().map(|session| session.session_id.clone()).collect();
+        {
+            let mut inner = self.inner.write().await;
+            inner.pending_closes.retain(|id| active.contains(id));
+            save_json(&inner.root.join("pending-closes.json"), &inner.pending_closes).await?;
+        }
+        let stale: Vec<_> = self.inner.read().await.sessions.keys()
+            .filter(|id| !active.contains(*id)).cloned().collect();
+        for id in stale {
+            self.stop_session(&id).await;
+        }
+        for session in assigned {
+            if self.inner.read().await.pending_closes.contains(&session.session_id) {
+                continue;
+            }
+            let outgoing = session.initiator_node_id == identity.node_id;
+            let old = self.inner.read().await.sessions.get(&session.session_id).cloned();
+            let running = {
+                let mut processes = self.frpc_processes.lock().await;
+                match processes.get_mut(&session.session_id) {
+                    Some(child) => child.try_wait()?.is_none(),
+                    None => false,
+                }
+            };
+            let should_start = !running || old.as_ref().is_none_or(|old| {
+                session.path == SessionPath::Relay && old.path != SessionPath::Relay
+            });
+            self.inner.write().await.sessions.insert(session.session_id.clone(), session.clone());
+            if should_start {
+                match self.start_frpc_mode(&session, outgoing, session.path == SessionPath::Relay).await {
+                    Ok(()) => {
+                        if outgoing {
+                            self.spawn_direct_fallback_monitor(session.clone()).await;
+                        }
+                        let path = if session.policy == ConnectionPolicy::RelayOnly {
+                            SessionPath::Relay
+                        } else {
+                            session.path
+                        };
+                        if let Ok(updated) = update_remote_session(self, &session, SessionStatus::Connected, path, session.failure_reason.clone()).await {
+                            self.inner.write().await.sessions.insert(updated.session_id.clone(), updated);
+                        }
+                    }
+                    Err(error) => self.fail_session(&session, error.to_string()).await,
+                }
+            }
+        }
         let mut inner = self.inner.write().await;
-        inner.devices = response;
-        // 有会话时保留建联阶段和回退原因，只在空闲或从心跳失败恢复时回到 online。
-        if inner.session.is_none() || inner.stage == "heartbeat_failed" {
+        if inner.sessions.is_empty() || inner.stage == "heartbeat_failed" {
             inner.stage = "online".into();
-            inner.last_error = None;
-        }
-        let assigned_session = assigned.first().cloned();
-        // 中心只返回未结束的会话；本地还有会话但中心已经不再分配，说明控制端已断开或会话已失败。
-        if role == Role::Executor && assigned_session.is_none() && inner.session.is_some() {
-            inner.session = None;
-            inner.stage = "online".into();
-            inner.last_error = None;
-            drop(inner);
-            self.stop_frpc().await;
-            return Ok(());
-        }
-        let should_start = assigned_session.as_ref().is_some_and(|session| {
-            inner.session.as_ref().is_none_or(|old| {
-                old.session_id != session.session_id
-                    || (session.path == SessionPath::Relay && old.path != SessionPath::Relay)
-            })
-        });
-        if let Some(session) = assigned_session {
-            if !should_start {
-                inner.session = Some(session.clone());
-                match session.path {
-                    SessionPath::Direct => {
-                        inner.stage = "direct".into();
-                        inner.last_error = None;
-                    }
-                    SessionPath::Relay => {
-                        inner.stage = "frpc_running".into();
-                    }
-                    SessionPath::Unknown => {}
-                }
-            }
-            if !should_start {
-                return Ok(());
-            }
-            inner.session = Some(session.clone());
-            drop(inner);
-            match self
-                .start_frpc_mode(&session, false, session.path == SessionPath::Relay)
-                .await
-            {
-                Ok(()) => {
-                    // 路径由控制端根据 visitor 日志判定，执行端不能把已判定的路径覆盖回 unknown。
-                    let path = if session.policy == ConnectionPolicy::RelayOnly {
-                        SessionPath::Relay
-                    } else {
-                        session.path
-                    };
-                    if let Ok(updated) =
-                        update_remote_session(self, &session, SessionStatus::Connected, path, None)
-                            .await
-                    {
-                        let mut inner = self.inner.write().await;
-                        inner.session = Some(updated);
-                    }
-                }
-                Err(error) => {
-                    let mut inner = self.inner.write().await;
-                    inner.stage = if error.to_string().contains("缺少 frpc") {
-                        "runtime_missing"
-                    } else {
-                        "frpc_failed"
-                    }
-                    .into();
-                    inner.last_error = Some(format!(
-                        "执行端 frpc 路由启动失败：{error}。{}",
-                        security_hint()
-                    ));
-                    drop(inner);
-                    let _ = update_remote_session(
-                        self,
-                        &session,
-                        SessionStatus::Failed,
-                        SessionPath::Unknown,
-                        Some(error.to_string()),
-                    )
-                    .await;
-                }
-            }
+            if inner.pending_closes.is_empty() { inner.last_error = None; }
         }
         Ok(())
+    }
+
+    async fn fail_session(&self, session: &SessionInfo, reason: String) {
+        self.stop_session(&session.session_id).await;
+        let _ = update_remote_session(self, session, SessionStatus::Failed, SessionPath::Unknown, Some(reason.clone())).await;
+        let mut inner = self.inner.write().await;
+        inner.stage = "frpc_failed".into();
+        inner.last_error = Some(format!("连接启动失败：{reason}。{}", security_hint()));
     }
 
     async fn start_frpc(&self, session: &SessionInfo, controller: bool) -> anyhow::Result<()> {
@@ -524,12 +510,13 @@ impl ClientApp {
             .route
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("中心没有返回 FRP 路由参数"))?;
-        let (root, frpc_path, ssh_port, target) = {
+        let (root, frpc_path, ssh_port, existing_port, target) = {
             let inner = self.inner.read().await;
             (
                 inner.root.clone(),
                 inner.runtime.frpc_path.clone(),
                 inner.ssh.port,
+                inner.visitor_ports.get(&session.session_id).copied(),
                 inner
                     .devices
                     .iter()
@@ -541,14 +528,16 @@ impl ClientApp {
             anyhow::bail!("缺少 frpc: {frpc_path}");
         }
         let port = if controller {
-            pick_port(22000, 22999)?
+            match existing_port {
+                Some(port) => port,
+                None => pick_port(22000, 22999)?,
+            }
         } else {
-            ssh_port.unwrap_or(22)
+            ssh_port.ok_or_else(|| anyhow::anyhow!("本机 SSH 服务尚未就绪"))?
         };
         if controller {
-            if let Some(target) = &target {
-                write_ssh_client_files(&root, target, port).await?;
-            }
+            let target = target.as_ref().ok_or_else(|| anyhow::anyhow!("目标设备不存在"))?;
+            write_session_ssh_files(&root, &session.session_id, target, port).await?;
         }
         let config = frpc_config(route, session, controller, port, force_relay);
         let routes = root.join("routes");
@@ -558,7 +547,8 @@ impl ClientApp {
         let log_path = routes.join(format!("{}.log", session.session_id));
         let log = std::fs::OpenOptions::new()
             .create(true)
-            .append(true)
+            .write(true)
+            .truncate(true)
             .open(&log_path)?;
         let mut process = async_command(&frpc_path);
         process
@@ -567,15 +557,14 @@ impl ClientApp {
             .stdin(Stdio::null())
             .stdout(Stdio::from(log.try_clone()?))
             .stderr(Stdio::from(log));
-        let mut current = self.frpc_process.lock().await;
+        let mut current = self.frpc_processes.lock().await;
         if self.shutting_down.load(Ordering::Acquire) {
             anyhow::bail!("客户端正在退出");
         }
-        if let Some(old) = current.as_mut() {
+        if let Some(mut old) = current.remove(&session.session_id) {
             let _ = old.kill().await;
             let _ = old.wait().await;
         }
-        *current = None;
         if self.shutting_down.load(Ordering::Acquire) {
             anyhow::bail!("客户端正在退出");
         }
@@ -583,25 +572,28 @@ impl ClientApp {
             .spawn()
             .map_err(|error| anyhow::anyhow!("启动 frpc 失败: {error}"))?;
         // 在首次 await 前登记，后台任务被取消时 shutdown 仍能等待进程退出。
-        *current = Some(child);
+        current.insert(session.session_id.clone(), child);
         tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-        if let Some(status) = current.as_mut().expect("frpc process registered").try_wait()? {
-            *current = None;
+        if let Some(status) = current.get_mut(&session.session_id).expect("frpc process registered").try_wait()? {
+            current.remove(&session.session_id);
             anyhow::bail!("frpc 启动后退出: {status}，日志见 {}", log_path.display());
         }
         drop(current);
+        let mut inner = self.inner.write().await;
+        *inner.route_generations.entry(session.session_id.clone()).or_default() += 1;
         if controller {
-            self.inner.write().await.visitor_port = Some(port);
+            inner.visitor_ports.insert(session.session_id.clone(), port);
         }
         Ok(())
     }
 
     /// 跟踪 visitor 日志判定实际路径。XTCP 要等第一条 SSH 连接才开始打洞，
     /// 所以一直跟踪到会话结束，而不是只看启动后的固定时长。
-    fn spawn_direct_fallback_monitor(&self, session: SessionInfo) {
-        if session.policy == ConnectionPolicy::RelayOnly {
+    async fn spawn_direct_fallback_monitor(&self, session: SessionInfo) {
+        if session.policy == ConnectionPolicy::RelayOnly || session.path == SessionPath::Relay {
             return;
         }
+        let generation = self.inner.read().await.route_generations.get(&session.session_id).copied();
         let app = self.clone();
         self.spawn_background(async move {
             let root = { app.inner.read().await.root.clone() };
@@ -615,9 +607,8 @@ impl ClientApp {
                     .inner
                     .read()
                     .await
-                    .session
-                    .as_ref()
-                    .is_some_and(|current| current.session_id == session.session_id);
+                    .route_generations
+                    .get(&session.session_id).copied() == generation;
                 if !active {
                     break;
                 }
@@ -627,6 +618,8 @@ impl ClientApp {
                 };
                 match frpc_path_from_log(&log) {
                     Some(SessionPath::Direct) => {
+                        let _operation = app.session_operations.lock().await;
+                        if app.inner.read().await.route_generations.get(&session.session_id).copied() != generation { break; }
                         if let Ok(updated) = update_remote_session(
                             &app,
                             &session,
@@ -637,7 +630,7 @@ impl ClientApp {
                         .await
                         {
                             let mut inner = app.inner.write().await;
-                            inner.session = Some(updated);
+                            inner.sessions.insert(updated.session_id.clone(), updated);
                             inner.stage = "direct".into();
                             inner.last_error = None;
                         }
@@ -646,6 +639,8 @@ impl ClientApp {
                     Some(SessionPath::Relay)
                         if session.policy == ConnectionPolicy::DirectPreferred =>
                     {
+                        let _operation = app.session_operations.lock().await;
+                        if app.inner.read().await.route_generations.get(&session.session_id).copied() != generation { break; }
                         if app.start_frpc_mode(&session, true, true).await.is_ok() {
                             if let Ok(updated) = update_remote_session(
                                 &app,
@@ -657,7 +652,7 @@ impl ClientApp {
                             .await
                             {
                                 let mut inner = app.inner.write().await;
-                                inner.session = Some(updated);
+                                inner.sessions.insert(updated.session_id.clone(), updated);
                                 inner.stage = "relay_fallback".into();
                                 inner.last_error = Some("XTCP 直连失败，已回退到 FRPS 中转".into());
                             }
@@ -666,6 +661,8 @@ impl ClientApp {
                     }
                     // 只允许直连时不回退；记录失败原因，visitor 会在下一条连接时重新打洞。
                     Some(SessionPath::Relay) if !reported_failure => {
+                        let _operation = app.session_operations.lock().await;
+                        if app.inner.read().await.route_generations.get(&session.session_id).copied() != generation { break; }
                         reported_failure = true;
                         let reason = "XTCP 直连失败，本次连接只允许直连，不会回退到中转";
                         let _ = update_remote_session(
@@ -687,12 +684,109 @@ impl ClientApp {
     }
 
     pub async fn stop_frpc(&self) {
-        let mut current = self.frpc_process.lock().await;
-        if let Some(child) = current.as_mut() {
+        let mut current = self.frpc_processes.lock().await;
+        for (_, mut child) in current.drain() {
             let _ = child.kill().await;
             let _ = child.wait().await;
         }
-        *current = None;
+    }
+
+    async fn stop_session(&self, id: &str) {
+        if let Some(mut child) = self.frpc_processes.lock().await.remove(id) {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+        let mut inner = self.inner.write().await;
+        inner.sessions.remove(id);
+        inner.visitor_ports.remove(id);
+        inner.route_generations.remove(id);
+    }
+
+    /// 先清理本地，再尽力通知中心；网络中断不能阻止用户停止连接。
+    async fn close_sessions(&self, only: Option<&str>) {
+        let ids = {
+            let mut inner = self.inner.write().await;
+            let ids = inner.sessions.keys().filter(|id| only.is_none_or(|only| only == id.as_str())).cloned().collect::<Vec<_>>();
+            inner.pending_closes.extend(ids.iter().cloned());
+            if let Err(error) = save_json(&inner.root.join("pending-closes.json"), &inner.pending_closes).await {
+                inner.last_error = Some(format!("保存断开状态失败：{error}"));
+            }
+            ids
+        };
+        for id in &ids { self.stop_session(id).await; }
+        self.retry_pending_closes().await;
+        let mut inner = self.inner.write().await;
+        inner.stage = if inner.auth.is_some() { "online" } else { "ready" }.into();
+    }
+
+    async fn retry_pending_closes(&self) {
+        let (auth, url, identity, ids) = {
+            let inner = self.inner.read().await;
+            (inner.auth.clone(), inner.config.server_url.clone(), inner.identity.clone(), inner.pending_closes.iter().cloned().collect::<Vec<_>>())
+        };
+        if ids.is_empty() { return; }
+        let mut failure = None;
+        if let Some(auth) = auth {
+            for id in ids {
+                match self.http.delete(format!("{url}/api/v1/sessions/{id}"))
+                    .bearer_auth(&auth.access_token)
+                    .header("x-starbridge-node-id", &identity.node_id)
+                    .header("x-starbridge-device-token", &identity.device_token)
+                    .send().await.and_then(reqwest::Response::error_for_status) {
+                    Ok(_) => { self.inner.write().await.pending_closes.remove(&id); }
+                    Err(error) => failure = Some(format!("本地连接已断开，中心状态同步失败：{error}")),
+                }
+            }
+        }
+        let mut inner = self.inner.write().await;
+        if let Err(error) = save_json(&inner.root.join("pending-closes.json"), &inner.pending_closes).await {
+            failure = Some(format!("保存断开状态失败：{error}"));
+        }
+        inner.last_error = failure;
+    }
+
+    async fn mark_offline(&self) {
+        let (auth, url, identity) = {
+            let inner = self.inner.read().await;
+            (inner.auth.clone(), inner.config.server_url.clone(), inner.identity.clone())
+        };
+        if let Some(auth) = auth {
+            let _ = self.http.post(format!("{url}/api/v1/devices/heartbeat"))
+                .bearer_auth(&auth.access_token)
+                .json(&HeartbeatRequest {
+                    node_id: identity.node_id,
+                    device_token: identity.device_token,
+                    status: "offline".into(),
+                }).send().await;
+        }
+    }
+}
+
+fn device_registration(inner: &Inner) -> DeviceRegistration {
+    let mut capabilities = Vec::new();
+    if !inner.ssh.public_key.is_empty() && inner.runtime.ssh_available {
+        capabilities.push("ssh_client".into());
+    }
+    if inner.ssh.port.is_some() {
+        capabilities.extend(["ssh_server", "ssh", "sftp", "scp"].map(String::from));
+    }
+    DeviceRegistration {
+        node_id: inner.identity.node_id.clone(),
+        device_token: inner.identity.device_token.clone(),
+        display_name: inner.config.display_name.clone(),
+        role: Role::Peer,
+        ssh_alias: inner.config.ssh_alias.clone(),
+        ssh_user: if inner.ssh.login_user.is_empty() { inner.config.ssh_user.clone() } else { inner.ssh.login_user.clone() },
+        ssh_privilege: inner.ssh.privilege,
+        ssh_public_key: inner.ssh.public_key.clone(),
+        ssh_host_key: inner.ssh.host_key.clone(),
+        capabilities,
+        allow_relay: inner.config.allow_relay,
+        direct_only: inner.config.direct_only,
+        version: env!("CARGO_PKG_VERSION").into(),
+        os: std::env::consts::OS.into(),
+        arch: std::env::consts::ARCH.into(),
+        hostname: hostname(),
     }
 }
 
@@ -737,16 +831,11 @@ async fn login(
     if form.username.trim().is_empty() || form.password.len() < 4 {
         return Err(ApiError::bad_request("请输入账户名称和至少 4 位密码"));
     }
-    let (url, role, node_id, config, identity, ssh) = {
+    let _operation = app.session_operations.lock().await;
+    app.close_sessions(None).await;
+    let (url, identity, registration) = {
         let inner = app.inner.read().await;
-        (
-            inner.config.server_url.clone(),
-            inner.role,
-            inner.identity.node_id.clone(),
-            inner.config.clone(),
-            inner.identity.clone(),
-            inner.ssh.clone(),
-        )
+        (inner.config.server_url.clone(), inner.identity.clone(), device_registration(&inner))
     };
     let auth = app
         .http
@@ -763,28 +852,6 @@ async fn login(
         .json::<AuthResponse>()
         .await
         .map_err(ApiError::network)?;
-    let registration = DeviceRegistration {
-        node_id,
-        device_token: identity.device_token.clone(),
-        display_name: config.display_name,
-        role,
-        ssh_alias: config.ssh_alias,
-        ssh_user: if ssh.login_user.is_empty() {
-            config.ssh_user
-        } else {
-            ssh.login_user.clone()
-        },
-        ssh_privilege: ssh.privilege,
-        ssh_public_key: ssh.public_key,
-        ssh_host_key: ssh.host_key,
-        capabilities: vec!["ssh".into(), "sftp".into(), "scp".into()],
-        allow_relay: config.allow_relay,
-        direct_only: config.direct_only,
-        version: env!("CARGO_PKG_VERSION").into(),
-        os: std::env::consts::OS.into(),
-        arch: std::env::consts::ARCH.into(),
-        hostname: hostname(),
-    };
     let devices = app
         .http
         .post(format!("{url}/api/v1/devices/register"))
@@ -814,11 +881,13 @@ async fn login(
 }
 
 async fn logout(State(app): State<ClientApp>) -> Json<ClientSnapshot> {
-    app.stop_frpc().await;
+    let _operation = app.session_operations.lock().await;
+    app.close_sessions(None).await;
+    app.mark_offline().await;
+    app.sync_authorized_keys(&[]).await;
     let mut inner = app.inner.write().await;
     inner.auth = None;
-    inner.session = None;
-    inner.visitor_port = None;
+    inner.devices.clear();
     inner.stage = "ready".into();
     let _ = tokio::fs::remove_file(inner.root.join("auth.json")).await;
     Json(snapshot(&inner))
@@ -828,139 +897,77 @@ async fn connect(
     State(app): State<ClientApp>,
     Json(form): Json<ConnectForm>,
 ) -> Result<Json<ClientSnapshot>, ApiError> {
-    let (auth, url, role, runtime) = {
+    let _operation = app.session_operations.lock().await;
+    let (auth, url, identity) = {
         let inner = app.inner.read().await;
+        if inner.ssh.public_key.is_empty() {
+            return Err(ApiError::bad_request("本机 SSH 登录密钥尚未就绪"));
+        }
+        if form.target_node_id == inner.identity.node_id {
+            return Err(ApiError::bad_request("请选择另一台设备"));
+        }
         (
-            inner
-                .auth
-                .clone()
-                .ok_or_else(|| ApiError::unauthorized("请先登录"))?,
+            inner.auth.clone().ok_or_else(|| ApiError::unauthorized("请先登录"))?,
             inner.config.server_url.clone(),
-            inner.role,
-            inner.runtime.clone(),
+            inner.identity.clone(),
         )
     };
-    if role != Role::Controller {
-        return Err(ApiError::bad_request("只有控制端可以发起连接"));
+    // 同一目标重复连接只替换同向会话；反向和其他设备的连接保持运行。
+    let replaced: Vec<_> = app.inner.read().await.sessions.values()
+        .filter(|session| session.initiator_node_id == identity.node_id && session.target_node_id == form.target_node_id)
+        .map(|session| session.session_id.clone()).collect();
+    for id in replaced {
+        app.close_sessions(Some(&id)).await;
     }
-    let info = app
-        .http
+    let info = app.http
         .post(format!("{url}/api/v1/sessions"))
         .bearer_auth(&auth.access_token)
         .json(&SessionCreateRequest {
+            initiator_node_id: identity.node_id,
+            device_token: identity.device_token,
             target_node_id: form.target_node_id,
             policy: form.policy,
         })
-        .send()
-        .await
-        .map_err(ApiError::network)?
-        .error_for_status()
-        .map_err(ApiError::from_response)?
-        .json::<SessionInfo>()
-        .await
-        .map_err(ApiError::network)?;
-    {
-        let mut inner = app.inner.write().await;
-        inner.session = Some(info.clone());
-    }
-    if !runtime.frpc_available {
-        let mut inner = app.inner.write().await;
-        inner.stage = "runtime_missing".into();
-        inner.last_error = Some(format!(
-            "未找到 {}。请先运行 tools/fetch_runtime.py，按本平台的 vendor/manifest*.toml 准备并校验 FRP 运行时。",
-            runtime.frpc_path
-        ));
-        drop(inner);
-        if let Ok(updated) = update_remote_session(
-            &app,
-            &info,
-            SessionStatus::Failed,
-            SessionPath::Unknown,
-            Some("frpc runtime missing".into()),
-        )
-        .await
-        {
+        .send().await.map_err(ApiError::network)?
+        .error_for_status().map_err(ApiError::from_response)?
+        .json::<SessionInfo>().await.map_err(ApiError::network)?;
+    app.inner.write().await.sessions.insert(info.session_id.clone(), info.clone());
+    let runtime = app.inner.read().await.runtime.clone();
+    let result = match probe_frpc(&runtime.frpc_path) {
+        Ok(_) => app.start_frpc(&info, true).await,
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(()) => {
+            if let Ok(updated) = update_remote_session(&app, &info, SessionStatus::Connected, initial_session_path(info.policy), None).await {
+                app.inner.write().await.sessions.insert(updated.session_id.clone(), updated);
+            }
             let mut inner = app.inner.write().await;
-            inner.session = Some(updated);
+            inner.stage = "frpc_running".into();
+            inner.last_error = None;
+            drop(inner);
+            app.spawn_direct_fallback_monitor(info).await;
         }
-    } else if let Err(error) = probe_frpc(&runtime.frpc_path) {
-        let mut inner = app.inner.write().await;
-        inner.stage = "frpc_blocked".into();
-        inner.last_error = Some(format!("frpc 启动检查失败：{error}。{}", security_hint()));
-        drop(inner);
-        let _ = update_remote_session(
-            &app,
-            &info,
-            SessionStatus::Failed,
-            SessionPath::Unknown,
-            Some(error.to_string()),
-        )
-        .await;
-    } else {
-        match app.start_frpc(&info, true).await {
-            Ok(()) => {
-                let path = initial_session_path(info.policy);
-                if let Ok(updated) =
-                    update_remote_session(&app, &info, SessionStatus::Connected, path, None).await
-                {
-                    let mut inner = app.inner.write().await;
-                    inner.session = Some(updated);
-                    inner.stage = "frpc_running".into();
-                    inner.last_error = None;
-                }
-                app.spawn_direct_fallback_monitor(info.clone());
-            }
-            Err(error) => {
-                let mut inner = app.inner.write().await;
-                inner.stage = "frpc_failed".into();
-                inner.last_error = Some(format!("frpc 路由启动失败：{error}。{}", security_hint()));
-                drop(inner);
-                let _ = update_remote_session(
-                    &app,
-                    &info,
-                    SessionStatus::Failed,
-                    SessionPath::Unknown,
-                    Some(error.to_string()),
-                )
-                .await;
-            }
-        }
+        Err(error) => app.fail_session(&info, error.to_string()).await,
     }
     let inner = app.inner.read().await;
     Ok(Json(snapshot(&inner)))
 }
 
 async fn disconnect(State(app): State<ClientApp>) -> Result<Json<ClientSnapshot>, ApiError> {
-    let (auth, url, session) = {
-        let inner = app.inner.read().await;
-        (
-            inner.auth.clone(),
-            inner.config.server_url.clone(),
-            inner.session.clone(),
-        )
-    };
-    if let (Some(auth), Some(session)) = (auth, session) {
-        app.http
-            .delete(format!("{url}/api/v1/sessions/{}", session.session_id))
-            .bearer_auth(&auth.access_token)
-            .send()
-            .await
-            .map_err(ApiError::network)?
-            .error_for_status()
-            .map_err(ApiError::from_response)
-            .map(|_| ())?;
-    }
-    app.stop_frpc().await;
-    let mut inner = app.inner.write().await;
-    inner.session = None;
-    inner.visitor_port = None;
-    inner.stage = if inner.auth.is_some() {
-        "online"
-    } else {
-        "ready"
-    }
-    .into();
-    inner.last_error = None;
+    let _operation = app.session_operations.lock().await;
+    app.close_sessions(None).await;
+    let inner = app.inner.read().await;
+    Ok(Json(snapshot(&inner)))
+}
+
+async fn disconnect_session(
+    State(app): State<ClientApp>,
+    Path(id): Path<String>,
+) -> Result<Json<ClientSnapshot>, ApiError> {
+    let _operation = app.session_operations.lock().await;
+    app.close_sessions(Some(&id)).await;
+    let inner = app.inner.read().await;
     Ok(Json(snapshot(&inner)))
 }
 
@@ -969,7 +976,7 @@ async fn copy_nodes(State(app): State<ClientApp>) -> Json<serde_json::Value> {
     let text = inner
         .devices
         .iter()
-        .filter(|d| d.role == Role::Executor && d.online)
+        .filter(|d| d.node_id != inner.identity.node_id && d.online && d.capabilities.iter().any(|capability| capability == "ssh_server"))
         .map(|d| {
             format!(
                 "{} ({}) · {} · {}",
@@ -991,33 +998,40 @@ async fn update_remote_session(
     path: SessionPath,
     failure_reason: Option<String>,
 ) -> anyhow::Result<SessionInfo> {
-    let (auth, url) = {
+    let (auth, url, identity) = {
         let inner = app.inner.read().await;
         (
-            inner
-                .auth
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("not logged in"))?,
+            inner.auth.clone().ok_or_else(|| anyhow::anyhow!("未登录"))?,
             inner.config.server_url.clone(),
+            inner.identity.clone(),
         )
     };
-    Ok(app
-        .http
+    Ok(app.http
         .post(format!("{url}/api/v1/sessions/{}/status", info.session_id))
         .bearer_auth(auth.access_token)
-        .json(&SessionStatusRequest {
-            status,
-            path,
-            failure_reason,
-        })
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<SessionInfo>()
-        .await?)
+        .header("x-starbridge-node-id", identity.node_id)
+        .header("x-starbridge-device-token", identity.device_token)
+        .json(&SessionStatusRequest { status, path, failure_reason })
+        .send().await?.error_for_status()?.json::<SessionInfo>().await?)
 }
 
 fn snapshot(inner: &Inner) -> ClientSnapshot {
+    let mut sessions: Vec<_> = inner.sessions.values().map(|session| SessionView {
+        session_id: session.session_id.clone(),
+        initiator_node_id: session.initiator_node_id.clone(),
+        target_node_id: session.target_node_id.clone(),
+        policy: session.policy,
+        path: session.path,
+        status: session.status,
+        created_at: session.created_at,
+        expires_at: session.expires_at,
+        failure_reason: session.failure_reason.clone(),
+        ssh_command: session_ssh_command(inner, session),
+    }).collect();
+    sessions.sort_by(|a, b| (a.created_at, &a.session_id).cmp(&(b.created_at, &b.session_id)));
+    // 旧 API 字段仍指向最近的发起连接，避免已有联调脚本失效。
+    let primary = sessions.iter().rev().find(|session| session.initiator_node_id == inner.identity.node_id)
+        .or_else(|| sessions.last()).cloned();
     ClientSnapshot {
         role: inner.role,
         logged_in: inner.auth.is_some(),
@@ -1026,38 +1040,23 @@ fn snapshot(inner: &Inner) -> ClientSnapshot {
         node_id: inner.identity.node_id.clone(),
         display_name: inner.config.display_name.clone(),
         devices: inner.devices.clone(),
-        session: inner.session.as_ref().map(|session| SessionView {
-            session_id: session.session_id.clone(),
-            policy: session.policy,
-            path: session.path,
-            status: session.status,
-            created_at: session.created_at,
-            expires_at: session.expires_at,
-            failure_reason: session.failure_reason.clone(),
-        }),
+        ssh_command: primary.as_ref().and_then(|session| session.ssh_command.clone()),
+        session: primary,
+        sessions,
         stage: inner.stage.clone(),
         last_error: inner.last_error.clone(),
         runtime: inner.runtime.clone(),
         ssh: inner.ssh.clone(),
-        ssh_command: ssh_command(inner),
         updated_at: now_unix(),
     }
 }
 
-/// 当前会话可直接使用的 SSH 命令；只在控制端 visitor 已启动时返回。
-fn ssh_command(inner: &Inner) -> Option<String> {
-    let session = inner.session.as_ref()?;
-    inner.visitor_port?;
-    let target = inner
-        .devices
-        .iter()
-        .find(|device| device.node_id == session.target_node_id)?;
-    let config = std::path::absolute(inner.root.join("ssh").join("config")).ok()?;
-    Some(format!(
-        "ssh -F \"{}\" {}",
-        config.display(),
-        target.ssh_alias
-    ))
+fn session_ssh_command(inner: &Inner, session: &SessionInfo) -> Option<String> {
+    if session.initiator_node_id != inner.identity.node_id { return None; }
+    inner.visitor_ports.get(&session.session_id)?;
+    let target = inner.devices.iter().find(|device| device.node_id == session.target_node_id)?;
+    let config = std::path::absolute(inner.root.join("ssh").join("sessions").join(&session.session_id).join("config")).ok()?;
+    Some(format!("ssh -F \"{}\" {}", config.display(), target.ssh_alias))
 }
 
 fn runtime_status(root: &FsPath) -> RuntimeStatus {
@@ -1238,22 +1237,21 @@ fn sshd_config(dir: &FsPath, sftp_server: &FsPath, port: u16) -> String {
     config
 }
 
-/// 同账户控制端的公钥，每行一个。
+/// 同账户设备的公钥，每行一个。
 fn authorized_keys(devices: &[DeviceInfo]) -> String {
     devices
         .iter()
-        .filter(|device| device.role == Role::Controller && !device.ssh_public_key.is_empty())
+        .filter(|device| !device.ssh_public_key.is_empty())
         .map(|device| format!("{}\n", device.ssh_public_key))
         .collect()
 }
 
-fn ssh_client_config(root: &FsPath, target: &DeviceInfo, port: u16) -> String {
-    let dir = root.join("ssh");
+fn ssh_client_config(root: &FsPath, dir: &FsPath, target: &DeviceInfo, port: u16) -> String {
     format!(
         "Host {}\n  HostName 127.0.0.1\n  Port {port}\n  User {}\n  IdentityFile {}\n  IdentitiesOnly yes\n  HostKeyAlias {}\n  UserKnownHostsFile {}\n  StrictHostKeyChecking {}\n",
         target.ssh_alias,
         target.ssh_user,
-        ssh_path(&dir.join("id_ed25519")),
+        ssh_path(&root.join("ssh").join("id_ed25519")),
         target.ssh_alias,
         ssh_path(&dir.join("known_hosts")),
         if target.ssh_host_key.is_empty() {
@@ -1264,15 +1262,16 @@ fn ssh_client_config(root: &FsPath, target: &DeviceInfo, port: u16) -> String {
     )
 }
 
-async fn write_ssh_client_files(
+async fn write_session_ssh_files(
     root: &FsPath,
+    session_id: &str,
     target: &DeviceInfo,
     port: u16,
 ) -> anyhow::Result<()> {
-    let dir = std::path::absolute(root.join("ssh"))?;
+    let root = std::path::absolute(root)?;
+    let dir = root.join("ssh").join("sessions").join(session_id);
     tokio::fs::create_dir_all(&dir).await?;
-    let root = dir.parent().map(FsPath::to_path_buf).unwrap_or_default();
-    tokio::fs::write(dir.join("config"), ssh_client_config(&root, target, port)).await?;
+    tokio::fs::write(dir.join("config"), ssh_client_config(&root, &dir, target, port)).await?;
     if !target.ssh_host_key.is_empty() {
         tokio::fs::write(
             dir.join("known_hosts"),
@@ -1536,7 +1535,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("正在退出"));
-        assert!(app.frpc_process.lock().await.is_none());
+        assert!(app.frpc_processes.lock().await.is_empty());
         assert!(app.sshd_process.lock().await.is_none());
         app.shutdown().await;
         std::fs::remove_dir_all(&root).unwrap();
@@ -1545,7 +1544,7 @@ mod tests {
     fn session(policy: ConnectionPolicy) -> SessionInfo {
         SessionInfo {
             session_id: "session-id".into(),
-            controller_node_id: "controller".into(),
+            initiator_node_id: "controller".into(),
             target_node_id: "executor".into(),
             policy,
             path: SessionPath::Unknown,
@@ -1605,13 +1604,13 @@ mod tests {
     }
 
     #[test]
-    fn authorized_keys_only_trust_controllers() {
+    fn authorized_keys_trust_same_account_devices_regardless_of_legacy_role() {
         let keys = authorized_keys(&[
             device(Role::Controller, "ssh-ed25519 AAAA controller"),
             device(Role::Executor, "ssh-ed25519 BBBB executor"),
             device(Role::Controller, ""),
         ]);
-        assert_eq!(keys, "ssh-ed25519 AAAA controller\n");
+        assert_eq!(keys, "ssh-ed25519 AAAA controller\nssh-ed25519 BBBB executor\n");
     }
 
     #[test]
@@ -1630,15 +1629,70 @@ mod tests {
     fn ssh_client_config_pins_host_key_when_known() {
         let mut target = device(Role::Executor, "");
         assert!(
-            ssh_client_config(FsPath::new("root"), &target, 22000)
+            ssh_client_config(FsPath::new("root"), FsPath::new("root/ssh"), &target, 22000)
                 .contains("StrictHostKeyChecking accept-new")
         );
         target.ssh_host_key = "ssh-ed25519 CCCC".into();
-        let config = ssh_client_config(FsPath::new("root"), &target, 22000);
+        let config = ssh_client_config(FsPath::new("root"), FsPath::new("root/ssh"), &target, 22000);
         assert!(
             config.contains("Host node-alias\n  HostName 127.0.0.1\n  Port 22000\n  User alice\n")
         );
         assert!(config.contains("StrictHostKeyChecking yes"));
+    }
+
+    #[tokio::test]
+    async fn simultaneous_sessions_keep_separate_ssh_configs_and_direction() {
+        let root = std::env::temp_dir().join(format!("starbridge-peer-{}", uuid::Uuid::new_v4()));
+        let app = ClientApp::load(Role::Peer, root.clone()).await.unwrap();
+        let mut target = device(Role::Peer, "ssh-ed25519 peer");
+        target.ssh_host_key = "ssh-ed25519 target-host".into();
+        let mut outgoing = session(ConnectionPolicy::RelayOnly);
+        let mut incoming = outgoing.clone();
+        incoming.session_id = "incoming".into();
+        {
+            let mut inner = app.inner.write().await;
+            outgoing.initiator_node_id = inner.identity.node_id.clone();
+            outgoing.target_node_id = target.node_id.clone();
+            incoming.initiator_node_id = target.node_id.clone();
+            incoming.target_node_id = inner.identity.node_id.clone();
+            inner.devices.push(target.clone());
+            inner.sessions.insert(outgoing.session_id.clone(), outgoing.clone());
+            inner.sessions.insert(incoming.session_id.clone(), incoming.clone());
+            inner.visitor_ports.insert(outgoing.session_id.clone(), 22001);
+            let state = snapshot(&inner);
+            assert_eq!(state.sessions.len(), 2);
+            assert_eq!(state.sessions.iter().filter(|session| session.ssh_command.is_some()).count(), 1);
+            assert_eq!(state.session.unwrap().session_id, outgoing.session_id);
+        }
+        write_session_ssh_files(&root, &outgoing.session_id, &target, 22001).await.unwrap();
+        write_session_ssh_files(&root, "another-target", &target, 22002).await.unwrap();
+        let config = tokio::fs::read_to_string(root.join("ssh/sessions/session-id/config")).await.unwrap();
+        let other = tokio::fs::read_to_string(root.join("ssh/sessions/another-target/config")).await.unwrap();
+        assert!(config.contains("Port 22001"));
+        assert!(other.contains("Port 22002"));
+        assert!(config.contains(&ssh_path(&root.join("ssh/id_ed25519"))));
+        assert!(config.contains("sessions/session-id/known_hosts"));
+        assert!(other.contains("sessions/another-target/known_hosts"));
+        // 中心不可达也必须清理选中的连接，并保留另一个方向。
+        {
+            let mut inner = app.inner.write().await;
+            inner.config.server_url = "http://127.0.0.1:1".into();
+            inner.auth = Some(AuthResponse { access_token: "test".into(), username: "alice".into(), expires_at: u64::MAX });
+        }
+        app.close_sessions(Some(&outgoing.session_id)).await;
+        let inner = app.inner.read().await;
+        assert!(!inner.sessions.contains_key(&outgoing.session_id));
+        assert!(inner.sessions.contains_key(&incoming.session_id));
+        assert!(inner.visitor_ports.is_empty());
+        assert!(inner.pending_closes.contains(&outgoing.session_id));
+        assert!(inner.last_error.as_ref().unwrap().contains("本地连接已断开"));
+        drop(inner);
+        let pending: HashSet<String> = serde_json::from_slice(
+            &tokio::fs::read(root.join("pending-closes.json")).await.unwrap()
+        ).unwrap();
+        assert!(pending.contains(&outgoing.session_id));
+        app.shutdown().await;
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

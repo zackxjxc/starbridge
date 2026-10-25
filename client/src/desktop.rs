@@ -59,12 +59,23 @@ async fn client_disconnect(app: tauri::State<'_, ClientApp>) -> Result<ClientSna
 }
 
 #[tauri::command]
+async fn client_disconnect_session(
+    app: tauri::State<'_, ClientApp>,
+    session_id: String,
+) -> Result<ClientSnapshot, String> {
+    disconnect_session(State(app.inner().clone()), axum::extract::Path(session_id))
+        .await
+        .map(|value| value.0)
+        .map_err(|error| error.message)
+}
+
+#[tauri::command]
 async fn client_copy_nodes(app: tauri::State<'_, ClientApp>) -> Result<serde_json::Value, String> {
     Ok(copy_nodes(State(app.inner().clone())).await.0)
 }
 
 /// The event loop stays on the main thread and shares the core's Tokio runtime.
-pub fn run(app: ClientApp, role: Role, root: PathBuf) -> anyhow::Result<()> {
+pub fn run(app: ClientApp, _role: Role, root: PathBuf) -> anyhow::Result<()> {
     let core = app.clone();
     let desktop = tauri::Builder::default()
         .manage(app)
@@ -77,16 +88,13 @@ pub fn run(app: ClientApp, role: Role, root: PathBuf) -> anyhow::Result<()> {
             client_logout,
             client_connect,
             client_disconnect,
+            client_disconnect_session,
             client_copy_nodes,
         ])
         .build(tauri::generate_context!())?;
-    let label = match role {
-        Role::Controller => "控制端",
-        Role::Executor => "执行端",
-    };
     // Build before run so startup failures return to main's error dialog and cleanup.
     WebviewWindowBuilder::new(&desktop, "main", WebviewUrl::App("index.html".into()))
-        .title(format!("StarBridge · {label}"))
+        .title("StarBridge · 设备中心")
         .inner_size(1200.0, 820.0)
         .min_inner_size(780.0, 600.0)
         .data_directory(root.join("webview"))

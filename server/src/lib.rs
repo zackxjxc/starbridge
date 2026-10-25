@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use starbridge_protocol::{
     AuthRequest, AuthResponse, ConnectionPolicy, DeviceInfo, DeviceRegistration, ErrorResponse,
-    FrpRoute, HealthResponse, HeartbeatRequest, Role, SessionCreateRequest, SessionInfo,
+    FrpRoute, HealthResponse, HeartbeatRequest, SessionCreateRequest, SessionInfo,
     SessionPath, SessionStatus, SessionStatusRequest, new_id, now_unix,
 };
 use std::{
@@ -249,8 +249,7 @@ async fn register_device(
     let account = authenticate(&state, &headers).await?;
     validate_registration(&registration)?;
     let mut inner = state.inner.write().await;
-    if registration.role == Role::Controller && registration.direct_only && registration.allow_relay
-    {
+    if registration.direct_only && registration.allow_relay {
         return Err(ApiError::bad_request("只允许直连的节点不能同时允许中继"));
     }
     if let Some(existing) = inner.devices.get(&registration.node_id) {
@@ -286,8 +285,8 @@ async fn heartbeat(
         .devices
         .get_mut(&request.node_id)
         .ok_or_else(|| ApiError::not_found("设备尚未登记"))?;
-    if device.account != account {
-        return Err(ApiError::forbidden("不能更新其他账户的设备"));
+    if device.account != account || device.device_token != request.device_token {
+        return Err(ApiError::forbidden("设备身份凭据不正确"));
     }
     device.last_heartbeat = now_unix();
     device.status = request.status;
@@ -326,7 +325,7 @@ async fn admin_summary(
         .sessions
         .values()
         .filter(|session| {
-            device_ids.contains(&session.controller_node_id)
+            device_ids.contains(&session.initiator_node_id)
                 || device_ids.contains(&session.target_node_id)
         })
         .cloned()
@@ -345,29 +344,50 @@ async fn create_session(
 ) -> Result<Json<SessionInfo>, ApiError> {
     let account = authenticate(&state, &headers).await?;
     let mut inner = state.inner.write().await;
-    let controller = inner
-        .devices
-        .values()
-        .find(|device| {
-            device.account == account
-                && device.registration.role == Role::Controller
-                && is_online(device)
-        })
-        .map(|device| device.registration.clone())
-        .ok_or_else(|| ApiError::conflict("当前账户没有在线控制端节点"))?;
+    let initiator = authenticate_device(
+        &inner,
+        &account,
+        &request.initiator_node_id,
+        &request.device_token,
+    )?;
+    if !is_online(initiator) {
+        return Err(ApiError::conflict("发起节点当前离线"));
+    }
+    if !has_capability(&initiator.registration, "ssh_client")
+        || initiator.registration.ssh_public_key.is_empty()
+    {
+        return Err(ApiError::conflict("发起节点的 SSH 登录密钥尚未就绪"));
+    }
+    if request.initiator_node_id == request.target_node_id {
+        return Err(ApiError::bad_request("不能连接本机节点"));
+    }
+    let initiator_registration = initiator.registration.clone();
     let target = inner
         .devices
         .get(&request.target_node_id)
-        .ok_or_else(|| ApiError::not_found("执行端节点不存在"))?;
-    if target.account != account || target.registration.role != Role::Executor {
-        return Err(ApiError::forbidden("不能连接这个执行端节点"));
+        .ok_or_else(|| ApiError::not_found("目标节点不存在"))?;
+    if target.account != account {
+        return Err(ApiError::forbidden("不能连接其他账户的节点"));
     }
     if !is_online(target) {
-        return Err(ApiError::conflict("执行端节点当前离线"));
+        return Err(ApiError::conflict("目标节点当前离线"));
+    }
+    if !has_capability(&target.registration, "ssh_server") {
+        return Err(ApiError::conflict("目标节点尚未允许 SSH 访问或 SSH 服务未就绪"));
     }
     let target_registration = target.registration.clone();
-    let policy = effective_policy(request.policy, &controller, &target_registration)?;
+    let policy = effective_policy(request.policy, &initiator_registration, &target_registration)?;
     let created_at = now_unix();
+    expire_sessions(&mut inner, created_at);
+    for session in inner.sessions.values_mut() {
+        if session.initiator_node_id == request.initiator_node_id
+            && session.target_node_id == request.target_node_id
+            && is_active(session)
+        {
+            session.status = SessionStatus::Closed;
+            session.failure_reason = Some("已由新的同向连接替换".into());
+        }
+    }
     let session_id = new_id();
     let proxy_name = format!(
         "sb-{}-{}",
@@ -376,7 +396,7 @@ async fn create_session(
     );
     let info = SessionInfo {
         session_id,
-        controller_node_id: controller.node_id.clone(),
+        initiator_node_id: initiator_registration.node_id,
         target_node_id: target_registration.node_id,
         policy,
         path: SessionPath::Unknown,
@@ -405,28 +425,27 @@ async fn assigned_sessions(
     Path(node_id): Path<String>,
 ) -> Result<Json<Vec<SessionInfo>>, ApiError> {
     let account = authenticate(&state, &headers).await?;
-    let inner = state.inner.read().await;
-    let device = inner
-        .devices
-        .get(&node_id)
-        .ok_or_else(|| ApiError::not_found("设备不存在"))?;
-    if device.account != account {
-        return Err(ApiError::forbidden("不能读取其他账户的会话"));
+    let mut inner = state.inner.write().await;
+    authenticate_device(&inner, &account, &node_id, device_token_header(&headers)?)?;
+    let changed = expire_sessions(&mut inner, now_unix());
+    let mut sessions: Vec<_> = inner
+        .sessions
+        .values()
+        .filter(|session| {
+            (session.initiator_node_id == node_id || session.target_node_id == node_id)
+                && is_active(session)
+        })
+        .cloned()
+        .collect();
+    sessions.sort_by(|left, right| {
+        left.created_at.cmp(&right.created_at)
+            .then_with(|| left.session_id.cmp(&right.session_id))
+    });
+    drop(inner);
+    if changed {
+        state.persist().await;
     }
-    Ok(Json(
-        inner
-            .sessions
-            .values()
-            .filter(|session| {
-                session.target_node_id == node_id
-                    && !matches!(
-                        session.status,
-                        SessionStatus::Closed | SessionStatus::Failed
-                    )
-            })
-            .cloned()
-            .collect(),
-    ))
+    Ok(Json(sessions))
 }
 
 async fn get_session(
@@ -440,7 +459,7 @@ async fn get_session(
         .sessions
         .get(&id)
         .ok_or_else(|| ApiError::not_found("会话不存在"))?;
-    ensure_session_account(&inner, session, &account)?;
+    ensure_session_device(&inner, session, &account, &headers)?;
     Ok(Json(session.clone()))
 }
 
@@ -457,7 +476,10 @@ async fn update_session(
         .get(&id)
         .cloned()
         .ok_or_else(|| ApiError::not_found("会话不存在"))?;
-    ensure_session_account(&inner, &existing, &account)?;
+    ensure_session_device(&inner, &existing, &account, &headers)?;
+    if !is_active(&existing) {
+        return Err(ApiError::conflict("会话已结束，不能更新状态"));
+    }
     let session = inner.sessions.get_mut(&id).expect("session exists");
     session.status = request.status;
     session.path = request.path;
@@ -480,7 +502,7 @@ async fn delete_session(
         .get(&id)
         .cloned()
         .ok_or_else(|| ApiError::not_found("会话不存在"))?;
-    ensure_session_account(&inner, &existing, &account)?;
+    ensure_session_device(&inner, &existing, &account, &headers)?;
     let session = inner.sessions.get_mut(&id).expect("session exists");
     session.status = SessionStatus::Closed;
     let response = Json(session.clone());
@@ -492,14 +514,12 @@ async fn delete_session(
 fn validate_registration(registration: &DeviceRegistration) -> Result<(), ApiError> {
     if registration.node_id.trim().is_empty()
         || registration.node_id.len() > 128
+        || registration.device_token.trim().is_empty()
         || registration.display_name.trim().is_empty()
         || registration.display_name.len() > 80
         || registration.ssh_alias.trim().is_empty()
     {
         return Err(ApiError::bad_request("设备身份或显示名称格式错误"));
-    }
-    if registration.capabilities.is_empty() {
-        return Err(ApiError::bad_request("设备至少需要声明一种能力"));
     }
     if [&registration.ssh_public_key, &registration.ssh_host_key]
         .iter()
@@ -512,23 +532,23 @@ fn validate_registration(registration: &DeviceRegistration) -> Result<(), ApiErr
 
 fn effective_policy(
     requested: ConnectionPolicy,
-    controller: &DeviceRegistration,
+    initiator: &DeviceRegistration,
     target: &DeviceRegistration,
 ) -> Result<ConnectionPolicy, ApiError> {
     if requested == ConnectionPolicy::RelayOnly
-        && (controller.direct_only
+        && (initiator.direct_only
             || target.direct_only
-            || !controller.allow_relay
+            || !initiator.allow_relay
             || !target.allow_relay)
     {
         return Err(ApiError::conflict("节点策略禁止使用中继"));
     }
     if requested == ConnectionPolicy::DirectPreferred
-        && (controller.direct_only || target.direct_only)
+        && (initiator.direct_only || target.direct_only)
     {
         return Ok(ConnectionPolicy::DirectOnly);
     }
-    if requested != ConnectionPolicy::DirectOnly && (!controller.allow_relay || !target.allow_relay)
+    if requested != ConnectionPolicy::DirectOnly && (!initiator.allow_relay || !target.allow_relay)
     {
         return Ok(ConnectionPolicy::DirectOnly);
     }
@@ -564,7 +584,60 @@ fn list_devices(inner: &Inner, account: Option<&str>) -> Vec<DeviceInfo> {
 }
 
 fn is_online(device: &StoredDevice) -> bool {
-    now_unix().saturating_sub(device.last_heartbeat) <= 30
+    device.status == "online" && now_unix().saturating_sub(device.last_heartbeat) <= 30
+}
+
+fn has_capability(device: &DeviceRegistration, capability: &str) -> bool {
+    device.capabilities.iter().any(|value| value == capability)
+}
+
+fn is_active(session: &SessionInfo) -> bool {
+    !matches!(session.status, SessionStatus::Closed | SessionStatus::Failed)
+}
+
+/// 协商有时限；已建立的长会话由双方心跳维持，不按创建时间截断。
+fn expire_sessions(inner: &mut Inner, now: u64) -> bool {
+    let mut changed = false;
+    for session in inner.sessions.values_mut().filter(|session| is_active(session)) {
+        let endpoints_online = [&session.initiator_node_id, &session.target_node_id]
+            .iter()
+            .all(|node_id| {
+                inner.devices.get(*node_id).is_some_and(|device| {
+                    device.status == "online" && now.saturating_sub(device.last_heartbeat) <= 30
+                })
+            });
+        if !endpoints_online {
+            session.status = SessionStatus::Closed;
+            session.failure_reason = Some("会话节点已离线".into());
+            changed = true;
+        } else if session.status == SessionStatus::Negotiating && session.expires_at <= now {
+            session.status = SessionStatus::Failed;
+            session.failure_reason = Some("连接协商已过期".into());
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn authenticate_device<'a>(
+    inner: &'a Inner,
+    account: &str,
+    node_id: &str,
+    token: &str,
+) -> Result<&'a StoredDevice, ApiError> {
+    let device = inner.devices.get(node_id)
+        .ok_or_else(|| ApiError::not_found("设备尚未登记"))?;
+    if device.account != account || token.is_empty() || device.device_token != token {
+        return Err(ApiError::forbidden("设备身份凭据不正确"));
+    }
+    Ok(device)
+}
+
+fn device_token_header(headers: &HeaderMap) -> Result<&str, ApiError> {
+    headers.get("x-starbridge-device-token")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::forbidden("缺少设备身份凭据"))
 }
 
 async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<String, ApiError> {
@@ -590,20 +663,20 @@ async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<String, A
     Ok(username)
 }
 
-fn ensure_session_account(
+fn ensure_session_device(
     inner: &Inner,
     session: &SessionInfo,
     account: &str,
+    headers: &HeaderMap,
 ) -> Result<(), ApiError> {
-    let controller = inner.devices.get(&session.controller_node_id);
-    let target = inner.devices.get(&session.target_node_id);
-    if controller.is_some_and(|d| d.account == account)
-        || target.is_some_and(|d| d.account == account)
-    {
-        Ok(())
-    } else {
-        Err(ApiError::forbidden("不能访问其他账户的会话"))
+    let node_id = headers.get("x-starbridge-node-id")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| ApiError::forbidden("缺少发起设备身份"))?;
+    authenticate_device(inner, account, node_id, device_token_header(headers)?)?;
+    if node_id != session.initiator_node_id && node_id != session.target_node_id {
+        return Err(ApiError::forbidden("本机不是这个会话的参与节点"));
     }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -651,7 +724,7 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use starbridge_protocol::SshPrivilege;
+    use starbridge_protocol::{Role, SshPrivilege};
 
     fn device(direct_only: bool, allow_relay: bool) -> DeviceRegistration {
         DeviceRegistration {
@@ -672,6 +745,208 @@ mod tests {
             arch: "x86_64".into(),
             hostname: "node".into(),
         }
+    }
+
+    struct TestApp {
+        state: AppState,
+    }
+
+    impl Drop for TestApp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.state.data_path.as_ref());
+        }
+    }
+
+    fn test_app() -> TestApp {
+        let directory = std::env::temp_dir().join(format!("starbridge-peer-test-{}", new_id()));
+        let state = AppState::with_frp_and_data("localhost".into(), 17851, "frp-token".into(), directory);
+        {
+            let mut inner = state.inner.try_write().unwrap();
+            for account in ["alice", "bob"] {
+                inner.accounts.insert(account.into(), Account { password: password_digest("test1234") });
+                inner.tokens.insert(format!("{account}-access"), (account.into(), now_unix() + 3600));
+            }
+            for (node_id, account) in [("a", "alice"), ("b", "alice"), ("c", "alice"), ("d", "bob")] {
+                let mut registration = device(false, true);
+                registration.node_id = node_id.into();
+                registration.device_token = format!("{node_id}-token");
+                registration.role = Role::Peer;
+                registration.ssh_public_key = format!("ssh-ed25519 {node_id}-public");
+                registration.ssh_host_key = format!("ssh-ed25519 {node_id}-host");
+                registration.capabilities = vec!["ssh_client".into(), "ssh_server".into(), "ssh".into()];
+                inner.devices.insert(node_id.into(), StoredDevice {
+                    account: account.into(),
+                    device_token: registration.device_token.clone(),
+                    registration,
+                    last_heartbeat: now_unix(),
+                    status: "online".into(),
+                });
+            }
+        }
+        TestApp { state }
+    }
+
+    fn peer_headers(node_id: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer alice-access".parse().unwrap());
+        headers.insert("x-starbridge-node-id", node_id.parse().unwrap());
+        headers.insert("x-starbridge-device-token", format!("{node_id}-token").parse().unwrap());
+        headers
+    }
+
+    fn session_request(initiator: &str, target: &str) -> SessionCreateRequest {
+        SessionCreateRequest {
+            initiator_node_id: initiator.into(),
+            device_token: format!("{initiator}-token"),
+            target_node_id: target.into(),
+            policy: ConnectionPolicy::RelayOnly,
+        }
+    }
+
+    async fn create_peer_session(state: &AppState, initiator: &str, target: &str) -> SessionInfo {
+        create_session(State(state.clone()), peer_headers(initiator), Json(session_request(initiator, target)))
+            .await.unwrap().0
+    }
+
+    #[tokio::test]
+    async fn peers_connect_both_directions_and_replace_only_the_same_direction() {
+        let app = test_app();
+        let first = create_peer_session(&app.state, "a", "b").await;
+        let reverse = create_peer_session(&app.state, "b", "a").await;
+        let replacement = create_peer_session(&app.state, "a", "b").await;
+        assert_eq!(replacement.initiator_node_id, "a");
+        let inner = app.state.inner.read().await;
+        assert_eq!(inner.sessions[&first.session_id].status, SessionStatus::Closed);
+        assert!(is_active(&inner.sessions[&reverse.session_id]));
+        assert!(is_active(&inner.sessions[&replacement.session_id]));
+    }
+
+    #[tokio::test]
+    async fn create_checks_device_identity_and_capabilities_instead_of_legacy_roles() {
+        let app = test_app();
+        {
+            let mut inner = app.state.inner.write().await;
+            inner.devices.get_mut("a").unwrap().registration.role = Role::Executor;
+            inner.devices.get_mut("b").unwrap().registration.role = Role::Controller;
+            // 外部 SSH 服务可以没有预登记的主机公钥。
+            inner.devices.get_mut("b").unwrap().registration.ssh_host_key.clear();
+        }
+        let info = create_peer_session(&app.state, "a", "b").await;
+        assert_eq!(info.initiator_node_id, "a");
+        let mut wrong_identity = session_request("a", "b");
+        wrong_identity.device_token = "b-token".into();
+        let error = create_session(State(app.state.clone()), peer_headers("a"), Json(wrong_identity))
+            .await.unwrap_err();
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        for (initiator, target, expected) in [
+            ("a", "a", StatusCode::BAD_REQUEST),
+            ("a", "d", StatusCode::FORBIDDEN),
+            ("d", "a", StatusCode::FORBIDDEN),
+        ] {
+            let error = create_session(State(app.state.clone()), peer_headers(initiator), Json(session_request(initiator, target)))
+                .await.unwrap_err();
+            assert_eq!(error.status, expected);
+        }
+        app.state.inner.write().await.devices.get_mut("b").unwrap().registration.capabilities.clear();
+        assert_eq!(create_session(State(app.state.clone()), peer_headers("a"), Json(session_request("a", "b")))
+            .await.unwrap_err().status, StatusCode::CONFLICT);
+        app.state.inner.write().await.devices.get_mut("c").unwrap().registration.ssh_public_key.clear();
+        assert_eq!(create_session(State(app.state.clone()), peer_headers("c"), Json(session_request("c", "a")))
+            .await.unwrap_err().status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn assigned_lists_both_directions_in_creation_order_and_requires_device_token() {
+        let app = test_app();
+        let outgoing = create_peer_session(&app.state, "a", "b").await;
+        let incoming = create_peer_session(&app.state, "b", "a").await;
+        create_peer_session(&app.state, "b", "c").await;
+        {
+            let mut inner = app.state.inner.write().await;
+            inner.sessions.get_mut(&outgoing.session_id).unwrap().created_at = 2;
+            inner.sessions.get_mut(&incoming.session_id).unwrap().created_at = 1;
+        }
+        let sessions = assigned_sessions(State(app.state.clone()), peer_headers("a"), Path("a".into()))
+            .await.unwrap().0;
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].session_id, incoming.session_id);
+        assert_eq!(sessions[1].session_id, outgoing.session_id);
+        let error = assigned_sessions(State(app.state.clone()), peer_headers("b"), Path("a".into()))
+            .await.unwrap_err();
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn assigned_expires_negotiation_and_offline_peers_but_keeps_long_connected_sessions() {
+        let app = test_app();
+        let long = create_peer_session(&app.state, "a", "b").await;
+        let expired = create_peer_session(&app.state, "a", "c").await;
+        {
+            let mut inner = app.state.inner.write().await;
+            let long_session = inner.sessions.get_mut(&long.session_id).unwrap();
+            long_session.status = SessionStatus::Connected;
+            long_session.expires_at = now_unix() - 1;
+            inner.sessions.get_mut(&expired.session_id).unwrap().expires_at = now_unix() - 1;
+        }
+        let sessions = assigned_sessions(State(app.state.clone()), peer_headers("a"), Path("a".into()))
+            .await.unwrap().0;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, long.session_id);
+        assert_eq!(app.state.inner.read().await.sessions[&expired.session_id].status, SessionStatus::Failed);
+        app.state.inner.write().await.devices.get_mut("b").unwrap().last_heartbeat = now_unix() - 31;
+        assert!(assigned_sessions(State(app.state.clone()), peer_headers("a"), Path("a".into()))
+            .await.unwrap().0.is_empty());
+        assert_eq!(app.state.inner.read().await.sessions[&long.session_id].status, SessionStatus::Closed);
+    }
+
+    #[tokio::test]
+    async fn session_updates_require_a_participating_device_and_cannot_revive_closed_sessions() {
+        let app = test_app();
+        let info = create_peer_session(&app.state, "a", "b").await;
+        let error = delete_session(State(app.state.clone()), peer_headers("c"), Path(info.session_id.clone()))
+            .await.unwrap_err();
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        let _ = delete_session(State(app.state.clone()), peer_headers("b"), Path(info.session_id.clone())).await.unwrap();
+        let error = update_session(State(app.state.clone()), peer_headers("a"), Path(info.session_id), Json(SessionStatusRequest {
+            status: SessionStatus::Connected,
+            path: SessionPath::Relay,
+            failure_reason: None,
+        })).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_authenticates_device_and_respects_offline_status() {
+        let app = test_app();
+        let error = heartbeat(State(app.state.clone()), peer_headers("a"), Json(HeartbeatRequest {
+            node_id: "a".into(), device_token: "wrong".into(), status: "online".into(),
+        })).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        let _ = heartbeat(State(app.state.clone()), peer_headers("a"), Json(HeartbeatRequest {
+            node_id: "a".into(), device_token: "a-token".into(), status: "offline".into(),
+        })).await.unwrap();
+        assert!(!is_online(&app.state.inner.read().await.devices["a"]));
+        assert_eq!(create_session(State(app.state.clone()), peer_headers("b"), Json(session_request("b", "a")))
+            .await.unwrap_err().status, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn protocol_reads_legacy_session_direction_and_defaults_to_peer_role() {
+        let legacy = serde_json::json!({
+            "session_id": "legacy", "controller_node_id": "a", "target_node_id": "b",
+            "policy": "relay_only", "path": "relay", "status": "connected",
+            "created_at": 1, "expires_at": 2, "failure_reason": null, "route": null,
+        });
+        let session: SessionInfo = serde_json::from_value(legacy).unwrap();
+        assert_eq!(session.initiator_node_id, "a");
+        let serialized = serde_json::to_value(session).unwrap();
+        assert_eq!(serialized["initiator_node_id"], "a");
+        assert!(serialized.get("controller_node_id").is_none());
+        let mut registration = serde_json::to_value(device(false, true)).unwrap();
+        registration.as_object_mut().unwrap().remove("role");
+        let registration: DeviceRegistration = serde_json::from_value(registration).unwrap();
+        assert_eq!(registration.role, Role::Peer);
+        assert_eq!(serde_json::from_str::<Role>("\"executor\"").unwrap(), Role::Executor);
     }
 
     #[test]

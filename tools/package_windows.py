@@ -94,10 +94,10 @@ def main() -> int:
 
     (args.output / "README.txt").write_text(
         "StarBridge Tauri 便携客户端\n\n"
-        "解压整个目录后，双击 starbridge.exe 打开控制端，或双击 start-executor.bat 打开执行端。\n"
+        "解压整个目录后，双击 starbridge.exe 或 start-node.bat 打开设备中心；同账户设备可以互相连接。\n"
         "无需安装程序；请保留 runtime 和 licenses 目录。Windows 需要已安装 Microsoft Edge WebView2 Runtime。\n"
         "在窗口内设置服务器地址并登录。关闭窗口会退出客户端并停止其连接组件。\n\n"
-        "账户和设备数据保存在程序旁的 state/controller 与 state/executor，移动程序时请一并保留。\n"
+        "账户和设备数据保存在程序旁的 state/node（兼容启动脚本仍使用原有目录），移动程序时请一并保留。\n"
         "请勿将使用过的目录转发给他人；分享时使用原始 ZIP。\n"
         "test-ssh.bat 使用独立的 state/controller-test 与 state/executor-test 测试数据。\n",
         encoding="utf-8",

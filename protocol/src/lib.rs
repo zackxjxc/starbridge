@@ -21,6 +21,8 @@ pub fn new_token() -> String {
 #[serde(rename_all = "snake_case")]
 pub enum Role {
     #[default]
+    Peer,
+    /// 兼容旧版设备状态；角色不再决定节点权限。
     Controller,
     Executor,
 }
@@ -53,7 +55,7 @@ pub enum SessionStatus {
     Closed,
 }
 
-/// 执行端 SSH 服务进程拥有的权限，决定远程命令能做什么。
+/// 本机 SSH 服务进程拥有的权限，决定远程命令能做什么。
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SshPrivilege {
@@ -82,15 +84,16 @@ pub struct DeviceRegistration {
     pub node_id: String,
     pub device_token: String,
     pub display_name: String,
+    #[serde(default)]
     pub role: Role,
     pub ssh_alias: String,
     pub ssh_user: String,
     #[serde(default)]
     pub ssh_privilege: SshPrivilege,
-    /// 控制端用于登录执行端的 SSH 公钥。
+    /// 本节点用于发起 SSH 登录的公钥。
     #[serde(default)]
     pub ssh_public_key: String,
-    /// 执行端 sshd 的主机公钥，控制端据此校验主机身份。
+    /// 本节点 sshd 的主机公钥，发起方据此校验目标身份。
     #[serde(default)]
     pub ssh_host_key: String,
     pub capabilities: Vec<String>,
@@ -107,15 +110,16 @@ pub struct DeviceInfo {
     pub node_id: String,
     pub account: String,
     pub display_name: String,
+    #[serde(default)]
     pub role: Role,
     pub ssh_alias: String,
     pub ssh_user: String,
     #[serde(default)]
     pub ssh_privilege: SshPrivilege,
-    /// 控制端用于登录执行端的 SSH 公钥。
+    /// 本节点用于发起 SSH 登录的公钥。
     #[serde(default)]
     pub ssh_public_key: String,
-    /// 执行端 sshd 的主机公钥，控制端据此校验主机身份。
+    /// 本节点 sshd 的主机公钥，发起方据此校验目标身份。
     #[serde(default)]
     pub ssh_host_key: String,
     pub capabilities: Vec<String>,
@@ -132,11 +136,14 @@ pub struct DeviceInfo {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HeartbeatRequest {
     pub node_id: String,
+    pub device_token: String,
     pub status: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SessionCreateRequest {
+    pub initiator_node_id: String,
+    pub device_token: String,
     pub target_node_id: String,
     pub policy: ConnectionPolicy,
 }
@@ -144,7 +151,8 @@ pub struct SessionCreateRequest {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SessionInfo {
     pub session_id: String,
-    pub controller_node_id: String,
+    #[serde(alias = "controller_node_id")]
+    pub initiator_node_id: String,
     pub target_node_id: String,
     pub policy: ConnectionPolicy,
     pub path: SessionPath,

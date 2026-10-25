@@ -1,4 +1,4 @@
-﻿# StarBridge 端到端 SSH 测试：登录控制端和执行端、建立连接，再通过隧道执行 ssh 和 scp。
+﻿# StarBridge 端到端 SSH 测试：登录两台设备、建立连接，再通过隧道执行 ssh 和 scp。
 param(
   [int]$ControllerPort = 18081,
   [int]$ExecutorPort = 18082,
@@ -62,7 +62,7 @@ function Ensure-Instance([int]$port, [string]$role) {
     Start-Process -FilePath $binary -ArgumentList $argumentText -WorkingDirectory $root -WindowStyle Hidden | Out-Null
     $state = Wait-Until "$role 启动" 60 { Get-State $port }.GetNewClosure()
   }
-  if ($state.role -ne $role) { throw "127.0.0.1:$port 上运行的是 $($state.role)，不是 $role" }
+  if ($state.role -notin @('peer', $role)) { throw "127.0.0.1:$port 上运行的是 $($state.role)，不是 $role" }
   Ok "$role 已运行：http://127.0.0.1:$port"
   $state
 }
@@ -95,7 +95,7 @@ try {
       [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
   }
   $credential = @{ username = $Username; password = $Password }
-  # 控制端先登记公钥，执行端登录时就能拿到并写入 authorized_keys。
+  # 设备 A先登记公钥，设备 B登录时就能拿到并写入 authorized_keys。
   $controller = Invoke-Api $ControllerPort POST /api/v1/login $credential
   $executor = Invoke-Api $ExecutorPort POST /api/v1/login $credential
   $Password = $null; $credential = $null
@@ -115,36 +115,36 @@ try {
   Ok "frpc $($frpc.Output)"
 
   Step '检查 SSH 准备情况'
-  Write-Host "  执行端：$($executor.ssh.message)"
-  if (-not $executor.ssh.port) { throw "执行端内置 SSH 服务没有启动：$($executor.ssh.message)" }
-  $null = Wait-Until '执行端收到控制端公钥（中心是旧版时不会转发公钥）' 30 {
+  Write-Host "  设备 B：$($executor.ssh.message)"
+  if (-not $executor.ssh.port) { throw "设备 B内置 SSH 服务没有启动：$($executor.ssh.message)" }
+  $null = Wait-Until '设备 B收到设备 A公钥（中心是旧版时不会转发公钥）' 30 {
     $s = Get-State $ExecutorPort
     $s.devices | Where-Object { $_.node_id -eq $controllerId -and $_.ssh_public_key }
   }.GetNewClosure()
-  Ok '执行端已信任控制端公钥'
-  $target = Wait-Until '控制端拿到执行端主机公钥' 30 {
+  Ok '设备 B已信任设备 A公钥'
+  $target = Wait-Until '设备 A拿到设备 B主机公钥' 30 {
     $s = Get-State $ControllerPort
     $s.devices | Where-Object { $_.node_id -eq $executorId -and $_.online -and $_.ssh_host_key }
   }.GetNewClosure()
-  Ok "目标执行端 $($target.display_name)，登录用户 $($target.ssh_user)，权限 $($target.ssh_privilege)"
+  Ok "目标设备 B $($target.display_name)，登录用户 $($target.ssh_user)，权限 $($target.ssh_privilege)"
 
   Step "建立连接（$Policy）"
   if ((Get-State $ControllerPort).session) { $null = Invoke-Api $ControllerPort DELETE /api/v1/disconnect }
   $connected = Invoke-Api $ControllerPort POST /api/v1/connect @{ target_node_id = $executorId; policy = $Policy }
-  # 控制端 frpc 被拦截或启动失败时，错误只出现在这次响应里，下一次心跳就会被覆盖。
+  # 设备 A frpc 被拦截或启动失败时，错误只出现在这次响应里，下一次心跳就会被覆盖。
   if (-not $connected.session -or $connected.stage -match 'failed|blocked|missing') {
-    throw "控制端连接失败（$($connected.stage)）：$($connected.last_error)"
+    throw "设备 A连接失败（$($connected.stage)）：$($connected.last_error)"
   }
   $sessionId = $connected.session.session_id
   Write-Host "  会话 $sessionId"
-  $null = Wait-Until '执行端接管会话（执行端每 10 秒轮询一次）' 40 {
+  $null = Wait-Until '设备 B接管会话（设备 B每 10 秒轮询一次）' 40 {
     $s = Get-State $ExecutorPort
-    if ($s.stage -match 'failed|blocked|missing') { throw "执行端失败：$($s.last_error)" }
+    if ($s.stage -match 'failed|blocked|missing') { throw "设备 B失败：$($s.last_error)" }
     $s.session -and $s.session.session_id -eq $sessionId -and $s.session.status -eq 'connected'
   }.GetNewClosure()
   $state = Get-State $ControllerPort
-  if ($state.session.status -ne 'connected') { throw "控制端会话状态 $($state.session.status)：$($state.last_error)" }
-  if ($state.ssh_command -notmatch '^ssh -F "([^"]+)" (\S+)$') { throw "控制端没有给出 SSH 命令：$($state.ssh_command)" }
+  if ($state.session.status -ne 'connected') { throw "设备 A会话状态 $($state.session.status)：$($state.last_error)" }
+  if ($state.ssh_command -notmatch '^ssh -F "([^"]+)" (\S+)$') { throw "设备 A没有给出 SSH 命令：$($state.ssh_command)" }
   $config = $Matches[1]
   $alias = $Matches[2]
   Ok "两端已连接，SSH 命令：$($state.ssh_command)"
@@ -195,12 +195,12 @@ try {
     "权限：$($target.ssh_privilege)"
   }
   $handoff = @"
-你可以通过 SSH 控制一台 Windows 执行端 $($target.display_name)：
+你可以通过 SSH 控制一台 Windows 设备 B $($target.display_name)：
 - 执行命令：ssh -F "$config" -o BatchMode=yes $alias "<命令>"
 - 上传：scp -F "$config" -o BatchMode=yes <本地文件> ${alias}:<远端路径>；下载时把两个参数对调
 - 远端默认 shell 是 cmd.exe，复杂操作用 powershell -NoProfile -Command "..."
 - 登录用户 $($target.ssh_user)，$limit
-- 会话 10 分钟后过期，需要我在控制端重新连接
+- 会话断开后可在设备中心重新连接
 - 连接失败时不要反复重试或猜测，把报错原样告诉我
 "@
   Write-Host $handoff

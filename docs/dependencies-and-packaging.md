@@ -22,7 +22,7 @@ OpenSSH：
 - Windows 发行版和发布页：<https://github.com/PowerShell/Win32-OpenSSH/releases>
 - Windows 安装说明：<https://github.com/PowerShell/Win32-OpenSSH/wiki/Install-Win32-OpenSSH>
 
-Windows 客户端优先使用 Win32-OpenSSH 的稳定发布包，至少需要 `ssh.exe`；需要文件传输时同时带 `sftp.exe` 和 `scp.exe`。`sshd.exe` 和 `sftp-server.exe` 是执行端作为 SSH 服务端时才需要的组件。Linux 端优先使用发行版自带的 OpenSSH，不把一个 Windows 版 OpenSSH 打进 Linux 服务器包。
+Windows 客户端优先使用 Win32-OpenSSH 的稳定发布包，至少需要 `ssh.exe`；需要文件传输时同时带 `sftp.exe` 和 `scp.exe`。`sshd.exe` 和 `sftp-server.exe` 供每台设备提供 SSH 服务的组件。Linux 端优先使用发行版自带的 OpenSSH，不把一个 Windows 版 OpenSSH 打进 Linux 服务器包。
 
 OpenSSH 的许可证、第三方库和各平台发布说明必须随发布物保存。不要从不明的第三方“绿色版 SSH”下载可执行文件。
 
@@ -85,8 +85,9 @@ Windows 客户端便携目录布局：
 ```text
 StarBridge-test/
   starbridge.exe
-  start-controller.bat
-  start-executor.bat
+  start-node.bat
+  start-controller.bat       兼容旧数据目录
+  start-executor.bat         兼容旧数据目录
   runtime/
     frpc.exe
     ssh.exe
@@ -104,11 +105,10 @@ StarBridge-test/
     openssh/
   runtime-manifest.json
   state/                   首次运行时创建，不进入分发 zip
-    controller/
-    executor/
+    node/
 ```
 
-双击 `starbridge.exe` 默认启动控制端，`start-executor.bat` 启动执行端。首次在界面配置中心服务器地址；默认值是本机开发地址。将整个便携目录放在可写位置，保留 `runtime/` 和许可证，运行电脑需已有 WebView2 Runtime；StarBridge 不运行安装器。默认数据目录基于 exe 位置，`--data-dir` 可覆盖；两种角色不得共用数据目录。升级请保留已有 `state/`，不要将身份、密钥或登录状态混入发布物。
+双击 `starbridge.exe` 或 `start-node.bat` 打开设备中心，同账户设备可互相连接。旧启动脚本仍可使用，并继续访问原来的数据目录。首次在界面配置中心服务器地址；默认值是本机开发地址。将整个便携目录放在可写位置，保留 `runtime/` 和许可证，运行电脑需已有 WebView2 Runtime；StarBridge 不运行安装器。默认数据目录基于 exe 位置，`--data-dir` 可覆盖；同时运行的实例不得共用数据目录。升级请保留已有 `state/`，不要将身份、密钥或登录状态混入发布物。
 
 中心 Linux 部署包建议布局：
 
