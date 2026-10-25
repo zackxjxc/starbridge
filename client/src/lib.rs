@@ -14,9 +14,15 @@ use starbridge_protocol::{
 use std::{
     path::{Path as FsPath, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::sync::{Mutex, RwLock};
+
+#[cfg(feature = "desktop")]
+pub mod desktop;
 
 const CLIENT_HTML: &str = include_str!("../../client-ui/index.html");
 
@@ -117,6 +123,8 @@ pub struct ClientApp {
     http: reqwest::Client,
     frpc_process: Arc<Mutex<Option<tokio::process::Child>>>,
     sshd_process: Arc<Mutex<Option<tokio::process::Child>>>,
+    shutting_down: Arc<AtomicBool>,
+    background_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 struct Inner {
@@ -174,6 +182,8 @@ impl ClientApp {
             http: reqwest::Client::builder().no_proxy().build()?,
             frpc_process: Arc::new(Mutex::new(None)),
             sshd_process: Arc::new(Mutex::new(None)),
+            shutting_down: Arc::new(AtomicBool::new(false)),
+            background_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         app.prepare_ssh().await;
         Ok(app)
@@ -240,7 +250,7 @@ impl ClientApp {
             .create(true)
             .append(true)
             .open(&log_path)?;
-        let mut child = tokio::process::Command::new(&sshd)
+        let mut child = async_command(&sshd)
             .arg("-D")
             .arg("-e")
             .arg("-f")
@@ -312,7 +322,7 @@ impl ClientApp {
 
     pub async fn heartbeat_loop(&self) {
         let app = self.clone();
-        tokio::spawn(async move {
+        self.spawn_background(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
             loop {
                 interval.tick().await;
@@ -335,6 +345,38 @@ impl ClientApp {
                 }
             }
         });
+    }
+
+    fn spawn_background(&self, task: impl std::future::Future<Output = ()> + Send + 'static) {
+        let mut tasks = self
+            .background_tasks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(tokio::spawn(task));
+    }
+
+    /// 先取消后台工作，再回收子进程；退出不依赖中心服务器在线。
+    pub async fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+        let tasks = {
+            let mut tasks = self
+                .background_tasks
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            std::mem::take(&mut *tasks)
+        };
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+        self.stop_frpc().await;
+        self.stop_sshd().await;
     }
 
     async fn heartbeat_once(&self) -> anyhow::Result<()> {
@@ -475,6 +517,9 @@ impl ClientApp {
         controller: bool,
         force_relay: bool,
     ) -> anyhow::Result<()> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            anyhow::bail!("客户端正在退出");
+        }
         let route = session
             .route
             .as_ref()
@@ -515,26 +560,35 @@ impl ClientApp {
             .create(true)
             .append(true)
             .open(&log_path)?;
-        let mut process = tokio::process::Command::new(&frpc_path);
+        let mut process = async_command(&frpc_path);
         process
             .arg("-c")
             .arg(&config_path)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log.try_clone()?))
             .stderr(Stdio::from(log));
-        let mut child = process
-            .spawn()
-            .map_err(|error| anyhow::anyhow!("启动 frpc 失败: {error}"))?;
-        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-        if let Some(status) = child.try_wait()? {
-            anyhow::bail!("frpc 启动后退出: {status}，日志见 {}", log_path.display());
-        }
         let mut current = self.frpc_process.lock().await;
+        if self.shutting_down.load(Ordering::Acquire) {
+            anyhow::bail!("客户端正在退出");
+        }
         if let Some(old) = current.as_mut() {
             let _ = old.kill().await;
             let _ = old.wait().await;
         }
+        *current = None;
+        if self.shutting_down.load(Ordering::Acquire) {
+            anyhow::bail!("客户端正在退出");
+        }
+        let child = process
+            .spawn()
+            .map_err(|error| anyhow::anyhow!("启动 frpc 失败: {error}"))?;
+        // 在首次 await 前登记，后台任务被取消时 shutdown 仍能等待进程退出。
         *current = Some(child);
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        if let Some(status) = current.as_mut().expect("frpc process registered").try_wait()? {
+            *current = None;
+            anyhow::bail!("frpc 启动后退出: {status}，日志见 {}", log_path.display());
+        }
         drop(current);
         if controller {
             self.inner.write().await.visitor_port = Some(port);
@@ -549,7 +603,7 @@ impl ClientApp {
             return;
         }
         let app = self.clone();
-        tokio::spawn(async move {
+        self.spawn_background(async move {
             let root = { app.inner.read().await.root.clone() };
             let log_path = root
                 .join("routes")
@@ -1007,16 +1061,8 @@ fn ssh_command(inner: &Inner) -> Option<String> {
 }
 
 fn runtime_status(root: &FsPath) -> RuntimeStatus {
-    let local_runtime = root.join("runtime");
-    let shared_runtime = root
-        .parent()
-        .map(|parent| parent.join("runtime"))
-        .unwrap_or_else(|| local_runtime.clone());
-    let runtime = if local_runtime.exists() || !shared_runtime.exists() {
-        local_runtime
-    } else {
-        shared_runtime
-    };
+    let executable = std::env::current_exe().ok();
+    let runtime = runtime_directory(root, executable.as_deref().and_then(FsPath::parent));
     let frpc = runtime.join(if cfg!(windows) { "frpc.exe" } else { "frpc" });
     let ssh = runtime.join(if cfg!(windows) { "ssh.exe" } else { "ssh" });
     let frpc_available = frpc.is_file();
@@ -1034,8 +1080,35 @@ fn runtime_status(root: &FsPath) -> RuntimeStatus {
     }
 }
 
+fn runtime_directory(root: &FsPath, executable_dir: Option<&FsPath>) -> PathBuf {
+    let local_runtime = root.join("runtime");
+    std::iter::once(local_runtime.clone())
+        .chain(root.parent().map(|parent| parent.join("runtime")))
+        .chain(executable_dir.map(|directory| directory.join("runtime")))
+        .find(|directory| directory.is_dir())
+        .unwrap_or(local_runtime)
+}
+
+fn quiet_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let command = std::process::Command::new(program);
+    #[cfg(windows)]
+    let command = {
+        use std::os::windows::process::CommandExt;
+        let mut command = command;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        command
+    };
+    command
+}
+
+fn async_command(program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
+    let mut command = tokio::process::Command::from(quiet_command(program));
+    command.kill_on_drop(true);
+    command
+}
+
 fn probe_frpc(path: &str) -> anyhow::Result<String> {
-    let output = std::process::Command::new(path)
+    let output = quiet_command(path)
         .arg("--version")
         .output()
         .map_err(|error| anyhow::anyhow!("无法启动 {path}: {error}"))?;
@@ -1123,7 +1196,7 @@ async fn ensure_key(keygen: &FsPath, path: &FsPath) -> anyhow::Result<String> {
         }
         let _ = tokio::fs::remove_file(path).await;
         let _ = tokio::fs::remove_file(&public).await;
-        let output = tokio::process::Command::new(keygen)
+        let output = async_command(keygen)
             .args(["-q", "-t", "ed25519", "-N", "", "-C", "starbridge", "-f"])
             .arg(path)
             .stdin(Stdio::null())
@@ -1213,7 +1286,7 @@ async fn write_ssh_client_files(
 /// 检测当前进程权限；sshd 由本进程拉起，权限相同。
 fn detect_privilege() -> SshPrivilege {
     if cfg!(windows) {
-        let Ok(output) = std::process::Command::new("whoami")
+        let Ok(output) = quiet_command("whoami")
             .args(["/groups", "/fo", "csv", "/nh"])
             .output()
         else {
@@ -1230,7 +1303,7 @@ fn detect_privilege() -> SshPrivilege {
             SshPrivilege::Unknown
         }
     } else {
-        match std::process::Command::new("id").arg("-u").output() {
+        match quiet_command("id").arg("-u").output() {
             Ok(output) if String::from_utf8_lossy(&output.stdout).trim() == "0" => {
                 SshPrivilege::Admin
             }
@@ -1317,11 +1390,11 @@ fn hostname() -> String {
 /// macOS 和多数 Linux 默认不导出 HOSTNAME 环境变量，向系统查询主机名。
 fn system_hostname() -> Option<String> {
     let mut command = if cfg!(target_os = "macos") {
-        let mut command = std::process::Command::new("scutil");
+        let mut command = quiet_command("scutil");
         command.args(["--get", "LocalHostName"]);
         command
     } else {
-        std::process::Command::new("hostname")
+        quiet_command("hostname")
     };
     let output = command
         .output()
@@ -1414,6 +1487,60 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portable_runtime_preserves_instance_and_shared_overrides() {
+        let temporary = std::env::temp_dir()
+            .join(format!("starbridge-runtime-{}", uuid::Uuid::new_v4()));
+        let executable_dir = temporary.join("portable");
+        let root = temporary.join("data").join("controller");
+        let portable = executable_dir.join("runtime");
+        let shared = root.parent().unwrap().join("runtime");
+        let local = root.join("runtime");
+        assert_eq!(runtime_directory(&root, Some(&executable_dir)), local);
+        std::fs::create_dir_all(&portable).unwrap();
+        assert_eq!(runtime_directory(&root, Some(&executable_dir)), portable);
+        std::fs::create_dir_all(&shared).unwrap();
+        assert_eq!(runtime_directory(&root, Some(&executable_dir)), shared);
+        std::fs::create_dir_all(&local).unwrap();
+        assert_eq!(runtime_directory(&root, Some(&executable_dir)), local);
+        std::fs::remove_dir_all(&temporary).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_background_work_and_rejects_restart() {
+        let root = std::env::temp_dir()
+            .join(format!("starbridge-shutdown-{}", uuid::Uuid::new_v4()));
+        let app = ClientApp::load(Role::Controller, root.clone()).await.unwrap();
+        let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
+        app.spawn_background(async move {
+            let _sender = sender;
+            std::future::pending::<()>().await;
+        });
+        app.heartbeat_loop().await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), app.shutdown())
+            .await
+            .expect("offline shutdown should not wait for the server");
+        assert!(receiver.await.is_err(), "background future must be dropped");
+        let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
+        app.spawn_background(async move {
+            let _sender = sender;
+            std::future::pending::<()>().await;
+        });
+        assert!(
+            receiver.await.is_err(),
+            "shutdown must prevent new background work"
+        );
+        let error = app
+            .start_frpc(&session(ConnectionPolicy::RelayOnly), true)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("正在退出"));
+        assert!(app.frpc_process.lock().await.is_none());
+        assert!(app.sshd_process.lock().await.is_none());
+        app.shutdown().await;
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     fn session(policy: ConnectionPolicy) -> SessionInfo {
         SessionInfo {

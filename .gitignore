@@ -5,6 +5,7 @@
 /.cache/
 /client-ui/node_modules/
 /client-ui/dist/
+/client/gen/schemas/
 /admin-ui/node_modules/
 /admin-ui/dist/
 *.log

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Local StarBridge window; clipboard text write only.",
+  "windows": ["main"],
+  "permissions": ["clipboard-manager:allow-write-text"]
+}

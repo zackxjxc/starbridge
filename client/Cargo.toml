@@ -2,19 +2,29 @@
 name = "starbridge-client"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+rust-version = "1.90"
 publish = false
+
+[features]
+default = ["desktop", "custom-protocol"]
+desktop = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-clipboard-manager"]
+custom-protocol = ["desktop", "tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", optional = true }
 
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
+fs2 = "0.4"
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 starbridge-protocol = { path = "../protocol" }
+tauri = { version = "2", optional = true }
+tauri-plugin-clipboard-manager = { version = "2", optional = true }
 tokio = { workspace = true, features = ["process"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
-webbrowser.workspace = true
