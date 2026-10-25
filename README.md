@@ -8,6 +8,8 @@ StarBridge 是一个基于 FRP 的跨网络设备连接工具。客户端使用 
 
 - [一期详细设计](docs/phase-1-design.md)
 - [架构总览](docs/architecture.md)
+- [客户端 UI 与交互定稿（两栏石墨灰）](docs/client-ui-and-interaction-spec.md)
+- [会话占用与准入规则](docs/client-experience-and-session-rules.md)
 - [本机连接测试方案](docs/connection-self-test-plan.md)
 - [FRP/OpenSSH 来源与打包](docs/dependencies-and-packaging.md)
 - [二期、三期和未来扩展路线](docs/future-roadmap.md)
@@ -15,7 +17,7 @@ StarBridge 是一个基于 FRP 的跨网络设备连接工具。客户端使用 
 
 ## 开发阶段
 
-开发阶段中心服务器运行在本机，客户端使用 `localhost` 连接。客户端界面内嵌在 Tauri 窗口中，通过 IPC 调用 Rust 核心；桌面模式不启动本地 HTTP 控制台，也不打开系统浏览器。中心服务器和管理页面保持原有部署方式。依赖二进制在构建前按锁定版本下载、校验并复制进发布目录，不从运行中的用户电脑临时下载。
+客户端界面内嵌在固定 900×600 的 Tauri 窗口中，采用两栏石墨灰界面，通过 IPC 调用 Rust 核心；桌面模式不启动本地 HTTP 控制台，也不打开系统浏览器。正式客户端内置连接服务，普通用户只需注册或登录，默认进入本机页。开发联调可通过 `STARBRIDGE_SERVER_URL` 或无界面模式的配置 API 使用本机中心。依赖二进制在构建前按锁定版本下载、校验并复制进发布目录，不从运行中的用户电脑临时下载。
 
 ## 线上地址和端口
 
@@ -26,7 +28,7 @@ https://starbridge.zackxjxc.de5.net
 https://starbridge.zackxjxc.de5.net/admin
 ```
 
-公网 HTTPS 使用 443 端口，FRP 原生入口使用 17851 端口。用户只填写 HTTPS 地址，FRP 地址和端口由 StarBridge 在登录后自动配置。17850 仅作为服务器本机开发或回环服务端口，不作为公网入口。
+公网 HTTPS 使用 443 端口，FRP 原生入口使用 17851 端口。HTTPS 和 FRP 地址由客户端与中心配置提供，普通界面不要求填写。17850 仅作为服务器本机开发或回环服务端口，不作为公网入口。
 
 ## 目录
 
@@ -53,13 +55,14 @@ cargo run -p starbridge-server
 再启动两台设备的客户端。本机联调使用两个独立数据目录：
 
 ```powershell
+$env:STARBRIDGE_SERVER_URL = 'http://127.0.0.1:17850'
 cargo run -p starbridge-client -- --data-dir state/node-a
 cargo run -p starbridge-client -- --data-dir state/node-b
 ```
 
-两个实例使用同一套客户端，都能发起和接受连接。登录时使用同一账户名称和密码；开发阶段中心服务会在首次登录时创建本地账户。设备列表会显示同账户设备，任意一台都可点击另一台发起连接，也支持两个方向同时连接。关闭窗口会停止客户端的心跳任务和受管的 `frpc`、`sshd` 子进程。
+两个实例使用同一套客户端，都能在空闲时发起或接受连接。先注册账户，再在各设备上登录同一账户。设备列表显示同账户设备；点击设备只查看详情，进入配置并点击开始后才连接。A 连接 B 后可继续连接空闲的 C，但 B 不能反向连接或被其他设备重复接入。关闭窗口会停止客户端的心跳任务和受管的 `frpc`、`sshd` 子进程。
 
-统一节点版本需要同步升级中心服务和客户端；历史设备身份和 SSH 密钥继续复用。构建后可运行 `python tools/test-peer-connectivity.py`，在隔离数据目录中验证真实 FRP/SSH 双向连接、独立断开、重复连接和重启恢复。
+本轮协议需要同步升级中心服务和客户端；历史设备身份和 SSH 密钥继续复用。构建后可运行 `python tools/test-peer-connectivity.py`，在隔离数据目录中验证 A→B/C 的真实 FRP/SSH 连接、占用拒绝、单台终止、同向复用和重启恢复。空闲后可以反过来由 B 连接 A，不允许两方向同时参与。
 
 联调或自动化可添加 `--headless`，启动原有的本地 HTTP 控制台；`--no-browser` 保留为兼容入口。`powershell -ExecutionPolicy Bypass -File tools/start-local.ps1` 使用这种模式一次启动本地中心和两个设备实例。若只需要无界面客户端，可用 `cargo run -p starbridge-client --no-default-features -- --headless --data-dir state/node-a`，无需 Tauri 系统依赖。
 
@@ -77,7 +80,7 @@ python tools/package_windows.py
 
 输出为 `dist/StarBridge-test/` 和 `dist/StarBridge-test.zip`。构建默认启用桌面和 `custom-protocol` 功能，将 UI 嵌入可执行文件；打包仅组装便携目录与 zip，不生成 MSI 或 NSIS 安装包。
 
-解压到可写目录后，双击 `starbridge.exe` 或 `start-node.bat` 打开设备中心，同账户设备可互相发起连接。首次在界面填写服务器地址，默认是本机开发地址。需要保留整个目录中的 `runtime/` 和许可证文件。运行电脑需要已安装 WebView2 Runtime；不需要安装 StarBridge 或 Rust。
+解压到可写目录后，双击 `starbridge.exe` 或 `start-node.bat`，使用用户名和密码登录或注册。连接服务已内置，不需要填写服务器地址。需要保留整个目录中的 `runtime/`、运行时校验清单和许可证文件。运行电脑需要已安装 WebView2 Runtime；不需要安装 StarBridge 或 Rust。
 
 新设备默认数据保存在可执行文件旁的 `state/node/`；升级时若该目录不存在且检测到旧 `state/controller/identity.json`，会继续使用旧目录。旧启动脚本继续使用各自的原数据目录。数据位置不依赖启动时的工作目录；可通过 `--data-dir` 指定其他位置。`runtime/` 从数据目录及其父目录、可执行文件旁依次查找，兼容开发环境的 `state/runtime/`。升级时请保留数据目录，不要把配置、身份或登录状态打进分发 zip。
 
