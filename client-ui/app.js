@@ -22,6 +22,7 @@
     client_save_config: ['PUT', '/api/v1/config'], client_login: ['POST', '/api/v1/login'],
     client_register: ['POST', '/api/v1/register'], client_logout: ['POST', '/api/v1/logout'],
     client_update_device: ['PUT', '/api/v1/devices'], client_connect: ['POST', '/api/v1/connect'],
+    client_delete_device: ['POST', '/api/v1/devices/delete'],
     client_connect_all: ['POST', '/api/v1/connect/all'], client_terminate: ['POST', '/api/v1/terminate'],
     client_export: ['POST', '/api/v1/export'], client_start_test: ['POST', '/api/v1/test/start'],
     client_cancel_test: ['POST', '/api/v1/test/cancel'], client_components: ['GET', '/api/v1/components'],
@@ -270,7 +271,9 @@
     return h('form', { 'data-form': 'metadata', 'data-id': item.node_id, 'data-key': `edit-${item.node_id}` },
       local ? field('本机名称', 'device-display-name', draft.display_name, { name: 'display_name', maxlength: 80, required: true, 'data-draft': item.node_id }) : null,
       field('用途备注', 'device-purpose', draft.purpose, { name: 'purpose', maxlength: 500, placeholder: '例如：开发环境、文件整理', 'data-draft': item.node_id, multiline: true }),
-      button(ui.busy.has('metadata') ? '正在保存…' : '保存修改', '', { type: 'submit', disabled: ui.busy.has('metadata') || !ui.drafts.has(item.node_id) }));
+      h('div', { class: 'actions device-edit-actions' },
+        button(ui.busy.has('metadata') ? '正在保存…' : '保存修改', '', { type: 'submit', disabled: ui.busy.has('metadata') || !ui.drafts.has(item.node_id) }),
+        button('删除设备', 'delete-device', { class: 'button danger', 'data-id': item.node_id, disabled: ui.busy.has('delete-device') })));
   }
   function devicePage() {
     const item = device(ui.selected); if (!item) return h('div', { class: 'empty' }, '这台设备已不在账号列表中。');
@@ -565,6 +568,7 @@
     menu.replaceChildren(...[
       !isLocal ? button(active ? '终止连接' : '连接设备', active ? 'terminate-one' : 'configure', { role: 'menuitem', 'data-id': id, disabled: !active && !!blockReason(item) }) : null,
       button('重命名设备', 'rename', { role: 'menuitem', 'data-id': id }),
+      button('删除设备', 'delete-device', { role: 'menuitem', class: 'danger', 'data-id': id, disabled: ui.busy.has('delete-device') }),
     ].filter(Boolean));
     ui.menuNode = id; ui.menuReturn = document.activeElement; menu.hidden = false;
     menu.style.left = `${Math.max(6, Math.min(x, innerWidth - menu.offsetWidth - 6))}px`;
@@ -586,6 +590,15 @@
     showModal('terminate', [h('h2', { id: 'modal-title' }, '终止全部连接？'),
       h('p', { class: 'modal-copy' }, '将结束本机发起的全部连接，并取消正在建立的连接和等待任务。现有 SSH 会中断，之后不会自动恢复。'),
       h('div', { class: 'actions' }, button('保留连接', 'close-modal'), button('终止全部连接', 'confirm-terminate-all', { class: 'button danger' }))]);
+  }
+  function deleteDialog(id) {
+    const item = device(id); if (!item) return;
+    const local = id === localId();
+    showModal('delete-device', [h('h2', { id: 'modal-title' }, '删除设备？'),
+      h('p', { class: 'modal-copy' }, `将从账号的设备列表中删除“${item.display_name}”。不会删除这台电脑上的文件。`),
+      h('p', { class: 'modal-copy' }, local ? '删除本机后会退出登录；重新登录可再次添加。' : '设备在线时也会被移除并退出登录；需要在该电脑重新登录才能再次添加。'),
+      h('p', { class: 'muted' }, '请先终止该设备的连接、等待任务或连接测试。'),
+      h('div', { class: 'actions' }, button('取消', 'close-modal'), button('删除设备', 'confirm-delete-device', { class: 'button danger', 'data-id': id, disabled: ui.busy.has('delete-device') }))]);
   }
   function showWindowsHelp() {
     if (!isWindows()) return;
@@ -643,6 +656,15 @@
       case 'confirm-terminate-all': modal.close(); await mutate('terminate', 'client_terminate', { form: { target_node_id: null } }); toast('全部连接及等待任务已终止'); break;
       case 'menu': { const rect = target.getBoundingClientRect(); openMenu(id, rect.right - 155, rect.bottom + 4); break; }
       case 'rename': renameDialog(id); break;
+      case 'delete-device': deleteDialog(id); break;
+      case 'confirm-delete-device': {
+        if (ui.busy.has('delete-device')) return;
+        const result = await mutate('delete-device', 'client_delete_device', { form: { node_id: id } });
+        ui.drafts.delete(id); ui.exportData = null; ui.exportFingerprint = null;
+        if (modal.open) modal.close();
+        if (result.logged_in) navigate('device', result.node_id);
+        toast('设备已删除'); break;
+      }
       case 'close-modal': modal.close(); break;
       case 'auth-switch': ui.authMode = ui.authMode === 'login' ? 'register' : 'login'; ui.authError = ''; ui.auth.password = ''; ui.auth.confirm_password = ''; render(); break;
       case 'logout': {

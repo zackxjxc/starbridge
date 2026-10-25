@@ -17,6 +17,11 @@ pub struct DeviceMetadataForm {
     pub purpose: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct DeviceDeleteForm {
+    pub node_id: String,
+}
+
 pub(super) async fn response_json<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
 ) -> Result<T, ApiError> {
@@ -53,6 +58,7 @@ async fn authenticate_account(app: &ClientApp, form: LoginForm, registering: boo
     if form.username.trim().is_empty() || form.password.len() < 4 {
         return Err(ApiError::bad_request("请输入账户名称和至少 4 位密码"));
     }
+    let _heartbeat = app.heartbeat_gate.lock().await;
     let _gate = app.session_operations.lock().await;
     let (url, generation) = {
         let mut inner = app.inner.write().await;
@@ -79,16 +85,45 @@ async fn authenticate_account(app: &ClientApp, form: LoginForm, registering: boo
         if form.remember { save_auth(&inner.root, &auth).await.map_err(ApiError::internal)?; }
     }
     drop(_gate);
-    if let Err(error) = app.refresh_devices().await {
+    let registration = app.refresh_devices().await;
+    // Only an explicit password login can replace a deleted device credential.
+    let registration = if registration.as_ref().err().and_then(|error| error.downcast_ref::<reqwest::Error>())
+        .and_then(reqwest::Error::status) == Some(StatusCode::GONE) {
+        let _gate = app.session_operations.lock().await;
+        {
+            let mut inner = app.inner.write().await;
+            if inner.auth_generation != generation || inner.auth.as_ref().map(|value| &value.access_token) != Some(&auth.access_token) {
+                return Err(ApiError::bad_request("登录状态已更改"));
+            }
+            let mut identity = inner.identity.clone();
+            identity.device_token = new_token();
+            save_json(&inner.root.join("identity.json"), &identity).await.map_err(ApiError::internal)?;
+            inner.identity = identity;
+        }
+        drop(_gate);
+        app.refresh_devices().await
+    } else { registration };
+    if let Err(error) = registration {
         app.inner.write().await.last_error = Some(error.to_string());
     }
     Ok(Json(snapshot(&*app.inner.read().await)))
 }
 
 pub(super) async fn logout(State(app): State<ClientApp>) -> Result<Json<ClientSnapshot>, ApiError> {
+    logout_account(&app, None, None).await
+}
+
+pub(super) async fn logout_removed_device(app: &ClientApp, generation: u64) -> Result<Json<ClientSnapshot>, ApiError> {
+    logout_account(app, Some(generation), Some("此设备已从账号删除，请重新登录后添加。")).await
+}
+
+async fn logout_account(app: &ClientApp, expected_generation: Option<u64>, reason: Option<&str>) -> Result<Json<ClientSnapshot>, ApiError> {
     let _gate=app.session_operations.lock().await;
     {
         let mut inner=app.inner.write().await;
+        if expected_generation.is_some_and(|generation| generation != inner.auth_generation) {
+            return Ok(Json(snapshot(&inner)));
+        }
         inner.closing_account=true;inner.auth_generation+=1;inner.stage="signing_out".into();
     }
     app.diagnostic_cancel.store(true, Ordering::Release);
@@ -109,6 +144,7 @@ pub(super) async fn logout(State(app): State<ClientApp>) -> Result<Json<ClientSn
         inner.closing_account=false;
         inner.devices.clear();
         inner.stage = "ready".into();
+        inner.last_error = reason.map(str::to_owned);
         clear_saved_auth(&inner.root).await;
         (auth, inner.config.server_url.clone())
     };
@@ -126,9 +162,56 @@ pub(super) async fn logout(State(app): State<ClientApp>) -> Result<Json<ClientSn
     Ok(Json(snapshot(&*app.inner.read().await)))
 }
 
+pub(super) async fn delete_device(
+    State(app): State<ClientApp>, Json(form): Json<DeviceDeleteForm>,
+) -> Result<Json<ClientSnapshot>, ApiError> {
+    app.refresh_auth(false).await.map_err(ApiError::internal)?;
+    // Match heartbeat's lock order and exclude an in-flight registration response.
+    let heartbeat = app.heartbeat_gate.lock().await;
+    let gate = app.session_operations.lock().await;
+    let updates = app.device_updates.lock().await;
+    let (auth, url, identity) = app.auth_context().await?;
+    let generation = app.inner.read().await.auth_generation;
+    let local = identity.node_id == form.node_id;
+    {
+        let inner = app.inner.read().await;
+        if inner.closing_account { return Err(ApiError::bad_request("正在退出登录")); }
+        if !local && !inner.devices.iter().any(|item| item.node_id == form.node_id) {
+            return Err(ApiError::bad_request("设备已不在账号列表中"));
+        }
+        let pending = inner.operations.values().any(|item| (local || item.node_id == form.node_id)
+            && matches!(item.state.as_str(), "queued" | "connecting" | "verifying"));
+        let connected = inner.sessions.values().any(|item| matches!(item.status, SessionStatus::Negotiating | SessionStatus::Connected)
+            && (local || item.initiator_node_id == form.node_id || item.target_node_id == form.node_id));
+        if pending || connected || (local && matches!(inner.self_test.state.as_str(), "running" | "cleaning")) {
+            return Err(ApiError::bad_request("请先终止该设备的连接、等待任务或连接测试，再删除设备"));
+        }
+    }
+    let response = app.http.delete(format!("{url}/api/v1/devices/{}", form.node_id))
+        .bearer_auth(auth.access_token)
+        .header("x-starbridge-node-id", &identity.node_id)
+        .header("x-starbridge-device-token", &identity.device_token)
+        .send().await.map_err(ApiError::network)?;
+    let devices: Vec<DeviceInfo> = response_json(response).await?;
+    {
+        let mut inner = app.inner.write().await;
+        if inner.auth_generation != generation { return Err(ApiError::bad_request("登录状态已更改")); }
+        inner.devices = devices.clone();
+        inner.operations.remove(&form.node_id);
+        if let Some(batch) = inner.batch.as_mut() { batch.targets.retain(|id| id != &form.node_id); }
+    }
+    app.sync_authorized_keys(&devices).await;
+    drop(updates);
+    drop(gate);
+    drop(heartbeat);
+    if local { return logout_removed_device(&app, generation).await; }
+    Ok(Json(snapshot(&*app.inner.read().await)))
+}
+
 pub(super) async fn update_device(
     State(app): State<ClientApp>, Json(form): Json<DeviceMetadataForm>,
 ) -> Result<Json<ClientSnapshot>, ApiError> {
+    let _updates = app.device_updates.lock().await;
     let name = form.display_name.trim();
     if name.is_empty() || name.chars().count() > 80 || form.purpose.chars().count() > 240 {
         return Err(ApiError::bad_request("名称不能为空且最多 80 字，用途最多 240 字"));
@@ -189,6 +272,7 @@ impl ClientApp {
     }
 
     pub(super) async fn refresh_devices(&self) -> anyhow::Result<Vec<DeviceInfo>> {
+        let _updates = self.device_updates.lock().await;
         let (auth, url, generation, registration) = {
             let inner = self.inner.read().await;
             if inner.closing_account { anyhow::bail!("正在退出登录"); }

@@ -97,6 +97,8 @@ svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width:
 .button.primary:hover:not(:disabled) { background: var(--main-hover); border-color: var(--main-hover); }
 .button.primary:active:not(:disabled) { background: var(--main-active); border-color: var(--main-active); }
 .button.danger { color: var(--bad); }
+.device-edit-actions .danger { margin-left: auto; }
+.context-menu button.danger { color: var(--bad); }
 .button.wide { width: 100%; }
 .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .actions.stretch > * { flex: 1; }

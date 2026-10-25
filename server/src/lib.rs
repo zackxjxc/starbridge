@@ -14,7 +14,7 @@ use starbridge_protocol::{
     SessionPath, SessionStatus, SessionStatusRequest, new_id, now_unix,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path as FsPath, PathBuf},
     sync::Arc,
 };
@@ -50,6 +50,12 @@ struct StoredDevice {
 }
 
 #[derive(Clone, Deserialize, Serialize)]
+struct DeletedDevice {
+    account: String,
+    revoked_token_hashes: HashSet<String>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 struct RefreshGrant {
     username: String,
     expires_at: u64,
@@ -62,6 +68,7 @@ struct Inner {
     tokens: HashMap<String, (String, u64)>,
     refresh_grants: HashMap<String, RefreshGrant>,
     devices: HashMap<String, StoredDevice>,
+    deleted_devices: HashMap<String, DeletedDevice>,
     sessions: HashMap<String, SessionInfo>,
     diagnostics: HashMap<String, diagnostics::DiagnosticRecord>,
     frp_server_addr: String,
@@ -73,6 +80,8 @@ struct Inner {
 struct PersistedState {
     accounts: HashMap<String, Account>,
     devices: HashMap<String, StoredDevice>,
+    #[serde(default)]
+    deleted_devices: HashMap<String, DeletedDevice>,
     sessions: HashMap<String, SessionInfo>,
     #[serde(default)]
     refresh_grants: HashMap<String, RefreshGrant>,
@@ -126,6 +135,7 @@ impl AppState {
                     .as_ref()
                     .map(|state| state.devices.clone())
                     .unwrap_or_default(),
+                deleted_devices: persisted.as_ref().map(|state| state.deleted_devices.clone()).unwrap_or_default(),
                 sessions,
                 refresh_grants: persisted.as_ref().map(|state| state.refresh_grants.clone()).unwrap_or_default(),
                 frp_server_addr: address,
@@ -177,6 +187,7 @@ fn persist_inner(data_path: &FsPath, inner: &Inner) -> anyhow::Result<()> {
     let bytes = serde_json::to_vec_pretty(&PersistedState {
         accounts: inner.accounts.clone(),
         devices: inner.devices.clone(),
+        deleted_devices: inner.deleted_devices.clone(),
         sessions: inner.sessions.clone(),
         refresh_grants: inner.refresh_grants.clone(),
     })?;
@@ -203,7 +214,7 @@ pub fn app(state: AppState) -> Router {
         .route("/api/v1/devices/register", post(register_device))
         .route("/api/v1/devices/heartbeat", post(heartbeat))
         .route("/api/v1/devices", get(devices))
-        .route("/api/v1/devices/{id}", axum::routing::put(update_device_metadata))
+        .route("/api/v1/devices/{id}", axum::routing::put(update_device_metadata).delete(delete_device))
         .route("/api/v1/admin/summary", get(admin_summary))
         .route("/api/v1/sessions", post(create_session))
         .route(
@@ -337,6 +348,7 @@ async fn register_device(
     let account = authenticate(&state, &headers).await?;
     validate_registration(&registration)?;
     let mut inner = state.inner.write().await;
+    ensure_device_not_deleted(&inner, &account, &registration.node_id, &registration.device_token)?;
     if registration.direct_only && registration.allow_relay {
         return Err(ApiError::bad_request("只允许直连的节点不能同时允许中继"));
     }
@@ -387,6 +399,38 @@ async fn update_device_metadata(
     Ok(Json(list_devices(&inner, Some(&account))))
 }
 
+async fn delete_device(
+    State(state): State<AppState>, headers: HeaderMap, Path(id): Path<String>,
+) -> Result<Json<Vec<DeviceInfo>>, ApiError> {
+    let account = authenticate(&state, &headers).await?;
+    let mut inner = state.inner.write().await;
+    let requester = headers.get("x-starbridge-node-id")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| ApiError::forbidden("缺少发起设备身份"))?;
+    authenticate_device(&inner, &account, requester, device_token_header(&headers)?)?;
+    let device = inner.devices.get(&id).cloned()
+        .ok_or_else(|| ApiError::not_found("设备不存在"))?;
+    if device.account != account { return Err(ApiError::forbidden("不能删除其他账户的设备")); }
+    expire_sessions(&mut inner, now_unix());
+    diagnostics::expire(&mut inner, now_unix());
+    if diagnostics::occupied(&inner, &id) || inner.sessions.values().any(|session| is_active(session)
+        && (session.initiator_node_id == id || session.target_node_id == id)) {
+        return Err(ApiError::conflict("设备正在连接或测试，请先终止相关任务后再删除"));
+    }
+    let previous_tombstone = inner.deleted_devices.get(&id).cloned();
+    inner.deleted_devices.entry(id.clone()).or_insert_with(|| DeletedDevice {
+        account: account.clone(), revoked_token_hashes: HashSet::new(),
+    }).revoked_token_hashes.insert(password_digest(&device.device_token));
+    inner.devices.remove(&id);
+    if let Err(error) = persist_inner(&state.data_path, &inner) {
+        inner.devices.insert(id.clone(), device);
+        if let Some(tombstone) = previous_tombstone { inner.deleted_devices.insert(id, tombstone); }
+        else { inner.deleted_devices.remove(&id); }
+        return Err(ApiError::internal(error));
+    }
+    Ok(Json(list_devices(&inner, Some(&account))))
+}
+
 async fn heartbeat(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -394,6 +438,7 @@ async fn heartbeat(
 ) -> Result<Json<Vec<DeviceInfo>>, ApiError> {
     let account = authenticate(&state, &headers).await?;
     let mut inner = state.inner.write().await;
+    ensure_device_not_deleted(&inner, &account, &request.node_id, &request.device_token)?;
     let device = inner
         .devices
         .get_mut(&request.node_id)
@@ -758,12 +803,24 @@ fn expire_sessions(inner: &mut Inner, now: u64) -> bool {
     changed
 }
 
+// Keep revoked credentials after re-registration so an old background client cannot restore a deleted node.
+fn ensure_device_not_deleted(inner: &Inner, account: &str, node_id: &str, token: &str) -> Result<(), ApiError> {
+    if let Some(deleted) = inner.deleted_devices.get(node_id) {
+        if deleted.account != account { return Err(ApiError::forbidden("设备身份属于其他账户")); }
+        if deleted.revoked_token_hashes.contains(&password_digest(token)) {
+            return Err(ApiError::new(StatusCode::GONE, "此设备已被删除，请重新登录后添加"));
+        }
+    }
+    Ok(())
+}
+
 fn authenticate_device<'a>(
     inner: &'a Inner,
     account: &str,
     node_id: &str,
     token: &str,
 ) -> Result<&'a StoredDevice, ApiError> {
+    ensure_device_not_deleted(inner, account, node_id, token)?;
     let device = inner.devices.get(node_id)
         .ok_or_else(|| ApiError::not_found("设备尚未登记"))?;
     if device.account != account || token.is_empty() || device.device_token != token {
@@ -1207,6 +1264,76 @@ mod tests {
         })).await.unwrap_err().status, StatusCode::CONFLICT);
         assert_eq!(occupancy(&*app.state.inner.read().await, "a").0, "idle");
         create_peer_session(&app.state, "d", "a").await;
+    }
+
+    #[tokio::test]
+    async fn device_delete_persists_revocation_and_allows_explicit_new_credentials() {
+        let app = test_app();
+        let original = app.state.inner.read().await.devices["b"].registration.clone();
+        let remaining = delete_device(State(app.state.clone()), peer_headers("a"), Path("b".into())).await.unwrap().0;
+        assert!(remaining.iter().all(|device| device.node_id != "b" && device.account == "alice"));
+        assert_eq!(delete_device(State(app.state.clone()), peer_headers("a"), Path("b".into())).await.unwrap_err().status, StatusCode::NOT_FOUND);
+        assert_eq!(register_device(State(app.state.clone()), peer_headers("b"), Json(original.clone())).await.unwrap_err().status, StatusCode::GONE);
+        assert_eq!(heartbeat(State(app.state.clone()), peer_headers("b"), Json(HeartbeatRequest {
+            node_id: "b".into(), device_token: "b-token".into(), status: "online".into(),
+        })).await.unwrap_err().status, StatusCode::GONE);
+        let restored = AppState::with_frp_and_data("localhost".into(), 17851, "token".into(), app.state.data_path.as_ref().clone());
+        {
+            let inner = restored.inner.read().await;
+            assert!(!inner.devices.contains_key("b"));
+            assert_eq!(ensure_device_not_deleted(&inner, "alice", "b", "b-token").unwrap_err().status, StatusCode::GONE);
+            assert_eq!(ensure_device_not_deleted(&inner, "bob", "b", "new-token").unwrap_err().status, StatusCode::FORBIDDEN);
+        }
+        let mut replacement = original.clone();
+        replacement.device_token = "replacement-token".into();
+        let _ = register_device(State(app.state.clone()), peer_headers("a"), Json(replacement)).await.unwrap();
+        assert_eq!(register_device(State(app.state.clone()), peer_headers("b"), Json(original)).await.unwrap_err().status, StatusCode::GONE);
+        let _ = delete_device(State(app.state.clone()), peer_headers("a"), Path("b".into())).await.unwrap();
+        let inner = app.state.inner.read().await;
+        assert_eq!(ensure_device_not_deleted(&inner, "alice", "b", "replacement-token").unwrap_err().status, StatusCode::GONE);
+        assert_eq!(inner.deleted_devices["b"].revoked_token_hashes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn device_delete_requires_requester_proof_same_account_and_idle_target() {
+        let app = test_app();
+        let mut missing_proof = peer_headers("a");
+        missing_proof.remove("x-starbridge-device-token");
+        assert_eq!(delete_device(State(app.state.clone()), missing_proof, Path("b".into())).await.unwrap_err().status, StatusCode::FORBIDDEN);
+        assert_eq!(delete_device(State(app.state.clone()), peer_headers("z"), Path("b".into())).await.unwrap_err().status, StatusCode::FORBIDDEN);
+        assert_eq!(delete_device(State(app.state.clone()), peer_headers("a"), Path("z".into())).await.unwrap_err().status, StatusCode::FORBIDDEN);
+        let session = create_session(State(app.state.clone()), peer_headers("a"), Json(session_request("a", "b"))).await.unwrap().0;
+        for node in ["a", "b"] {
+            assert_eq!(delete_device(State(app.state.clone()), peer_headers("c"), Path(node.into())).await.unwrap_err().status, StatusCode::CONFLICT);
+        }
+        let _ = delete_session(State(app.state.clone()), peer_headers("a"), Path(session.session_id)).await.unwrap();
+        let _ = delete_device(State(app.state.clone()), peer_headers("a"), Path("a".into())).await.unwrap();
+        let inner = app.state.inner.read().await;
+        assert!(inner.devices.contains_key("z"));
+        assert_eq!(authenticate_device(&inner, "alice", "a", "a-token").err().unwrap().status, StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn device_delete_rejects_running_and_cleaning_diagnostics() {
+        let app = test_app();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        app.state.configure_diagnostics(DiagnosticIntegration {
+            admin_url: format!("http://{address}"), admin_user: "test".into(),
+            admin_password: "test".into(), plugin_token: "test".into(),
+        }).await;
+        let admin = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/api/serverinfo", get(|| async { Json(serde_json::json!({})) }))).await.unwrap();
+        });
+        let info = diagnostics::create(State(app.state.clone()), peer_headers("a"), Json(starbridge_protocol::DiagnosticCreateRequest {
+            node_id: "a".into(), device_token: "a-token".into(),
+        })).await.unwrap().0;
+        assert_eq!(delete_device(State(app.state.clone()), peer_headers("b"), Path("a".into())).await.unwrap_err().status, StatusCode::CONFLICT);
+        app.state.inner.write().await.diagnostics.get_mut(&info.test_id).unwrap().info.status = "cleaning".into();
+        assert_eq!(delete_device(State(app.state.clone()), peer_headers("b"), Path("a".into())).await.unwrap_err().status, StatusCode::CONFLICT);
+        app.state.inner.write().await.diagnostics.get_mut(&info.test_id).unwrap().info.status = "cancelled".into();
+        let _ = delete_device(State(app.state.clone()), peer_headers("b"), Path("a".into())).await.unwrap();
+        admin.abort();
     }
 
     #[tokio::test]

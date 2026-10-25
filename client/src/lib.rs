@@ -167,6 +167,7 @@ pub struct ClientApp {
     background_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     initialization: Arc<Mutex<()>>,
     heartbeat_gate: Arc<Mutex<()>>,
+    device_updates: Arc<Mutex<()>>,
     incoming_gate: Arc<Mutex<()>>,
     route_start_gate: Arc<Mutex<()>>,
     diagnostic_gate: Arc<Mutex<()>>,
@@ -264,6 +265,7 @@ impl ClientApp {
             shutting_down: Arc::new(AtomicBool::new(false)),
             background_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
             initialization: Arc::new(Mutex::new(())), heartbeat_gate: Arc::new(Mutex::new(())),
+            device_updates: Arc::new(Mutex::new(())),
             incoming_gate: Arc::new(Mutex::new(())),
             route_start_gate: Arc::new(Mutex::new(())),
             diagnostic_gate: Arc::new(Mutex::new(())),
@@ -413,6 +415,7 @@ impl ClientApp {
             .route("/api/v1/logout", post(logout))
             .route("/api/v1/device", axum::routing::put(update_device))
             .route("/api/v1/devices", axum::routing::put(update_device))
+            .route("/api/v1/devices/delete", post(delete_device))
             .route("/api/v1/connect", post(connect))
             .route("/api/v1/connect/all", post(connect_all))
             .route("/api/v1/terminate", post(terminate))
@@ -438,9 +441,13 @@ impl ClientApp {
                 }
                 let attempted = app.inner.read().await.auth_generation;
                 if let Err(error) = app.heartbeat_once().await {
-                    let unauthorized = error.downcast_ref::<reqwest::Error>().and_then(reqwest::Error::status)
-                        == Some(StatusCode::UNAUTHORIZED);
+                    let status = error.downcast_ref::<reqwest::Error>().and_then(reqwest::Error::status);
+                    let unauthorized = status == Some(StatusCode::UNAUTHORIZED);
                     if app.inner.read().await.auth_generation != attempted { continue; }
+                    if status == Some(StatusCode::GONE) {
+                        let _ = logout_removed_device(&app, attempted).await;
+                        continue;
+                    }
                     if unauthorized {
                         if app.refresh_auth(true).await.is_ok() { continue; }
                         app.terminate_targets(None, true).await;

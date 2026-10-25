@@ -68,6 +68,17 @@ async fn client_update_device(
 }
 
 #[tauri::command]
+async fn client_delete_device(
+    app: tauri::State<'_, ClientApp>,
+    form: DeviceDeleteForm,
+) -> Result<ClientSnapshot, String> {
+    delete_device(State(app.inner().clone()), Json(form))
+        .await
+        .map(|value| value.0)
+        .map_err(|error| error.message)
+}
+
+#[tauri::command]
 async fn client_connect_all(
     app: tauri::State<'_, ClientApp>,
     form: BatchConnectForm,
@@ -181,6 +192,7 @@ pub fn run(app: ClientApp, _role: Role, root: PathBuf) -> anyhow::Result<()> {
             client_login,
             client_register,
             client_update_device,
+            client_delete_device,
             client_connect_all,
             client_terminate,
             client_export,
