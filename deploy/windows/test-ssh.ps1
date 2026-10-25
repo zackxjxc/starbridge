@@ -2,6 +2,7 @@
 param(
   [int]$ControllerPort = 18081,
   [int]$ExecutorPort = 18082,
+  [string]$ServerUrl,
   [string]$Username,
   # 不传时交互输入，避免密码留在命令历史里。
   [string]$Password,
@@ -54,10 +55,11 @@ function Get-State([int]$port) {
 function Ensure-Instance([int]$port, [string]$role) {
   $state = Get-State $port
   if (-not $state) {
-    $script = Join-Path $root "start-$role.bat"
-    if (-not (Test-Path $script)) { throw "127.0.0.1:$port 上没有运行 $role，也找不到 $script" }
-    Write-Host "  启动 $role ..."
-    Start-Process -FilePath $script -WorkingDirectory $root | Out-Null
+    $binary = Join-Path $root 'starbridge.exe'
+    if (-not (Test-Path $binary)) { throw "127.0.0.1:$port 上没有运行 $role，也找不到 $binary" }
+    Write-Host "  启动 $role 无窗口测试实例 ..."
+    $argumentText = "--headless --role $role --listen 127.0.0.1:$port --data-dir state/$role-test"
+    Start-Process -FilePath $binary -ArgumentList $argumentText -WorkingDirectory $root -WindowStyle Hidden | Out-Null
     $state = Wait-Until "$role 启动" 60 { Get-State $port }.GetNewClosure()
   }
   if ($state.role -ne $role) { throw "127.0.0.1:$port 上运行的是 $($state.role)，不是 $role" }
@@ -79,6 +81,13 @@ try {
   $null = Ensure-Instance $ExecutorPort 'executor'
 
   Step '登录中心'
+  if ($ServerUrl) {
+    foreach ($port in @($ControllerPort, $ExecutorPort)) {
+      $config = Invoke-Api $port GET /api/v1/config
+      $config.server_url = $ServerUrl
+      $null = Invoke-Api $port PUT /api/v1/config $config
+    }
+  }
   if (-not $Username) { $Username = Read-Host '账户名称' }
   if (-not $Password) {
     $secure = Read-Host '密码' -AsSecureString
@@ -198,9 +207,9 @@ try {
   try { Set-Clipboard -Value $handoff; Ok '已复制到剪贴板' } catch {}
 } catch {
   Write-Host "`n[失败] $($_.Exception.Message)" -ForegroundColor Red
-  $logs = @("$root\executor-data\ssh\sshd.log", "$root\state\executor-local\ssh\sshd.log")
+  $logs = @("$root\state\executor-test\ssh\sshd.log", "$root\state\executor-local\ssh\sshd.log")
   if ($sessionId) {
-    foreach ($dir in 'controller-data', 'executor-data', 'state\controller-local', 'state\executor-local') {
+    foreach ($dir in 'state\controller-test', 'state\executor-test', 'state\controller-local', 'state\executor-local') {
       $logs += "$root\$dir\routes\$sessionId.log"
     }
   }

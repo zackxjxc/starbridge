@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Assemble a Windows test package from a release build and a verified runtime.
+"""Assemble a portable Tauri client directory and ZIP, without an installer.
 
 Run after `cargo build --release -p starbridge-client` and
 `python tools/fetch_runtime.py --output state/runtime`.
@@ -36,7 +36,7 @@ LICENSES = {
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=Path("target/release/starbridge-client.exe"))
     parser.add_argument("--runtime", type=Path, default=Path("state/runtime"))
     parser.add_argument("--cache", type=Path, default=Path(".cache/runtime"))
@@ -49,6 +49,25 @@ def main() -> int:
     if missing:
         raise SystemExit(f"运行时缺少文件: {', '.join(missing)}，请先运行 tools/fetch_runtime.py")
 
+    manifest_path = args.runtime / "runtime-manifest.json"
+    if not manifest_path.is_file():
+        raise SystemExit(f"缺少运行时清单: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for archive, _ in LICENSES.values():
+        if not (args.cache / archive).is_file():
+            raise SystemExit(f"缺少许可证来源包: {args.cache / archive}")
+
+    output = args.output.resolve()
+    sources = (
+        args.binary.resolve(), args.runtime.resolve(), args.cache.resolve(),
+        Path.cwd(), Path(__file__).resolve().parent.parent,
+    )
+    if (output == output.parent or args.output.is_symlink()
+            or any(source == output or output in source.parents for source in sources)):
+        raise SystemExit("输出目录不能包含项目或打包输入文件，也不能是符号链接")
+    if any((args.output / name).exists() for name in ("state", "controller-data", "executor-data")):
+        raise SystemExit("输出目录包含客户端数据，请使用新的 --output 目录，避免删除数据或把登录状态打进 ZIP")
+
     if args.output.exists():
         shutil.rmtree(args.output)
     runtime = args.output / "runtime"
@@ -56,9 +75,9 @@ def main() -> int:
     shutil.copy2(args.binary, args.output / "starbridge.exe")
     for name in CLIENT_RUNTIME:
         shutil.copy2(args.runtime / name, runtime / name)
-    manifest = json.loads((args.runtime / "runtime-manifest.json").read_text(encoding="utf-8"))
     for record in manifest:
         record["files"] = [name for name in record["files"] if name in CLIENT_RUNTIME]
+    manifest = [record for record in manifest if record["files"]]
     (args.output / "runtime-manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
@@ -69,8 +88,21 @@ def main() -> int:
             for member in bundle.namelist():
                 if Path(member).name in names:
                     (destination / Path(member).name).write_bytes(bundle.read(member))
-    for script in [*Path("deploy/windows").glob("*.bat"), *Path("deploy/windows").glob("*.ps1")]:
+    scripts = Path(__file__).resolve().parent.parent / "deploy" / "windows"
+    for script in [*scripts.glob("*.bat"), *scripts.glob("*.ps1")]:
         shutil.copy2(script, args.output / script.name)
+
+    (args.output / "README.txt").write_text(
+        "StarBridge Tauri 便携客户端\n\n"
+        "解压整个目录后，双击 starbridge.exe 打开控制端，或双击 start-executor.bat 打开执行端。\n"
+        "无需安装程序；请保留 runtime 和 licenses 目录。Windows 需要已安装 Microsoft Edge WebView2 Runtime。\n"
+        "在窗口内设置服务器地址并登录。关闭窗口会退出客户端并停止其连接组件。\n\n"
+        "账户和设备数据保存在程序旁的 state/controller 与 state/executor，移动程序时请一并保留。\n"
+        "请勿将使用过的目录转发给他人；分享时使用原始 ZIP。\n"
+        "test-ssh.bat 使用独立的 state/controller-test 与 state/executor-test 测试数据。\n",
+        encoding="utf-8",
+        newline="\n",
+    )
 
     archive = shutil.make_archive(str(args.output), "zip", args.output.parent, args.output.name)
     print(archive)
