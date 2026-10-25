@@ -2,7 +2,7 @@
 
 ## 结论
 
-FRP 和 OpenSSH 都作为外部运行时组件随 StarBridge 发布，但不直接把“下载最新版”写进用户首次启动流程。发布构建使用明确的版本清单，先下载对应平台的压缩包或安装包，验证 SHA-256 和签名（项目提供时），再将需要的二进制、许可证和来源信息复制到发布目录。这样用户安装包可以离线安装，构建结果可复现，也不会因为上游发布新版本而悄悄改变行为。
+FRP 和 OpenSSH 都作为外部运行时组件随 StarBridge 发布，但不直接把“下载最新版”写进用户首次启动流程。发布构建使用明确的版本清单，先下载对应平台的压缩包或安装包，验证 SHA-256 和签名（项目提供时），再将需要的二进制、许可证和来源信息复制到发布目录。Windows 客户端使用 Tauri 2，发布为解压后双击运行的便携目录和 zip，不制作 MSI 或 NSIS 安装包；中心服务器的发布方式保持不变。
 
 ## 官方来源
 
@@ -68,23 +68,47 @@ sha256 = "..."
 
 CI 应缓存下载文件但仍每次校验哈希。生产发布使用已审核的锁定清单；开发者可以显式更新清单，但不能由“latest”别名自动决定版本。
 
+Windows 客户端构建需要 Rust 1.90+、C++ 构建工具和 WebView2，详见 [Tauri 前置依赖](https://v2.tauri.app/start/prerequisites/)。客户端直接嵌入 `client-ui/` 静态资源，无需 Node.js 或前端开发服务器。在仓库根目录运行：
+
+```powershell
+python tools/fetch_runtime.py --manifest vendor/manifest.toml --output state/runtime
+cargo build --release -p starbridge-client
+python tools/package_windows.py
+```
+
+默认功能包含 `desktop` 和 `custom-protocol`，普通 Cargo release 构建即可生成内嵌界面的 exe。Tauri 配置关闭安装包生成；`tools/package_windows.py` 将可执行文件、客户端运行时和许可证组装为 `dist/StarBridge-test/` 与 `dist/StarBridge-test.zip`。发布物不包含 `frps` 或服务器二进制。若使用 Tauri CLI，应按 [Tauri 分发文档](https://v2.tauri.app/distribute/) 跳过安装包步骤。
+
 ## 发布目录
 
-Windows 客户端建议布局：
+Windows 客户端便携目录布局：
 
 ```text
-StarBridge/
+StarBridge-test/
   starbridge.exe
+  start-controller.bat
+  start-executor.bat
   runtime/
     frpc.exe
     ssh.exe
     sftp.exe
     scp.exe
+    ssh-keygen.exe
+    sshd.exe
+    sshd-session.exe
+    sshd-auth.exe
+    sftp-server.exe
+    ssh-shellhost.exe
+    libcrypto.dll
   licenses/
     frp/
     openssh/
   runtime-manifest.json
+  state/                   首次运行时创建，不进入分发 zip
+    controller/
+    executor/
 ```
+
+双击 `starbridge.exe` 默认启动控制端，`start-executor.bat` 启动执行端。首次在界面配置中心服务器地址；默认值是本机开发地址。将整个便携目录放在可写位置，保留 `runtime/` 和许可证，运行电脑需已有 WebView2 Runtime；StarBridge 不运行安装器。默认数据目录基于 exe 位置，`--data-dir` 可覆盖；两种角色不得共用数据目录。升级请保留已有 `state/`，不要将身份、密钥或登录状态混入发布物。
 
 中心 Linux 部署包建议布局：
 

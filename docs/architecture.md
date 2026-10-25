@@ -2,7 +2,7 @@
 
 ## 组件和进程
 
-一期有三个角色：中心服务器、控制端节点和执行端节点。中心服务器运行一个 `starbridge-server` 和一个长期运行的 `frps`；每个端侧节点运行一个 `starbridge` 核心进程和一个受其管理的 `frpc`。一台电脑同时具备控制和执行能力，角色由登录账户和发起的会话决定，不增加第二套端侧进程。
+一期有三个角色：中心服务器、控制端节点和执行端节点。中心服务器运行一个 `starbridge-server` 和一个长期运行的 `frps`；每个端侧节点在同一个 Tauri 桌面进程中运行 UI 和 Rust 核心，并管理自己的 `frpc`。客户端通过 `--role controller` 或 `--role executor` 选择角色；一台电脑可同时运行两种角色，但必须使用独立数据目录。
 
 端侧可调用本机的 OpenSSH 客户端；执行端默认以当前用户权限启动随包携带的 `sshd`，无需管理员安装系统服务；设置 `STARBRIDGE_SSH_PORT` 时改为转发到本机已有的 SSH 服务。StarBridge 不把 SSH 数据协议重新实现为自己的协议，只为本地 SSH 客户端提供一个可用的本地目标地址。
 
@@ -22,11 +22,13 @@
 
 生产环境由 nginx 终止 HTTPS，并将 `/` 和 `/admin` 转发给中心 StarBridge 的回环监听地址。frpc 直接连接 `starbridge.zackxjxc.de5.net:17851`；用户界面不要求用户填写这个端口。
 
-## 本地浏览器和可替换 UI
+## Tauri 客户端和无界面模式
 
-端侧 StarBridge 启动本地 HTTP 服务并自动打开系统浏览器。浏览器只访问动态分配的 `127.0.0.1` 控制台端口；本地核心服务负责访问中心服务和管理 `frpc` 子进程。
+端侧 StarBridge 默认打开 Tauri 2 原生窗口，静态 UI 随可执行文件内嵌，通过 Tauri IPC 调用 Rust 核心，访问中心服务和管理 `frpc`、`sshd` 子进程。桌面模式不监听本地 HTTP 控制台端口，不启动外部浏览器；中心服务器及其管理页面不参与这次客户端迁移。
 
-核心服务向 UI 提供带版本号的本地 REST/WebSocket API。这样一期可以使用普通浏览器，后续可以替换为 Electron、Tauri 或 Flutter，而不改变登录、会话、节点和传输适配器。
+`--headless` 保留本地 HTTP 控制台与原有版本化 REST API，供联调和自动化使用，`--no-browser` 兼容该模式。两种入口复用登录、配置、设备、会话和传输逻辑；`--no-default-features` 可构建不依赖 Tauri 系统库的无界面客户端。
+
+便携版默认将两种角色的数据分别写入可执行文件旁的 `state/controller/` 和 `state/executor/`，`--data-dir` 可覆盖。运行时依次查找数据目录、其父目录和可执行文件旁的 `runtime/`。关闭桌面窗口时先停止后台任务，再清理受管子进程，避免窗口退出后留下隧道或 SSH 服务。
 
 ## 传输适配器
 
