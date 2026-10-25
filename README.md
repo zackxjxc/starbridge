@@ -8,6 +8,7 @@ StarBridge 是一个基于 FRP 的跨网络设备连接工具。客户端使用 
 
 - [一期详细设计](docs/phase-1-design.md)
 - [架构总览](docs/architecture.md)
+- [本机连接测试方案](docs/connection-self-test-plan.md)
 - [FRP/OpenSSH 来源与打包](docs/dependencies-and-packaging.md)
 - [二期、三期和未来扩展路线](docs/future-roadmap.md)
 - [开发环境、服务器和部署约束](docs/development-environment.md)
