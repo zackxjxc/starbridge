@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>弹窗逐步诊断</title>
+<style>
+body{font:16px/1.6 system-ui,sans-serif;background:#eef2f7;color:#172239;margin:0}main{max-width:920px;margin:28px auto;padding:24px;background:white;border-radius:16px}h1{margin:0}button,a{font:inherit}button{padding:12px 20px;border:0;border-radius:8px;cursor:pointer;margin:6px 8px 6px 0}#next{background:#1762d1;color:white;font-size:22px}#mark{background:#b42d40;color:white}button:disabled{opacity:.45;cursor:wait}#card{padding:20px;background:#edf4ff;border-radius:12px;margin:16px 0}.muted{color:#56627a}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#101c30;color:#dce8ff;padding:16px;max-height:340px;overflow:auto}ol{padding-left:28px}li.current{font-weight:bold;color:#1762d1}.toolbar{position:sticky;top:0;background:white;padding:10px 0}#status{font-weight:bold}#output{overflow-wrap:anywhere}
+</style>
+<main><h1>弹窗逐步诊断</h1>
+<p>每次只点一次“下一步”，观察 10–20 秒再继续。出现“无法打开此 ms-gamingoverlay 链接”时，先回到本页点红色按钮，暂时不要继续。标记记录当前与上一步时间；它不能单独证明触发原因。</p>
+<p class="muted">全部客户端和临时账号均隔离。不会调用该链接、Win+G，不改注册表或防火墙。请勿在测试窗口输入真实账号。进程采样只记录 PID、父 PID、路径和启动时间，不采集命令行、键盘或截图。</p>
+<div class="toolbar"><button id="next">下一步</button><button id="mark">刚才出现弹窗</button><button id="skip">跳过下一步</button></div>
+<div id="card"><div id="status">等待手动开始</div><p id="description"></p><div id="preview"></div></div>
+<button id="stop">结束并清理</button> <a id="download" href="report" download="popup-diagnostic-report.json">导出诊断报告</a>
+<p class="muted">关闭本页后，约 60 秒无心跳即停止工具启动的组件；浏览器休眠或严重节流也可能触发自动清理。结束后报告保留在下方目录。请只分享 report.json，其他临时状态含测试登录凭据。</p>
+<p id="output"></p><details><summary>全部步骤</summary><ol id="steps"></ol></details><h2>动作与弹窗时间线</h2><pre id="events"></pre></main>
+<script>
+let busy=false, finished=false;
+const byId=id=>document.getElementById(id);
+async function refresh(){
+  if(finished)return;
+  try{
+    const response=await fetch('state');if(!response.ok)throw Error();const state=await response.json();
+    byId('status').textContent=state.closed?'诊断已结束，组件已清理':state.index<0?'等待手动开始':`当前第 ${state.index+1} 步：${state.steps[state.index][0]}`;
+    byId('description').textContent=state.index<0?'尚未启动任何测试组件。第一次点击仅记录基线静置。':state.steps[state.index][1];
+    byId('preview').textContent=state.steps[state.index+1]?`下一步：${state.steps[state.index+1][0]} — ${state.steps[state.index+1][1]}`:'没有后续步骤。';
+    byId('output').textContent='报告目录：'+state.output;
+    byId('steps').replaceChildren(...state.steps.map((step,i)=>{let li=document.createElement('li');li.textContent=step[0];if(i===state.index)li.className='current';return li;}));
+    byId('events').textContent=state.events.filter(e=>e.kind!=='new_process').map(e=>JSON.stringify(e)).join('\n');
+    for(const id of ['next','skip'])byId(id).disabled=busy||state.closed;
+    if(state.closed)finished=true;
+  }catch{byId('status').textContent='工具已停止或本地连接中断；保留的报告可从上方目录打开。';}
+}
+async function action(name){
+  if(busy&&name!=='mark')return;
+  if(name!=='mark'){busy=true;byId('next').disabled=true;byId('skip').disabled=true;}
+  try{const response=await fetch(name,{method:'POST'});if(!response.ok)alert('动作未执行：工具忙或请求被拒绝。');}
+  catch{byId('status').textContent='动作连接已结束；请从报告目录查看最后记录。';}
+  finally{if(name!=='mark')busy=false;await refresh();}
+}
+byId('next').onclick=()=>action('next');byId('mark').onclick=()=>action('mark');byId('skip').onclick=()=>action('skip');byId('stop').onclick=()=>action('stop');
+refresh();setInterval(refresh,2000);
+</script></html>
