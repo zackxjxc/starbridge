@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>StarBridge</title>
+  <script src="/tray-notice.js" defer></script>
   <style>
     * { box-sizing: border-box; }
     body { margin: 0; padding: 20px; height: 138px; background: #f7f8fa; color: #27313f;
@@ -12,8 +13,8 @@
     p { margin: 0; color: #526071; }
   </style>
 </head>
-<body role="status">
-  <strong>StarBridge 已在后台运行</strong>
-  <p>连接保持不变。点击托盘图标打开窗口，右键选择“退出”结束程序。</p>
+<body role="status" hidden>
+  <strong id="notice-title">StarBridge 已在后台运行</strong>
+  <p id="notice-body">连接保持不变。点击托盘图标打开窗口，右键选择“退出”结束程序。</p>
 </body>
 </html>

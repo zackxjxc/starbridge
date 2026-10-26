@@ -67,6 +67,7 @@
     '登录账号': 'Sign in',
     '创建账号': 'Create an account',
     '关闭': 'Close',
+    '关闭到托盘': 'Close to tray',
     '关闭窗口': 'Close window',
     '最小化': 'Minimize',
     '最小化窗口': 'Minimize window',

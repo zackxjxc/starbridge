@@ -9,9 +9,80 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 struct DesktopLifecycle {
     exit_pending: AtomicBool,
     shutdown_complete: AtomicBool,
+    english: AtomicBool,
 }
 
 struct ExitMenu(MenuItem<tauri::Wry>);
+
+struct DesktopText {
+    exit: &'static str,
+    exiting: &'static str,
+    tooltip: &'static str,
+    confirm_title: &'static str,
+    confirm_message: &'static str,
+    cancel: &'static str,
+    notice_title: &'static str,
+    notice_body: &'static str,
+}
+
+fn desktop_text(english: bool) -> DesktopText {
+    if english {
+        DesktopText {
+            exit: "Exit", exiting: "Exiting…", tooltip: "StarBridge · Running in background",
+            confirm_title: "Exit StarBridge?",
+            confirm_message: "Exiting will disconnect all connections on this computer, cancel queued tasks and connection tests, and stop background services.",
+            cancel: "Cancel", notice_title: "StarBridge is running in the background",
+            notice_body: "Connections stay active. Click the tray icon to reopen, or right-click and choose Exit to quit.",
+        }
+    } else {
+        DesktopText {
+            exit: "退出", exiting: "正在退出…", tooltip: "StarBridge · 后台运行",
+            confirm_title: "退出 StarBridge？",
+            confirm_message: "退出将断开本机所有连接，取消等待任务和连接测试，并停止后台服务。",
+            cancel: "取消", notice_title: "StarBridge 已在后台运行",
+            notice_body: "连接保持不变。点击托盘图标打开窗口，右键选择“退出”结束程序。",
+        }
+    }
+}
+
+fn current_text(handle: &tauri::AppHandle) -> DesktopText {
+    desktop_text(handle.state::<DesktopLifecycle>().english.load(Ordering::Acquire))
+}
+
+fn tray_notice_copy(handle: &tauri::AppHandle) -> String {
+    let english = handle.state::<DesktopLifecycle>().english.load(Ordering::Acquire);
+    let text = desktop_text(english);
+    serde_json::json!({
+        "locale": if english { "en" } else { "zh-CN" },
+        "title": text.notice_title, "body": text.notice_body,
+    }).to_string()
+}
+
+#[tauri::command]
+fn client_set_desktop_locale(handle: tauri::AppHandle, window: tauri::WebviewWindow, locale: String) -> Result<(), String> {
+    if window.label() != "main" {
+        return Err("Only the main window can update the desktop language".into());
+    }
+    let english = match locale.as_str() {
+        "en" => true,
+        "zh-CN" => false,
+        _ => return Err("Unsupported desktop language".into()),
+    };
+    handle.state::<DesktopLifecycle>().english.store(english, Ordering::Release);
+    let text = desktop_text(english);
+    if let Some(item) = handle.try_state::<ExitMenu>() {
+        let exiting = !item.0.is_enabled().map_err(|error| error.to_string())?;
+        item.0.set_text(if exiting { text.exiting } else { text.exit }).map_err(|error| error.to_string())?;
+    }
+    if let Some(tray) = handle.tray_by_id("main") {
+        tray.set_tooltip(Some(text.tooltip)).map_err(|error| error.to_string())?;
+    }
+    if let Some(notice) = handle.get_webview_window("tray-notice") {
+        notice.eval(format!("window.__STARBRIDGE_TRAY_NOTICE__ = {}; window.renderTrayNotice?.(window.__STARBRIDGE_TRAY_NOTICE__);", tray_notice_copy(&handle)))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
 
 fn restore_main(handle: &tauri::AppHandle) -> tauri::Result<()> {
     if let Some(window) = handle.get_webview_window("main") {
@@ -28,7 +99,7 @@ fn restore_main(handle: &tauri::AppHandle) -> tauri::Result<()> {
 fn start_shutdown(handle: tauri::AppHandle) {
     if let Some(item) = handle.try_state::<ExitMenu>() {
         let _ = item.0.set_enabled(false);
-        let _ = item.0.set_text("正在退出…");
+        let _ = item.0.set_text(current_text(&handle).exiting);
     }
     tauri::async_runtime::spawn(async move {
         handle.state::<ClientApp>().shutdown().await;
@@ -68,11 +139,12 @@ fn request_exit(handle: &tauri::AppHandle) {
             return;
         }
         let _ = restore_main(&handle);
+        let text = current_text(&handle);
         let mut dialog = handle.dialog()
-            .message("退出将断开本机所有连接，取消等待任务和连接测试，并停止后台服务。")
-            .title("退出 StarBridge？")
+            .message(text.confirm_message)
+            .title(text.confirm_title)
             .kind(MessageDialogKind::Warning)
-            .buttons(MessageDialogButtons::OkCancelCustom("退出".into(), "取消".into()));
+            .buttons(MessageDialogButtons::OkCancelCustom(text.exit.into(), text.cancel.into()));
         if let Some(window) = handle.get_webview_window("main") {
             dialog = dialog.parent(&window);
         }
@@ -87,13 +159,14 @@ fn request_exit(handle: &tauri::AppHandle) {
 }
 
 fn create_tray(handle: &tauri::AppHandle) -> anyhow::Result<()> {
-    let exit = MenuItem::with_id(handle, "exit", "退出", true, None::<&str>)?;
+    let text = current_text(handle);
+    let exit = MenuItem::with_id(handle, "exit", text.exit, true, None::<&str>)?;
     let menu = Menu::with_items(handle, &[&exit])?;
     let icon = handle.default_window_icon().cloned()
         .ok_or_else(|| anyhow::anyhow!("缺少应用图标"))?;
     let _tray = TrayIconBuilder::with_id("main")
         .icon(icon)
-        .tooltip("StarBridge · 后台运行")
+        .tooltip(text.tooltip)
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|handle, event| {
@@ -126,6 +199,7 @@ fn show_tray_notice(handle: &tauri::AppHandle, window: &tauri::WebviewWindow, ro
     // A non-activating local notice also works in the portable package without OS notification setup.
     let mut notice = WebviewWindowBuilder::new(handle, "tray-notice", WebviewUrl::App("tray-notice.html".into()))
         .title("StarBridge")
+        .initialization_script(format!("window.__STARBRIDGE_TRAY_NOTICE__ = {};", tray_notice_copy(handle)))
         .inner_size(360.0, 138.0)
         .decorations(false)
         .resizable(false)
@@ -361,6 +435,7 @@ pub fn run(app: ClientApp, _role: Role, root: PathBuf) -> anyhow::Result<()> {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
+            client_set_desktop_locale,
             client_window_action,
             client_state,
             client_config,
@@ -455,6 +530,24 @@ pub fn run(app: ClientApp, _role: Role, root: PathBuf) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_copy_covers_both_languages() {
+        let english = desktop_text(true);
+        let chinese = desktop_text(false);
+        assert_eq!(english.exit, "Exit");
+        assert_eq!(chinese.exit, "退出");
+        for (en, zh) in [
+            (english.exiting, chinese.exiting), (english.tooltip, chinese.tooltip),
+            (english.confirm_title, chinese.confirm_title), (english.confirm_message, chinese.confirm_message),
+            (english.cancel, chinese.cancel), (english.notice_title, chinese.notice_title),
+            (english.notice_body, chinese.notice_body),
+        ] {
+            assert!(!en.is_empty());
+            assert_ne!(en, zh);
+            assert!(!en.chars().any(|c| ('\u{3400}'..='\u{9fff}').contains(&c)));
+        }
+    }
 
     #[test]
     fn exit_confirms_any_active_session_including_incoming() {

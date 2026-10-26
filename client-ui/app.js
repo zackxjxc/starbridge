@@ -11,6 +11,10 @@
   const desktop = window.__TAURI__?.core;
   const frameless = !!desktop && window.__STARBRIDGE_FRAMELESS__ === true;
   const closeLabel = window.__STARBRIDGE_TRAY__ === true ? '关闭到托盘' : '关闭';
+  function syncDesktopLocale() {
+    return desktop?.invoke('client_set_desktop_locale', { locale: i18n.locale() })
+      .catch(error => console.warn('Could not update the desktop language', error));
+  }
   const activeStates = new Set(['negotiating', 'connected']);
   const workingStates = new Set(['queued', 'connecting', 'verifying']);
   const ui = {
@@ -1028,6 +1032,7 @@
   modal.addEventListener('close', () => { ui.modalKind = null; ui.modalRender = null; });
   window.addEventListener('resize', () => { if (ui.languageOpen) renderLanguageMenu(); });
   window.addEventListener('starbridge:language', () => {
+    syncDesktopLocale();
     closeMenu(); toastNode.hidden = true; render();
     if (modal.open && ui.modalRender) {
       const values = [...modal.querySelectorAll('input, textarea')].map(input => ({ id: input.id, name: input.name, value: input.value, checked: input.checked }));
@@ -1041,6 +1046,7 @@
     }
   });
   async function init() {
+    await syncDesktopLocale();
     try {
       const [snapshot, config] = await Promise.all([api('client_state'), api('client_config')]);
       ui.config = config; ui.policy = ['direct_preferred', 'direct_only'].includes(config.connection_policy) ? config.connection_policy : config.direct_only ? 'direct_only' : 'direct_preferred';

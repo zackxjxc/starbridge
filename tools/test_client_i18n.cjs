@@ -93,3 +93,14 @@ test('known service errors translate and can be re-rendered in either language',
   assert.equal(i18n.message('SSH 验证失败：C:\\设备\\ssh.exe: exit 255'), 'SSH verification failed: C:\\设备\\ssh.exe: exit 255');
   assert.equal(i18n.message('Unknown technical output {0}'), 'Unknown technical output {0}');
 });
+
+test('tray close text follows explicit and system language changes', () => {
+  const { i18n, context, emit } = load({ saved: 'en' });
+  assert.equal(i18n.t('关闭到托盘'), 'Close to tray');
+  assert.equal(i18n.t('关闭'), 'Close');
+  i18n.setPreference('zh-CN');
+  assert.equal(i18n.t('关闭到托盘'), '关闭到托盘');
+  i18n.setPreference('system');
+  context.navigator.languages = ['en-US']; emit({ type: 'languagechange' });
+  assert.equal(i18n.t('关闭到托盘'), 'Close to tray');
+});

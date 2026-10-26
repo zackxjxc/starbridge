@@ -14,7 +14,10 @@ const assets = path.join(__dirname, '../client-ui');
     const context = await browser.newContext({ viewport: { width: 900, height: 600 }, locale: 'en-US' });
     await context.addInitScript(() => {
       window.__STARBRIDGE_FRAMELESS__ = true;
+      window.__STARBRIDGE_TRAY__ = true;
+      window.__desktopLocales = [];
       window.__TAURI__ = { core: { invoke: async (command, args) => {
+        if (command === 'client_set_desktop_locale') { window.__desktopLocales.push(args.locale); return; }
         if (command === 'plugin:clipboard-manager|write_text') { window.__copied = args.text; return; }
         if (command === 'client_window_action') return;
         const response = await fetch('/fixture/' + command, { method: 'POST', body: JSON.stringify(args || {}) });
@@ -37,7 +40,7 @@ const assets = path.join(__dirname, '../client-ui');
     const local = { node_id: 'local', display_name: 'Dev-PC', purpose: '', os: 'Windows 11', online: true, occupancy: 'idle' };
     const peer = { node_id: 'peer', display_name: 'Build-PC', purpose: '', os: 'Ubuntu 24.04', online: true, occupancy: 'idle', capabilities: ['ssh_server'] };
     const exportData = { text: '后端中文导出', items: [{ name: 'Build-PC', purpose: '保留中文备注', system: 'Ubuntu / x86_64', ssh_user: 'dev', privilege: 'user', path: 'direct', ssh_command: 'ssh dev@localhost -p 22000', source_name: 'Dev-PC', shell: 'PowerShell' }], excluded: [] };
-    await page.route('http://starbridge.test/**', async route => {
+    await context.route('http://starbridge.test/**', async route => {
       const url = new URL(route.request().url());
       if (url.pathname.startsWith('/fixture/')) {
         const command = url.pathname.slice('/fixture/'.length); calls.push(command);
@@ -55,7 +58,7 @@ const assets = path.join(__dirname, '../client-ui');
         return route.fulfill({ json: value });
       }
       const name = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
-      if (!['index.html', 'app.js', 'i18n.js', 'style.css'].includes(name)) return route.fulfill({ status: 404, body: '' });
+      if (!['index.html', 'app.js', 'i18n.js', 'style.css', 'tray-notice.html', 'tray-notice.js'].includes(name)) return route.fulfill({ status: 404, body: '' });
       return route.fulfill({ path: path.join(assets, name), contentType: name.endsWith('.js') ? 'text/javascript' : name.endsWith('.css') ? 'text/css' : 'text/html' });
     });
     const choose = async language => {
@@ -63,6 +66,9 @@ const assets = path.join(__dirname, '../client-ui');
       await page.locator(`[data-language="${language}"]`).click();
       assert.equal(await page.locator('#language-menu').isVisible(), false);
       assert.equal(await page.locator('#language-trigger').getAttribute('aria-expanded'), 'false');
+      const locale = language === 'system' ? await page.evaluate(() => window.StarBridgeI18n.systemLocale()) : language;
+      assert.equal(await page.evaluate(() => window.__desktopLocales.at(-1)), locale);
+      assert.equal(await page.locator('[data-action="window-close"]').getAttribute('title'), locale === 'en' ? 'Close to tray' : '关闭到托盘');
     };
     const noChineseUI = async () => {
       const text = await page.locator('body').evaluate(body => {
@@ -79,6 +85,8 @@ const assets = path.join(__dirname, '../client-ui');
     const refresh = async () => { await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange'))); await page.waitForTimeout(80); };
     await page.goto('http://starbridge.test/');
     await page.getByRole('heading', { name: 'Sign in', exact: true }).waitFor();
+    assert.deepEqual(await page.evaluate(() => window.__desktopLocales), ['en']);
+    assert.equal(await page.locator('[data-action="window-close"]').getAttribute('aria-label'), 'Close to tray');
     await noChineseUI();
     await page.locator('#auth-username').fill('tester');
     await page.locator('#auth-password').fill('fixture-password');
@@ -189,6 +197,31 @@ const assets = path.join(__dirname, '../client-ui');
     await page.keyboard.press('Escape');
     await page.emulateMedia({ colorScheme: 'dark' });
     await noChineseUI();
+    await choose('system');
+    await page.evaluate(() => {
+      Object.defineProperty(navigator, 'languages', { configurable: true, value: ['zh-TW'] });
+      window.dispatchEvent(new Event('languagechange'));
+    });
+    assert.equal(await page.evaluate(() => window.__desktopLocales.at(-1)), 'zh-CN');
+    assert.equal(await page.locator('[data-action="window-close"]').getAttribute('title'), '关闭到托盘');
+    await choose('en');
+
+    const notice = await context.newPage();
+    await notice.setViewportSize({ width: 360, height: 138 });
+    await notice.addInitScript(() => {
+      window.__STARBRIDGE_TRAY_NOTICE__ = { locale: 'en', title: 'StarBridge is running in the background',
+        body: 'Connections stay active. Click the tray icon to reopen, or right-click and choose Exit to quit.' };
+    });
+    await notice.goto('http://starbridge.test/tray-notice.html');
+    assert.equal(await notice.locator('html').getAttribute('lang'), 'en');
+    assert.equal(await notice.locator('body').isVisible(), true);
+    assert.doesNotMatch(await notice.locator('body').innerText(), /[\u3400-\u9fff]/u);
+    assert.equal(await notice.evaluate(() => document.body.scrollHeight <= innerHeight), true, 'English tray notice must fit its window');
+    await notice.evaluate(() => window.renderTrayNotice({ locale: 'zh-CN', title: 'StarBridge 已在后台运行',
+      body: '连接保持不变。点击托盘图标打开窗口，右键选择“退出”结束程序。' }));
+    assert.equal(await notice.locator('html').getAttribute('lang'), 'zh-CN');
+    assert.match(await notice.locator('#notice-body').textContent(), /连接保持不变/);
+    await notice.close();
     assert.deepEqual(errors, []);
     await context.close();
     console.log('PASS: 900×600 desktop chrome, login/register, service errors, language persistence, drafts/search/scroll, keyboard/outside click, history filters, configuration, diagnostics, dialogs, export preview and clipboard, sign-out, reload, dark theme');
