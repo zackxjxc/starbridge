@@ -30,7 +30,7 @@
 
 当前交互为固定 900×600 窗口：同尺寸登录／注册页进入双栏设备列表主界面，服务地址内置且不在 UI 暴露。左栏以本机置顶展示设备、统计和搜索，不设多选框；右栏承载本机或单设备信息、连接前配置、批量进度与导出。具体行为以 [客户端 UI 与交互定稿](client-ui-and-interaction-spec.md) 为准。
 
-Windows 桌面窗口由 Tauri 配置 `decorations(false)` 与 `shadow(true)`，维持固定 900×600 客户区，禁止调整大小和最大化；系统负责阴影、圆角与细描边。仅 Windows 原生入口注入只读 `__STARBRIDGE_FRAMELESS__` 标记，前端据此在唯一的 36 像素品牌／账号栏中启用拖动、最小化和关闭。macOS 与 Linux 保留现有系统装饰，浏览器预览不显示原生窗控。默认本机首页采用紧凑布局，备注框内部滚动，详情容器继续允许纵向滚动。
+Windows 桌面窗口由 Tauri 配置 `decorations(false)` 与 `shadow(true)`，维持固定 900×600 客户区，禁止调整大小和最大化；系统负责阴影、圆角与细描边。仅 Windows 原生入口注入只读 `__STARBRIDGE_FRAMELESS__` 标记，前端据此在唯一的 36 像素品牌／账号栏中启用拖动、最小化和关闭。macOS 使用 `TitleBarStyle::Overlay`、`hidden_title(true)` 及原生窗控位置配置，将红黄绿按钮与应用内容融合为唯一的 44 像素顶栏；只读 `__STARBRIDGE_MACOS_OVERLAY__` 标记启用左侧避让和拖动，不启用 Windows 网页窗控。Linux 保留现有系统装饰，浏览器预览不显示原生窗控。默认本机首页采用紧凑布局，备注框内部滚动，详情容器继续允许纵向滚动。
 
 `--headless` 保留本地 HTTP 控制台与原有版本化 REST API，供联调和自动化使用，`--no-browser` 兼容该模式。两种入口复用登录、配置、设备、会话和传输逻辑；`--no-default-features` 可构建不依赖 Tauri 系统库的无界面客户端。
 

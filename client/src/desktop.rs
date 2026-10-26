@@ -500,6 +500,12 @@ pub fn run(app: ClientApp, _role: Role, root: PathBuf) -> anyhow::Result<()> {
         .decorations(false)
         .shadow(true)
         .initialization_script("Object.defineProperty(window, '__STARBRIDGE_FRAMELESS__', { value: true });");
+    #[cfg(target_os = "macos")]
+    let window = window
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true)
+        .traffic_light_position(tauri::LogicalPosition::new(12.0, 22.0))
+        .initialization_script("Object.defineProperty(window, '__STARBRIDGE_MACOS_OVERLAY__', { value: true });");
     window.build()?;
     desktop.run(move |handle, event| {
         match event {

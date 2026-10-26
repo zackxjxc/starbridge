@@ -10,6 +10,9 @@
   const languageMenu = document.getElementById('language-menu');
   const desktop = window.__TAURI__?.core;
   const frameless = !!desktop && window.__STARBRIDGE_FRAMELESS__ === true;
+  const macosOverlay = !!desktop && window.__STARBRIDGE_MACOS_OVERLAY__ === true;
+  const draggableHeader = frameless || macosOverlay;
+  if (macosOverlay) document.documentElement.classList.add('macos-overlay');
   const closeLabel = window.__STARBRIDGE_TRAY__ === true ? '关闭到托盘' : '关闭';
   function syncDesktopLocale() {
     return desktop?.invoke('client_set_desktop_locale', { locale: i18n.locale() })
@@ -945,13 +948,13 @@
   document.addEventListener('copy', guardClipboard);
   document.addEventListener('cut', guardClipboard);
   document.addEventListener('mousedown', event => {
-    if (!frameless || event.button !== 0 || event.detail > 1 || !event.target.closest('.app-header')
+    if (!draggableHeader || event.button !== 0 || event.detail > 1 || !event.target.closest('.app-header')
       || event.target.closest('button, a, input, textarea, select, [contenteditable], [role="button"]')) return;
     event.preventDefault();
     desktop.invoke('client_window_action', { action: 'drag' }).catch(error => toast(message(error)));
   });
   document.addEventListener('dblclick', event => {
-    if (frameless && event.target.closest('.app-header') && !event.target.closest('button, a, input, textarea, select')) event.preventDefault();
+    if (draggableHeader && event.target.closest('.app-header') && !event.target.closest('button, a, input, textarea, select')) event.preventDefault();
   });
   document.addEventListener('click', event => {
     if (!event.composedPath().some(node => node === languageMenu || node.id === 'language-trigger')) closeLanguageMenu();
