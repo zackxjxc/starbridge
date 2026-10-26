@@ -1,0 +1,161 @@
+name: Build release packages
+
+on:
+  push:
+    tags:
+      - '*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  RUST_TOOLCHAIN: '1.94.1'
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Validate tag against Cargo version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: python tools/release_metadata.py version
+      - name: Test packaging and release validation
+        run: python -m unittest discover -s tools -p 'test_package*.py' -v
+
+  build:
+    needs: validate
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x86_64
+            runner: windows-2022
+            manifest: vendor/manifest.toml
+            client: true
+            extension: .exe
+          - platform: darwin-arm64
+            runner: macos-15
+            manifest: vendor/manifest.darwin-arm64.toml
+            client: true
+            extension: ''
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            manifest: vendor/manifest.linux-arm64.toml
+            client: false
+            extension: ''
+    defaults:
+      run:
+        shell: bash
+    env:
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Test protocol and server
+        run: cargo test --locked -p starbridge-protocol -p starbridge-server
+      - name: Build server
+        run: cargo build --locked --release -p starbridge-server
+      - name: Build desktop client and SSH session launcher
+        if: matrix.client
+        run: cargo build --locked --release -p starbridge-client --bins
+      - name: Check native client binary
+        if: matrix.client
+        run: ./target/release/starbridge-client${{ matrix.extension }} --version
+      - name: Fetch and verify client runtime
+        if: matrix.client
+        run: python tools/fetch_runtime.py --manifest '${{ matrix.manifest }}' --output state/runtime
+      - name: Package Windows client
+        if: runner.os == 'Windows'
+        run: python tools/package_windows.py --output "dist/release/StarBridge-client-$RELEASE_VERSION-windows-x86_64"
+      - name: Package macOS client (ad-hoc signature)
+        if: runner.os == 'macOS'
+        run: python tools/package_macos.py --output "dist/release/StarBridge-client-$RELEASE_VERSION-darwin-arm64.app"
+      - name: Package server with verified FRPS
+        run: >-
+          python tools/package_server.py
+          --binary target/release/starbridge-server${{ matrix.extension }}
+          --manifest '${{ matrix.manifest }}'
+          --verify-executables
+      - name: Upload package archives
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: packages-${{ matrix.platform }}
+          path: |
+            dist/release/*.zip
+            dist/release/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  release:
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: packages-*
+          merge-multiple: true
+          path: dist/release
+      - name: Require all five packages and write SHA-256 checksums
+        run: python tools/release_metadata.py checksums
+      - name: Save complete set for manual builds
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: release-preview
+          path: dist/release/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - name: Upload complete release set
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        shell: bash
+        run: |
+          if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/release/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/release/* --draft --verify-tag --title "StarBridge $RELEASE_TAG" --generate-notes
+          fi
+          gh release edit "$RELEASE_TAG" --draft=false
