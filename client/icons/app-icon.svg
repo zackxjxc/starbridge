@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <title>StarBridge</title>
+  <rect width="256" height="256" rx="56" fill="#4e5a6a"/>
+  <g transform="translate(23.04 82.08) scale(.82)"><path fill="white" fill-rule="evenodd" d="M12 48H32C50 48 66 12 128 12C190 12 206 48 224 48H244Q248 48 248 52V96Q248 100 244 100H212Q208 100 208 96V78C208 67 168 51 128 51C88 51 48 67 48 78V96Q48 100 44 100H12Q8 100 8 96V52Q8 48 12 48ZM128 14C126 30 122 34 105 36C122 38 126 42 128 50C130 42 134 38 151 36C134 34 130 30 128 14Z"/></g>
+</svg>
