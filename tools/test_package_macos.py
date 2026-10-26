@@ -7,6 +7,7 @@ from pathlib import Path
 import plistlib
 import tarfile
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -77,6 +78,9 @@ class MacPackageTests(unittest.TestCase):
         contents = self.output / "Contents"
         info = plistlib.loads((contents / "Info.plist").read_bytes())
         self.assertEqual(info["CFBundleExecutable"], "starbridge")
+        version = tomllib.loads((package_macos.REPO / "Cargo.toml").read_text(encoding="utf-8"))["workspace"]["package"]["version"]
+        self.assertEqual(info["CFBundleShortVersionString"], version)
+        self.assertEqual(info["CFBundleVersion"], version)
         self.assertEqual(info["LSMinimumSystemVersion"], "12.0")
         resources = contents / "Resources"
         records = json.loads((resources / "runtime-manifest.json").read_bytes())

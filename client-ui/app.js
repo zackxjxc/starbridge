@@ -21,7 +21,7 @@
   const activeStates = new Set(['negotiating', 'connected']);
   const workingStates = new Set(['queued', 'connecting', 'verifying']);
   const ui = {
-    snapshot: null, config: null, view: 'device', selected: null, query: '',
+    snapshot: null, config: null, version: '', view: 'device', selected: null, query: '',
     authMode: 'login', auth: { username: '', password: '', confirm_password: '', remember: true },
     authError: '', loadError: '', startupError: null, recoveryError: '', syncError: '', busy: new Set(), drafts: new Map(), reauthenticate: false,
     policy: 'direct_preferred', rebuild: false, allConfig: true, failureGroup: null,
@@ -32,6 +32,7 @@
     epoch: 0, poll: null, request: 0, applied: 0, mutating: 0, mutation: 0, mutationApplied: 0, menuNode: null, menuReturn: null, modalKind: null,
   };
   const routes = {
+    client_version: ['GET', '/api/health'],
     client_state: ['GET', '/api/v1/state'], client_config: ['GET', '/api/v1/config'],
     client_save_config: ['PUT', '/api/v1/config'], client_login: ['POST', '/api/v1/login'],
     client_register: ['POST', '/api/v1/register'], client_logout: ['POST', '/api/v1/logout'],
@@ -610,6 +611,7 @@
   }
   function header(loggedIn) {
     return h('header', { class: 'app-header', 'data-key': 'app-header' }, h('span', { class: 'brand-mark', 'aria-hidden': 'true' }, 'S'), h('span', {}, 'StarBridge'),
+      ui.version ? h('span', { class: 'muted app-version', 'data-copyable': '' }, `v${ui.version}`) : null,
       h('div', { class: 'account' }, button([h('span', { class: i18n.locale() === 'zh-CN' ? 'language-current' : '' }, '中'),
         h('span', { class: 'language-divider' }, '/'), h('span', { class: i18n.locale() === 'en' ? 'language-current' : '' }, 'EN'), icon('down')], 'language-menu',
         { id: 'language-trigger', class: 'language-trigger', 'data-key': 'language-trigger', 'aria-label': '语言 / Language', 'aria-haspopup': 'menu', 'aria-expanded': String(ui.languageOpen), 'aria-controls': 'language-menu' }, 'globe'),
@@ -1103,6 +1105,7 @@
     clearTimeout(ui.poll); ui.loadError = '';
     await syncDesktopLocale();
     try {
+      ui.version = (await api('client_version')).version;
       ui.startupError = desktop ? await api('client_startup_status') : null;
       if (ui.startupError) { render(); return; }
       const [snapshot, config] = await Promise.all([api('client_state'), api('client_config')]);

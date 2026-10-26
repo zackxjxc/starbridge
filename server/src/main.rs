@@ -4,7 +4,7 @@ use std::{net::SocketAddr, path::PathBuf, process::Stdio};
 use tracing::info;
 
 #[derive(Parser, Debug)]
-#[command(name = "starbridge-server", about = "StarBridge central server")]
+#[command(name = "starbridge-server", version, about = "StarBridge central server")]
 struct Args {
     #[arg(long, default_value = "127.0.0.1:17850")]
     listen: SocketAddr,

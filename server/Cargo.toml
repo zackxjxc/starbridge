@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[build-dependencies]
+tauri-winres.workspace = true
+
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true

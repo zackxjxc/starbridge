@@ -13,7 +13,7 @@ use std::{
 use tracing::info;
 
 #[derive(Parser, Debug)]
-#[command(name = "starbridge", about = "StarBridge desktop node console")]
+#[command(name = "starbridge", version, about = "StarBridge desktop node console")]
 struct Args {
     /// Legacy role names are accepted only to locate existing data directories.
     #[arg(long, default_value = "peer", hide = true)]

@@ -12,6 +12,7 @@ custom-protocol = ["desktop", "tauri/custom-protocol"]
 
 [build-dependencies]
 tauri-build = { version = "2", optional = true }
+tauri-winres.workspace = true
 
 [dependencies]
 anyhow.workspace = true

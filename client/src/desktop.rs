@@ -15,6 +15,11 @@ struct DesktopLifecycle {
 struct ExitMenu(MenuItem<tauri::Wry>);
 
 #[tauri::command]
+async fn client_version() -> HealthResponse {
+    health().await.0
+}
+
+#[tauri::command]
 async fn client_startup_status(startup: tauri::State<'_, crate::startup::ProfileStartup>) -> Result<Option<crate::profile::StartupIssue>, String> {
     Ok(startup.status().await)
 }
@@ -407,6 +412,7 @@ pub fn run(loaded: anyhow::Result<ClientApp>, role: Role, root: PathBuf) -> anyh
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
+            client_version,
             client_startup_status,
             client_startup_retry,
             client_startup_recover,

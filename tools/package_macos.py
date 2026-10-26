@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import tomllib
 
 from fetch_runtime import parse_manifest, sha256
 
@@ -68,6 +69,7 @@ def package(binary: Path, runtime: Path, cache: Path, output: Path, signing_iden
     for source in [binary, *(runtime / filename for names in CLIENT_RUNTIME.values() for filename in names)]:
         subprocess.run(["lipo", str(source), "-verify_arch", "arm64"], check=True, capture_output=True)
     config = json.loads((REPO / "client/tauri.conf.json").read_text(encoding="utf-8"))
+    version = tomllib.loads((REPO / "Cargo.toml").read_text(encoding="utf-8"))["workspace"]["package"]["version"]
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".starbridge-package-", dir=output.parent) as temporary:
         app = Path(temporary) / "StarBridge.app"
@@ -105,8 +107,8 @@ def package(binary: Path, runtime: Path, cache: Path, output: Path, signing_iden
             "CFBundleExecutable": "starbridge",
             "CFBundleIconFile": "icon.icns",
             "CFBundlePackageType": "APPL",
-            "CFBundleShortVersionString": config["version"],
-            "CFBundleVersion": config["version"],
+            "CFBundleShortVersionString": version,
+            "CFBundleVersion": version,
             "LSMinimumSystemVersion": "12.0",
             "NSHighResolutionCapable": True,
         }))
