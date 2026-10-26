@@ -1,5 +1,6 @@
 //! Machine identification is a lookup hint, separate from the device credential.
 use crate::secure_store;
+use crate::profile::{failure, FailureKind};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, path::Path};
@@ -112,7 +113,11 @@ pub(super) async fn load_identity(root: &Path) -> anyhow::Result<Identity> {
 }
 
 pub(super) async fn load_identity_with_interaction(root: &Path, interaction: secure_store::Interaction) -> anyhow::Result<Identity> {
-    let bytes = match secure_store::read_secret_with_interaction(root, "identity", interaction).await? {
+    let bytes = match secure_store::read_secret_with_interaction(root, "identity", interaction).await.map_err(|error| {
+        if crate::profile::kind(&error) == FailureKind::CorruptCredential {
+            failure(FailureKind::Identity, error.to_string())
+        } else { error }
+    })? {
         Some(bytes) => Some(bytes),
         None => match tokio::fs::read(root.join("identity.json")).await {
             Ok(bytes) => Some(bytes),
@@ -122,18 +127,18 @@ pub(super) async fn load_identity_with_interaction(root: &Path, interaction: sec
     };
     // A corrupt or inaccessible credential must never cause regeneration.
     let mut identity: Identity = match bytes {
-        Some(bytes) => serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("原设备身份损坏，请保留数据目录并恢复备份"))?,
+        Some(bytes) => serde_json::from_slice(&bytes).map_err(|_| failure(FailureKind::Identity, "原设备身份损坏，请通过账号验证恢复这台电脑"))?,
         None => Identity::default(),
     };
     if identity.node_id.is_empty() || identity.device_token.is_empty() {
-        anyhow::bail!("原设备身份无效，请保留数据目录并恢复备份");
+        return Err(failure(FailureKind::Identity, "原设备身份无效，请通过账号验证恢复这台电脑"));
     }
     if identity.active_account.is_none() && identity.account_bindings.is_empty() {
         identity.retain_legacy_candidate();
     }
     let key = load_machine(root).await?;
     if !identity.machine_key.is_empty() && identity.machine_key != key {
-        anyhow::bail!("设备识别来源发生变化；请保留原数据并通过账号验证处理设备绑定");
+        return Err(failure(FailureKind::Machine, "设备识别来源发生变化；请保留原数据并通过账号验证处理设备绑定"));
     }
     identity.machine_key = key;
     save_identity_with_interaction(root, &identity, interaction).await?;
@@ -197,29 +202,38 @@ async fn load_machine(root: &Path) -> anyhow::Result<String> {
     load_machine_with(root, crate::data_directory::is_default(root), native).await
 }
 
+#[cfg(feature = "desktop")]
+pub(crate) async fn recovery_requires_machine_reset(root: &Path) -> bool {
+    let Ok(bytes) = tokio::fs::read(root.join("machine.json")).await else { return false; };
+    saved_machine(&bytes, crate::data_directory::is_default(root), || machine_uid::get().ok().and_then(|value| normalize(&value)))
+        .is_err_and(|error| crate::profile::kind(&error) == FailureKind::Machine)
+}
+
+fn saved_machine(bytes: &[u8], default_profile: bool, read_native: impl FnOnce() -> Option<String>) -> anyhow::Result<String> {
+    let state: MachineState = serde_json::from_slice(bytes)
+        .map_err(|_| failure(FailureKind::Machine, "设备识别状态损坏，请通过账号验证恢复这台电脑"))?;
+    if state.version != 1 || state.key.len() != 64
+        || !state.key.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) {
+        return Err(failure(FailureKind::Machine, "设备识别状态无效，请通过账号验证恢复这台电脑"));
+    }
+    if !default_profile && state.source != Source::IsolatedV1 {
+        anyhow::bail!("此目录含默认设备身份，不能作为独立测试实例使用。请为 --data-dir 选择空目录；保留正式身份请使用 --import-data-dir 导入默认用户目录");
+    }
+    if state.source == Source::NativeV1 {
+        if let Some(value) = read_native() {
+            if derive(b"starbridge:machine:v1\0", &value) != state.key {
+                return Err(failure(FailureKind::Machine, "系统设备标识已改变，请保留原数据并通过账号验证处理设备绑定"));
+            }
+        }
+    }
+    // A transient read failure or recovered native source never changes a pinned identity.
+    Ok(state.key)
+}
+
 async fn load_machine_with(root: &Path, default_profile: bool, read_native: impl FnOnce() -> Option<String>) -> anyhow::Result<String> {
     let path = root.join("machine.json");
     match tokio::fs::read(&path).await {
-        Ok(bytes) => {
-            let state: MachineState = serde_json::from_slice(&bytes)
-                .map_err(|_| anyhow::anyhow!("设备识别状态损坏，请保留数据目录并恢复备份"))?;
-            if state.version != 1 || state.key.len() != 64
-                || !state.key.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) {
-                anyhow::bail!("设备识别状态无效，请保留数据目录并恢复备份");
-            }
-            if !default_profile && state.source != Source::IsolatedV1 {
-                anyhow::bail!("此目录含默认设备身份，不能作为独立测试实例使用。请为 --data-dir 选择空目录；保留正式身份请使用 --import-data-dir 导入默认用户目录");
-            }
-            if state.source == Source::NativeV1 {
-                if let Some(value) = read_native() {
-                    if derive(b"starbridge:machine:v1\0", &value) != state.key {
-                        anyhow::bail!("系统设备标识已改变，请保留原数据并通过账号验证处理设备绑定");
-                    }
-                }
-            }
-            // A transient read failure or recovered native source never changes a pinned identity.
-            return Ok(state.key);
-        }
+        Ok(bytes) => return saved_machine(&bytes, default_profile, read_native),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
         Err(_) => anyhow::bail!("无法读取设备识别状态，请检查数据目录权限"),
     }

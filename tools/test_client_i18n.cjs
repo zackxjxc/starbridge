@@ -104,3 +104,24 @@ test('tray close text follows explicit and system language changes', () => {
   context.navigator.languages = ['en-US']; emit({ type: 'languagechange' });
   assert.equal(i18n.t('关闭到托盘'), 'Close to tray');
 });
+
+test('startup recovery errors translate in both directions without losing status codes', () => {
+  const { i18n } = load({ saved: 'en' });
+  for (const original of [
+    '无法访问系统钥匙串，请检查当前用户的登录钥匙串后重试（状态 -25300）',
+    '钥匙串访问暂不可用，请重新打开客户端',
+    '系统钥匙串中的凭据已缺失，请验证账号后恢复这台电脑',
+    '系统设备标识已改变，请保留原数据并通过账号验证处理设备绑定',
+    '设备识别状态损坏，请通过账号验证恢复这台电脑',
+    '已保留无法读取的登录缓存，请重新登录。',
+    '恢复未完成，原资料备份已保留，请检查数据目录权限',
+  ]) {
+    i18n.setPreference('en');
+    const translated = i18n.message(original);
+    assert.doesNotMatch(translated, /[\u3400-\u9fff]/u);
+    if (original.includes('-25300')) assert.match(translated, /-25300/);
+    assert.equal(i18n.source(translated), original);
+    i18n.setPreference('zh-CN');
+    assert.equal(i18n.message(translated), original);
+  }
+});

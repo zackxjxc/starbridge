@@ -36,6 +36,8 @@ fs.mkdirSync(review, { recursive: true });
     let startupError = null;
     let startupRetryDenied = false;
     let startupRetries = 0;
+    let accountRecoveryDenied = true;
+    let accountRecoveries = 0;
     const enrollmentRequests = [];
     const calls = [];
     const state = {
@@ -55,8 +57,17 @@ fs.mkdirSync(review, { recursive: true });
         if (command === 'client_startup_status') value = startupError;
         else if (command === 'client_startup_retry') {
           ++startupRetries;
-          if (startupRetryDenied) return route.fulfill({ status: 403, json: { error: startupError } });
+          if (startupRetryDenied) return route.fulfill({ status: 403, json: { error: startupError.message } });
           startupError = null; value = null;
+        }
+        else if (command === 'client_startup_recover') {
+          ++accountRecoveries;
+          const form = route.request().postDataJSON().form;
+          assert.deepEqual(Object.keys(form).sort(), ['password', 'remember', 'username']);
+          if (accountRecoveryDenied) return route.fulfill({ status: 401, json: { error: '账户不存在或密码不正确，请检查后登录或注册' } });
+          startupError = null; state.logged_in = true; state.username = form.username;
+          state.devices = [local, peer]; state.device_rebind_required = false;
+          state.last_error = null; value = null;
         }
         else if (command === 'client_config') value = { connection_policy: 'direct_preferred', rebuild_relay: false };
         else if (command === 'client_state') value = state;
@@ -277,7 +288,7 @@ fs.mkdirSync(review, { recursive: true });
     await page.close();
 
     // Emulate only the web layout and IPC contract; native macOS authorization is separate.
-    startupError = '未获得系统钥匙串访问许可，原设备身份和登录凭据已保留。请点击“授权后重试”并在系统弹窗中允许访问。';
+    startupError = { kind: 'authorization', message: '未获得系统钥匙串访问许可，原设备身份和登录凭据已保留。请点击“授权后重试”并在系统弹窗中允许访问。', account_recovery: false };
     startupRetryDenied = true;
     Object.assign(state, { logged_in: false, username: null, devices: [], device_rebind_required: false, enrollment_candidates: [] });
     const recovery = await context.newPage();
@@ -289,7 +300,7 @@ fs.mkdirSync(review, { recursive: true });
     const recoveryStart = calls.length;
     await recovery.goto('http://starbridge.test/');
     await recovery.locator('[data-key="recovery-shell"]').waitFor();
-    assert.match(await recovery.locator('body').innerText(), /Unable to read saved device information/);
+    assert.match(await recovery.locator('body').innerText(), /System credential access is required/);
     assert.match(await recovery.locator('body').innerText(), /Mac login keychain password/);
     assert.equal(await recovery.locator('[data-action="window-close"]').count(), 0);
     assert.equal(await recovery.locator('.app-header').evaluate(node => getComputedStyle(node).height), '44px');
@@ -311,6 +322,38 @@ fs.mkdirSync(review, { recursive: true });
     await recovery.locator('[data-action="startup-retry"]').click();
     await recovery.locator('[data-form="auth"]').waitFor();
     assert.equal(startupRetries, 2);
+    assert.equal(await recovery.locator('[data-key="recovery-shell"]').count(), 0);
+    // A storage error containing the word Keychain is not an authorization prompt.
+    startupError = { kind: 'storage', message: '钥匙串访问暂不可用，请重新打开客户端', account_recovery: false };
+    await recovery.reload();
+    await recovery.locator('[data-key="recovery-shell"]').waitFor();
+    assert.equal(await recovery.locator('[data-action="startup-retry"]').innerText(), 'Retry reading');
+    assert.equal(await recovery.locator('[data-form="startup-recover"]').count(), 0);
+    assert.doesNotMatch(await recovery.locator('main').innerText(), /[\u3400-\u9fff]/u);
+
+    // Identity recovery asks for one account password; a rejected password leaves the form available.
+    startupError = { kind: 'identity', message: '原设备身份损坏，请通过账号验证恢复这台电脑', account_recovery: true };
+    await recovery.reload();
+    await recovery.locator('[data-form="startup-recover"]').waitFor();
+    await recovery.locator('#startup-username').fill('tester');
+    await recovery.locator('#startup-password').fill('wrong-password');
+    await recovery.locator('[data-form="startup-recover"] button[type="submit"]').click();
+    await recovery.waitForFunction(() => !document.querySelector('#startup-password').disabled);
+    assert.equal(accountRecoveries, 1);
+    assert.equal(await recovery.locator('#startup-password').inputValue(), '');
+    assert.match(await recovery.locator('[data-form="startup-recover"]').innerText(), /incorrect password/);
+    assert.doesNotMatch(await recovery.locator('main').innerText(), /[\u3400-\u9fff]/u);
+    await recovery.screenshot({ path: path.join(review, 'account-recovery.png') });
+    accountRecoveryDenied = false;
+    await recovery.locator('#startup-password').fill('correct-password');
+    await recovery.locator('[data-form="startup-recover"] button[type="submit"]').click();
+    await recovery.locator('[data-key="main-shell"]').waitFor();
+    assert.equal(accountRecoveries, 2);
+
+    Object.assign(state, { logged_in: false, username: null, last_error: '已保留无法读取的登录缓存，请重新登录。' });
+    await recovery.reload();
+    await recovery.locator('[data-form="auth"]').waitFor();
+    assert.match(await recovery.locator('main').innerText(), /unreadable sign-in cache has been preserved/);
     assert.equal(await recovery.locator('[data-key="recovery-shell"]').count(), 0);
     await recovery.close();
     assert.deepEqual(errors, []);

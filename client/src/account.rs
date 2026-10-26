@@ -96,6 +96,20 @@ pub(super) async fn register(
 async fn authenticate_account(app: &ClientApp, form: LoginForm, registering: bool)
     -> Result<Json<ClientSnapshot>, ApiError>
 {
+    authenticate_with_verified_auth(app, form, registering, None).await
+}
+
+#[cfg(feature = "desktop")]
+pub(super) async fn recover_verified_account(app: &ClientApp, form: LoginForm, auth: AuthResponse)
+    -> Result<Json<ClientSnapshot>, ApiError>
+{
+    if auth.username != form.username.trim() { return Err(ApiError::unauthorized("账号验证结果不匹配，请重新登录")); }
+    authenticate_with_verified_auth(app, form, false, Some(auth)).await
+}
+
+async fn authenticate_with_verified_auth(app: &ClientApp, form: LoginForm, registering: bool, verified: Option<AuthResponse>)
+    -> Result<Json<ClientSnapshot>, ApiError>
+{
     if form.username.trim().is_empty() || form.password.len() < 4 {
         return Err(ApiError::bad_request("请输入账户名称和至少 4 位密码"));
     }
@@ -114,10 +128,11 @@ async fn authenticate_account(app: &ClientApp, form: LoginForm, registering: boo
         (inner.config.server_url.clone(), inner.auth_generation)
     };
     let endpoint = if registering { "register" } else { "login" };
-    let response = app.http.post(format!("{url}/api/v1/auth/{endpoint}"))
-        .json(&AuthRequest { username: form.username.trim().into(), password: form.password.clone() })
-        .send().await.map_err(ApiError::network)?;
-    let auth: AuthResponse = response_json(response).await?;
+    let auth: AuthResponse = if let Some(auth) = verified { auth } else {
+        response_json(app.http.post(format!("{url}/api/v1/auth/{endpoint}"))
+            .json(&AuthRequest { username: form.username.trim().into(), password: form.password.clone() })
+            .send().await.map_err(ApiError::network)?).await?
+    };
     // Resolve ownership of an unclaimed portable identity using the authenticated
     // account's list before choosing a credential. A different first account must
     // never consume or reuse the original account's credential.
@@ -402,24 +417,38 @@ pub(super) async fn clear_saved_auth(root: &FsPath) {
 
 #[cfg(test)]
 pub(super) async fn load_auth(root: &FsPath, remember: bool) -> anyhow::Result<Option<AuthResponse>> {
-    load_auth_with_interaction(root, remember, secure_store::Interaction::Silent).await
+    Ok(load_auth_with_interaction(root, remember, secure_store::Interaction::Silent).await?.auth)
 }
 
-pub(super) async fn load_auth_with_interaction(root: &FsPath, remember: bool, interaction: secure_store::Interaction) -> anyhow::Result<Option<AuthResponse>> {
-    if !remember { clear_saved_auth(root).await; return Ok(None); }
-    let bytes = match secure_store::read_secret_with_interaction(root, "auth", interaction).await? {
-        Some(bytes) => bytes,
-        None => match tokio::fs::read(root.join("auth.json")).await {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => anyhow::bail!("无法读取已保存的登录状态"),
-        },
+#[derive(Default)]
+pub(super) struct LoadedAuth { pub auth: Option<AuthResponse>, pub cache_recovered: bool }
+
+pub(super) async fn load_auth_with_interaction(root: &FsPath, remember: bool, interaction: secure_store::Interaction) -> anyhow::Result<LoadedAuth> {
+    if !remember { clear_saved_auth(root).await; return Ok(LoadedAuth::default()); }
+    let loaded: anyhow::Result<Option<AuthResponse>> = async {
+        let bytes = match secure_store::read_secret_with_interaction(root, "auth", interaction).await? {
+            Some(bytes) => bytes,
+            None => match tokio::fs::read(root.join("auth.json")).await {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(_) => anyhow::bail!("无法读取已保存的登录状态"),
+            },
+        };
+        let auth: Option<AuthResponse> = serde_json::from_slice(&bytes).map_err(|_| crate::profile::failure(
+            crate::profile::FailureKind::CorruptCredential, "已保存的登录状态无法读取，请重新登录"))?;
+        Ok(auth)
+    }.await;
+    let auth = match loaded {
+        Ok(auth) => auth,
+        Err(error) if crate::profile::kind(&error) == crate::profile::FailureKind::CorruptCredential => {
+            crate::profile::ProfileBackup::create(root, &["auth.secure", "auth.json"], false).await?;
+            return Ok(LoadedAuth { auth: None, cache_recovered: true });
+        }
+        Err(error) => return Err(error),
     };
-    let auth: Option<AuthResponse> = serde_json::from_slice(&bytes)
-        .map_err(|_| anyhow::anyhow!("已保存的登录状态无法读取，请重新登录"))?;
     if let Some(auth) = &auth { save_auth_with_interaction(root, auth, interaction).await?; }
-    Ok(auth.filter(|auth| auth.expires_at > now_unix()
-        || auth.refresh_expires_at.is_some_and(|expiry| expiry > now_unix())))
+    Ok(LoadedAuth { auth: auth.filter(|auth| auth.expires_at > now_unix()
+        || auth.refresh_expires_at.is_some_and(|expiry| expiry > now_unix())), cache_recovered: false })
 }
 
 pub(super) async fn save_auth(root: &FsPath, auth: &AuthResponse) -> anyhow::Result<()> {

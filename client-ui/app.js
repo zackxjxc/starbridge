@@ -23,7 +23,7 @@
   const ui = {
     snapshot: null, config: null, view: 'device', selected: null, query: '',
     authMode: 'login', auth: { username: '', password: '', confirm_password: '', remember: true },
-    authError: '', loadError: '', startupError: null, syncError: '', busy: new Set(), drafts: new Map(), reauthenticate: false,
+    authError: '', loadError: '', startupError: null, recoveryError: '', syncError: '', busy: new Set(), drafts: new Map(), reauthenticate: false,
     policy: 'direct_preferred', rebuild: false, allConfig: true, failureGroup: null,
     components: null, exportData: null, exportIds: [], exportFingerprint: '', exportBack: 'device',
     historyItems: [], historyTotal: 0, historyOffset: 0, historyLoaded: false, historyError: '', historyRequest: 0,
@@ -637,16 +637,26 @@
   function render() {
     renderLanguageMenu();
     if (ui.startupError) {
-      const keychainRecovery = macosOverlay && ui.startupError.includes('钥匙串');
+      const issue = ui.startupError;
+      const keychainRecovery = macosOverlay && issue.kind === 'authorization';
+      const recovering = ui.busy.has('startup-recover');
+      const busy = recovering || ui.busy.has('startup-retry');
       root.setAttribute('aria-busy', 'false');
       patchChildren(root, [h('div', { class: 'shell', 'data-key': 'recovery-shell' }, header(false),
         h('main', { class: 'auth' }, h('div', { class: 'auth-form' },
-          h('h1', {}, t("无法读取已保存的设备信息")),
-          h('p', { class: 'intro' }, t("原设备身份和登录凭据已保留，不会自动创建新设备或覆盖原数据。")),
-          h('p', { class: 'auth-error', role: 'alert', 'data-copyable': '' }, displayMessage(ui.startupError)),
+          h('h1', {}, issue.account_recovery ? t("恢复这台电脑") : issue.kind === 'authorization' ? t("需要访问系统保存的凭据") : t("无法读取本机数据")),
+          h('p', { class: 'intro' }, issue.account_recovery ? t("验证账号后恢复本机，原文件和凭据引用会保留备份。") : t("原设备身份和登录凭据已保留，不会自动创建新设备或覆盖原数据。")),
+          h('p', { class: 'auth-error', role: 'alert', 'data-copyable': '' }, displayMessage(issue.message)),
           keychainRecovery ? h('p', { class: 'muted section' }, t("更新后的应用可能需要 macOS 重新授权。系统弹窗要求的是 Mac 登录钥匙串密码，不是 StarBridge 账号密码。拒绝或取消后会留在此页面，可稍后重试。"))
-            : h('p', { class: 'muted section' }, t("请检查数据目录和当前系统用户的访问权限，再重试读取。")),
-          button(ui.busy.has('startup-retry') ? t("正在读取…") : keychainRecovery ? t("授权后重试") : t("重试读取"), 'startup-retry', { class: 'button primary wide', disabled: ui.busy.has('startup-retry') }))))]);
+            : issue.account_recovery ? h('p', { class: 'muted' }, issue.kind === 'machine' ? t("识别信息变化时可能新增设备，原设备记录会保留。") : t("请输入 StarBridge 账号密码；密码验证通过前不会重建设备身份。"))
+              : h('p', { class: 'muted section' }, t("请检查数据目录和当前系统用户的访问权限，再重试读取。")),
+          issue.account_recovery ? h('form', { 'data-form': 'startup-recover' },
+            field(t("用户名"), 'startup-username', ui.auth.username, { name: 'username', autocomplete: 'username', required: true, maxlength: 80, disabled: busy }),
+            field(t("密码"), 'startup-password', ui.auth.password, { name: 'password', type: 'password', autocomplete: 'current-password', required: true, minlength: 4, disabled: busy }),
+            h('label', { class: 'remember' }, h('input', { type: 'checkbox', name: 'remember', checked: ui.auth.remember, disabled: busy }), t("记住登录状态")),
+            ui.recoveryError ? h('p', { class: 'auth-error', role: 'alert' }, displayMessage(ui.recoveryError)) : null,
+            button(recovering ? t("正在验证并恢复…") : t("验证账号并恢复"), '', { type: 'submit', class: 'button primary wide', disabled: busy })) : null,
+          button(ui.busy.has('startup-retry') ? t("正在读取…") : keychainRecovery ? t("授权后重试") : t("重试读取"), 'startup-retry', { class: issue.account_recovery ? 'link' : 'button primary wide', disabled: busy }))))]);
       return;
     }
     if (!s()) {
@@ -686,7 +696,7 @@
     return true;
   }
   async function refresh() {
-    if (ui.startupError || ui.busy.has('startup-retry')) return;
+    if (ui.startupError || ui.busy.has('startup-retry') || ui.busy.has('startup-recover')) return;
     const epoch = ui.epoch; const request = ++ui.request;
     try {
       const snapshot = await api('client_state');
@@ -850,10 +860,10 @@
         break;
       case 'retry': if (s()) await refresh(); else await init(); break;
       case 'startup-retry':
-        if (!desktop || ui.busy.has('startup-retry')) break;
+        if (!desktop || ui.busy.has('startup-retry') || ui.busy.has('startup-recover')) break;
         ui.busy.add('startup-retry'); render();
         try { await api('client_startup_retry'); ui.startupError = null; await init(); }
-        catch (error) { ui.startupError = message(error); }
+        catch (error) { ui.startupError = await api('client_startup_status'); ui.recoveryError = message(error); }
         finally { ui.busy.delete('startup-retry'); render(); }
         break;
       case 'history': navigate('history'); await loadHistory(); break;
@@ -991,7 +1001,7 @@
   document.addEventListener('input', event => {
     const input = event.target;
     if (input.id === 'device-search') { ui.query = input.value; render(); }
-    else if (input.closest('[data-form="auth"]') && input.name !== 'remember') { ui.auth[input.name] = input.value; ui.authError = ''; }
+    else if (input.closest('[data-form="auth"], [data-form="startup-recover"]') && input.name !== 'remember') { ui.auth[input.name] = input.value; ui.authError = ''; ui.recoveryError = ''; }
     else if (input.dataset.draft) {
       const item = device(input.dataset.draft); if (!item) return;
       const draft = { ...draftFor(item), [input.name]: input.value }; ui.drafts.set(item.node_id, draft); render();
@@ -999,7 +1009,7 @@
   });
   document.addEventListener('change', event => {
     const input = event.target;
-    if (input.id === 'auth-remember') ui.auth.remember = input.checked;
+    if (input.id === 'auth-remember' || input.name === 'remember' && input.closest('[data-form="startup-recover"]')) ui.auth.remember = input.checked;
     if (input.id === 'history-failed') { ui.historyFailed = input.checked; ui.historyExpanded = null; render(); }
     if (input.name === 'connection-policy') { ui.policy = input.value; render(); }
     if (input.name === 'relay-choice') { ui.rebuild = input.value === 'rebuild'; render(); }
@@ -1007,7 +1017,19 @@
   document.addEventListener('submit', event => {
     const form = event.target; if (!form.dataset.form) return; event.preventDefault();
     (async () => {
-      if (form.dataset.form === 'auth') {
+      if (form.dataset.form === 'startup-recover') {
+        if (!desktop || ui.busy.has('startup-recover') || ui.busy.has('startup-retry')) return;
+        const values = new FormData(form);
+        const submitted = { username: String(values.get('username') || '').trim(), password: String(values.get('password') || ''), remember: values.has('remember') };
+        ui.auth.username = submitted.username; ui.auth.password = ''; ui.recoveryError = '';
+        ui.busy.add('startup-recover'); render();
+        try {
+          await api('client_startup_recover', { form: submitted });
+          ui.startupError = null; await init();
+          if (s()?.enrollment_candidates?.length) rebindDialog();
+        } catch (error) { ui.recoveryError = message(error); ui.startupError = await api('client_startup_status'); }
+        finally { submitted.password = ''; ui.busy.delete('startup-recover'); render(); }
+      } else if (form.dataset.form === 'auth') {
         if (ui.busy.has('auth')) return;
         ui.auth.username = ui.auth.username.trim();
         if (!ui.auth.username) { ui.authError = t("请输入用户名。"); render(); return; }
@@ -1088,6 +1110,7 @@
       ui.rebuild = config.rebuild_relay === true; applySnapshot(snapshot);
       ui.auth.username = snapshot.last_username || snapshot.username || '';
       ui.auth.remember = snapshot.remember_login !== false;
+      ui.authError = !snapshot.logged_in && snapshot.last_error ? message(snapshot.last_error) : '';
     } catch (error) { ui.loadError = message(error); }
     render(); ui.poll = setTimeout(polling, 1200);
   }

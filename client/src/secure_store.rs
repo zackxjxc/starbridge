@@ -1,5 +1,6 @@
 //! User-scoped credential persistence. Never include payloads in errors or logs.
 use std::path::Path;
+use crate::profile::{failure, FailureKind};
 
 #[derive(Clone, Copy)]
 pub(super) enum Interaction {
@@ -25,7 +26,7 @@ pub(super) async fn read_secret_with_interaction(root: &Path, name: &str, intera
     { return Ok(Some(protect(&bytes, false)?)); }
     #[cfg(target_os = "macos")]
     {
-        let account = String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("凭据引用损坏"))?;
+        let account = String::from_utf8(bytes).map_err(|_| failure(FailureKind::CorruptCredential, "凭据引用损坏"))?;
         return keychain::read(&account, interaction).map(Some);
     }
     #[cfg(not(any(windows, target_os = "macos")))]
@@ -44,14 +45,26 @@ pub(super) async fn write_secret_with_interaction(root: &Path, name: &str, bytes
     let bytes = protect(bytes, true)?;
     #[cfg(target_os = "macos")]
     let bytes = {
-        use sha2::{Digest, Sha256};
-        let root = std::fs::canonicalize(root)?;
-        let account = format!("{:x}", Sha256::digest(format!("{}\0{name}", root.display())));
+        let account = keychain_account(root, name).await?;
         keychain::write(&account, bytes, interaction)?;
         account.into_bytes()
     };
     let path = root.join(format!("{name}.secure"));
     write_private(&path, &bytes).await
+}
+
+#[cfg(any(target_os = "macos", test))]
+async fn keychain_account(root: &Path, name: &str) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    match tokio::fs::read(root.join(format!("{name}.secure"))).await {
+        Ok(bytes) => String::from_utf8(bytes).map_err(|_| failure(FailureKind::CorruptCredential, "凭据引用损坏")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A recovery must not overwrite the Keychain item referenced by its backup.
+            let root = std::fs::canonicalize(root)?;
+            Ok(format!("{:x}", Sha256::digest(format!("{}\0{name}\0{}", root.display(), uuid::Uuid::new_v4()))))
+        }
+        Err(_) => anyhow::bail!("无法读取已保存的凭据，请检查数据目录权限"),
+    }
 }
 
 pub(super) async fn remove_secret(root: &Path, name: &str) -> anyhow::Result<()> {
@@ -103,7 +116,7 @@ fn protect(bytes: &[u8], encrypt: bool) -> anyhow::Result<Vec<u8>> {
     } else {
         CryptUnprotectData(&input, std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut(), 1, &mut output)
     }};
-    if result == 0 { anyhow::bail!("无法访问当前系统用户的安全凭据，请使用原系统用户运行客户端"); }
+    if result == 0 { return Err(failure(FailureKind::Authorization, "无法访问当前系统用户的安全凭据，请使用原系统用户运行客户端")); }
     let protected = unsafe { std::slice::from_raw_parts(output.data, output.size as usize).to_vec() };
     unsafe { LocalFree(output.data.cast()); }
     Ok(protected)
@@ -112,6 +125,7 @@ fn protect(bytes: &[u8], encrypt: bool) -> anyhow::Result<Vec<u8>> {
 #[cfg(target_os = "macos")]
 mod keychain {
     use super::Interaction;
+    use crate::profile::{failure, FailureKind};
     use std::ffi::c_void;
     use std::sync::{Mutex, MutexGuard};
     const SERVICE: &[u8] = b"net.starbridge.client.credentials.v1";
@@ -134,7 +148,7 @@ mod keychain {
     unsafe extern "C" { fn CFRelease(item: *const c_void); }
     fn check(status: i32) -> anyhow::Result<()> {
         if matches!(status, -128 | -25293 | -25308) {
-            anyhow::bail!("未获得系统钥匙串访问许可，原设备身份和登录凭据已保留。请点击“授权后重试”并在系统弹窗中允许访问。");
+            return Err(failure(FailureKind::Authorization, "未获得系统钥匙串访问许可，原设备身份和登录凭据已保留。请点击“授权后重试”并在系统弹窗中允许访问。"));
         }
         if status != 0 { anyhow::bail!("无法访问系统钥匙串，请检查当前用户的登录钥匙串后重试（状态 {status}）"); }
         Ok(())
@@ -160,8 +174,12 @@ mod keychain {
         let _interaction = InteractionGuard::new(interaction)?;
         let mut length = 0;
         let mut data = std::ptr::null_mut();
-        check(unsafe { SecKeychainFindGenericPassword(std::ptr::null(), SERVICE.len() as u32, SERVICE.as_ptr(),
-            account.len() as u32, account.as_ptr(), &mut length, &mut data, std::ptr::null_mut()) })?;
+        let status = unsafe { SecKeychainFindGenericPassword(std::ptr::null(), SERVICE.len() as u32, SERVICE.as_ptr(),
+            account.len() as u32, account.as_ptr(), &mut length, &mut data, std::ptr::null_mut()) };
+        if status == NOT_FOUND {
+            return Err(failure(FailureKind::CorruptCredential, "系统钥匙串中的凭据已缺失，请验证账号后恢复这台电脑"));
+        }
+        check(status)?;
         let bytes = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), length as usize).to_vec() };
         unsafe { SecKeychainItemFreeContent(std::ptr::null_mut(), data); }
         Ok(bytes)
@@ -217,6 +235,21 @@ mod keychain {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn keychain_reference_reuses_existing_item_but_quarantine_allocates_a_new_slot() {
+        let root = std::env::temp_dir().join(format!("starbridge-keychain-slot-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let original = keychain_account(&root, "identity").await.unwrap();
+        tokio::fs::write(root.join("identity.secure"), original.as_bytes()).await.unwrap();
+        assert_eq!(keychain_account(&root, "identity").await.unwrap(), original);
+        let _backup = crate::profile::ProfileBackup::create(&root, &["identity.secure"], false).await.unwrap();
+        let replacement = keychain_account(&root, "identity").await.unwrap();
+        assert_ne!(replacement, original);
+        tokio::fs::write(root.join("identity.secure"), replacement.as_bytes()).await.unwrap();
+        assert_eq!(keychain_account(&root, "identity").await.unwrap(), replacement);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
     #[tokio::test]
     async fn credentials_survive_restart_without_plaintext_on_windows() {
         let root = std::env::temp_dir().join(format!("starbridge-secure-{}", uuid::Uuid::new_v4()));

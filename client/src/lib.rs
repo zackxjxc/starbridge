@@ -27,6 +27,7 @@ use tokio::sync::{Mutex, RwLock};
 mod account;
 mod identity;
 mod secure_store;
+mod profile;
 #[cfg(feature = "desktop")]
 mod startup;
 pub mod data_directory;
@@ -233,7 +234,8 @@ impl ClientApp {
         tokio::fs::create_dir_all(&root).await?;
         let mut config = load_json(&root.join("config.json"), ClientConfig::default()).await?;
         let mut identity = identity::load_identity_with_interaction(&root, interaction).await?;
-        let auth = load_auth_with_interaction(&root, config.remember_login, interaction).await?;
+        let loaded_auth = load_auth_with_interaction(&root, config.remember_login, interaction).await?;
+        let auth = loaded_auth.auth;
         if let Some(auth) = &auth {
             identity.select_account(&account_scope(&config.server_url, &auth.username));
             identity::save_identity_with_interaction(&root, &identity, interaction).await?;
@@ -266,7 +268,7 @@ impl ClientApp {
                 sessions: HashMap::new(),
                 ended_sessions: pending_closes.clone(), pending_closes,
                 stage: if restoring { "restoring" } else { "ready" }.into(),
-                last_error: None,
+                last_error: loaded_auth.cache_recovered.then(|| "已保留无法读取的登录缓存，请重新登录。".into()),
                 runtime,
                 ssh: SshStatus { initialization: "not_initialized".into(), message: "连接组件将在需要时启动".into(), ..Default::default() },
                 visitor_ports: HashMap::new(),

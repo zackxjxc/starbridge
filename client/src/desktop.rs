@@ -15,13 +15,20 @@ struct DesktopLifecycle {
 struct ExitMenu(MenuItem<tauri::Wry>);
 
 #[tauri::command]
-async fn client_startup_status(startup: tauri::State<'_, crate::startup::ProfileStartup>) -> Result<Option<String>, String> {
-    Ok(startup.error().await)
+async fn client_startup_status(startup: tauri::State<'_, crate::startup::ProfileStartup>) -> Result<Option<crate::profile::StartupIssue>, String> {
+    Ok(startup.status().await)
 }
 
 #[tauri::command]
 async fn client_startup_retry(handle: tauri::AppHandle, startup: tauri::State<'_, crate::startup::ProfileStartup>) -> Result<(), String> {
     let core = startup.retry().await?;
+    if handle.manage(core.clone()) { core.heartbeat_loop().await; }
+    Ok(())
+}
+
+#[tauri::command]
+async fn client_startup_recover(handle: tauri::AppHandle, startup: tauri::State<'_, crate::startup::ProfileStartup>, form: LoginForm) -> Result<(), String> {
+    let core = startup.recover_account(form).await?;
     if handle.manage(core.clone()) { core.heartbeat_loop().await; }
     Ok(())
 }
@@ -460,6 +467,7 @@ pub fn run(loaded: anyhow::Result<ClientApp>, role: Role, root: PathBuf) -> anyh
         .invoke_handler(tauri::generate_handler![
             client_startup_status,
             client_startup_retry,
+            client_startup_recover,
             client_set_desktop_locale,
             client_window_action,
             client_state,
