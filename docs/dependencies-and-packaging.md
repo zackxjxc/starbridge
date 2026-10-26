@@ -131,9 +131,9 @@ macOS ARM64 的清单是 `vendor/manifest.darwin-arm64.toml`：
 - 构建脚本在未设置 `SDKROOT` 时通过 `xcrun` 选择当前 Xcode 的 SDK，并默认设置 `MACOSX_DEPLOYMENT_TARGET=12.0`，避免 OpenSSH 只能在构建机的系统版本上运行。FRP 的最低系统版本为 macOS 12。
 - OpenSSH 源码包的 SHA-256 是从 `cdn.openbsd.org` 和 `mirrors.aliyun.com` 分别下载、结果一致后锁定的。上游还提供 `.asc` 签名，当前开发机没有 `gpg`，签名尚未校验。
 
-`cargo build --locked --release --workspace` 编译客户端与本地测试中心后，执行 `python3 tools/package_macos.py`，得到 `dist/StarBridge.app` 和 `dist/StarBridge.zip`。打包前核对来源归档与锁定清单、运行时文件 SHA-256 和 ARM64 架构；包中仅保留 `frpc`、五个 OpenSSH 服务组件和许可证，不包含 `frps`、中心程序或用户状态。SSH 客户端使用 macOS 系统提供的 `ssh`。
+`cargo build --locked --release --workspace` 编译客户端与本地测试中心后，执行 `python3 tools/package_macos.py --signing-identity "Developer ID Application"`，得到 `dist/StarBridge.app` 和 `dist/StarBridge.zip`。打包前核对来源归档与锁定清单、运行时文件 SHA-256 和 ARM64 架构；包中仅保留 `frpc`、五个 OpenSSH 服务组件和许可证，不包含 `frps`、中心程序或用户状态。SSH 客户端使用 macOS 系统提供的 `ssh`。
 
-应用主程序位于 `Contents/MacOS/starbridge`，运行时位于 `Contents/Resources/runtime/`。桌面数据位于用户的 `~/Library/Application Support/StarBridge`，不会写入应用包。打包脚本对运行时和应用进行 ad-hoc 签名，签名后重新记录分发文件哈希并验证整个包；这是本地构建包，尚未进行 Developer ID 签名或 Apple 公证。ZIP 保留执行权限，脚本拒绝覆盖已有 `.app`。
+应用主程序位于 `Contents/MacOS/starbridge`，运行时位于 `Contents/Resources/runtime/`。桌面数据位于用户的 `~/Library/Application Support/StarBridge`，不会写入应用包。正式更新应固定使用同一 Developer ID Application 身份，签名后重新记录分发文件哈希并验证整个包；Apple 公证尚未执行。开发环境可显式使用 `--signing-identity -` 生成 ad-hoc 包，但其指定要求与当前代码版本绑定，不能稳定沿用旧版钥匙串授权。ZIP 保留执行权限，脚本拒绝覆盖已有 `.app`。
 
 ## 待处理项
 

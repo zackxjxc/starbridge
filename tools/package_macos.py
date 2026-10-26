@@ -25,7 +25,7 @@ CLIENT_RUNTIME = {
 LICENSES = {"frp": ("LICENSE",), "openssh": ("LICENCE",)}
 
 
-def package(binary: Path, runtime: Path, cache: Path, output: Path) -> Path:
+def package(binary: Path, runtime: Path, cache: Path, output: Path, signing_identity: str = "-") -> Path:
     if output.suffix != ".app" or output.exists() or output.is_symlink():
         raise SystemExit("输出必须是尚不存在的 .app 路径；请使用新的 --output，保留已有应用和数据")
     if not binary.is_file():
@@ -85,7 +85,7 @@ def package(binary: Path, runtime: Path, cache: Path, output: Path) -> Path:
                 destination = bundled_runtime / filename
                 shutil.copy2(runtime / filename, destination)
                 destination.chmod(0o755)
-                subprocess.run(["codesign", "--force", "--sign", "-", str(destination)],
+                subprocess.run(["codesign", "--force", "--sign", signing_identity, str(destination)],
                                check=True, capture_output=True)
             # Signing changes Mach-O bytes; record hashes of the distributed files.
             record["file_sha256"] = {filename: sha256(bundled_runtime / filename)
@@ -110,7 +110,7 @@ def package(binary: Path, runtime: Path, cache: Path, output: Path) -> Path:
             "LSMinimumSystemVersion": "12.0",
             "NSHighResolutionCapable": True,
         }))
-        subprocess.run(["codesign", "--force", "--sign", "-", str(app)], check=True, capture_output=True)
+        subprocess.run(["codesign", "--force", "--sign", signing_identity, str(app)], check=True, capture_output=True)
         subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)],
                        check=True, capture_output=True)
         archive = Path(temporary) / "StarBridge.zip"
@@ -128,12 +128,13 @@ def main() -> int:
     parser.add_argument("--runtime", type=Path, default=REPO / "state/runtime")
     parser.add_argument("--cache", type=Path, default=REPO / ".cache/runtime")
     parser.add_argument("--output", type=Path, default=REPO / "dist/StarBridge.app")
+    parser.add_argument("--signing-identity", default="-", help="正式包使用固定 Developer ID Application 身份；默认 - 为本地 ad-hoc 签名")
     args = parser.parse_args()
     if sys.platform != "darwin":
         parser.error("macOS 打包需要在配备 Xcode 命令行工具的 Mac 上运行")
     try:
         archive = package(args.binary.resolve(), args.runtime.resolve(), args.cache.resolve(),
-                          args.output.absolute())
+                          args.output.absolute(), args.signing_identity)
     except subprocess.CalledProcessError as error:
         raise SystemExit(f"打包命令失败: {error.cmd}\n{error.stderr.decode(errors='replace')}") from error
     print(args.output)

@@ -27,6 +27,7 @@ class MacPackageTests(unittest.TestCase):
         self.cache.mkdir()
         self.output = self.root / "StarBridge.app"
         self.locked = []
+        self.signing_commands = []
         records = []
         for component, filenames in package_macos.CLIENT_RUNTIME.items():
             archive = self.cache / f"{component}.tar.gz"
@@ -48,6 +49,8 @@ class MacPackageTests(unittest.TestCase):
         (self.runtime / "runtime-manifest.json").write_text(json.dumps(records), encoding="utf-8")
 
     def run_command(self, command, **kwargs):
+        if command[0] == "codesign" and "--sign" in command:
+            self.signing_commands.append(command)
         if command[0] == "codesign" and "--sign" in command and Path(command[-1]).is_file():
             with Path(command[-1]).open("ab") as destination:
                 destination.write(b"signed")
@@ -58,10 +61,16 @@ class MacPackageTests(unittest.TestCase):
                     if path.is_file():
                         archive.write(path, path.relative_to(app.parent))
 
-    def package(self):
+    def package(self, signing_identity="-"):
         with patch.object(package_macos, "parse_manifest", return_value=self.locked), \
              patch.object(package_macos.subprocess, "run", side_effect=self.run_command):
-            return package_macos.package(self.binary, self.runtime, self.cache, self.output)
+            return package_macos.package(self.binary, self.runtime, self.cache, self.output, signing_identity)
+
+    def test_fixed_signing_identity_is_used_for_app_and_every_runtime(self):
+        identity = "Developer ID Application: Fixture"
+        self.package(identity)
+        self.assertEqual(len(self.signing_commands), 1 + sum(map(len, package_macos.CLIENT_RUNTIME.values())))
+        self.assertTrue(all(command[command.index("--sign") + 1] == identity for command in self.signing_commands))
 
     def test_app_contains_signed_runtime_and_no_user_state(self):
         archive = self.package()

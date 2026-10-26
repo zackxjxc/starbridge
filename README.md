@@ -99,10 +99,12 @@ cargo run -p starbridge-server -- --frps-path state/runtime/frps
 
 ```sh
 cargo build --locked --release --workspace
-python3 tools/package_macos.py
+python3 tools/package_macos.py --signing-identity "Developer ID Application"
 ```
 
-输出为 `dist/StarBridge.app` 和 `dist/StarBridge.zip`，适用于 Apple Silicon、macOS 12+。解压后双击应用，或拖到“应用程序”目录；无需 Python、Rust 或独立安装 FRP/OpenSSH。包内包含经过锁定清单与文件哈希校验的客户端运行时及许可证，SSH 客户端使用系统自带的 `/usr/bin/ssh`。打包脚本使用本地 ad-hoc 签名并验证签名，尚未进行 Developer ID 签名或 Apple 公证。已有应用不会被打包脚本覆盖，可使用新的 `--output` 路径重新打包。
+输出为 `dist/StarBridge.app` 和 `dist/StarBridge.zip`，适用于 Apple Silicon、macOS 12+。解压后双击应用，或拖到“应用程序”目录；无需 Python、Rust 或独立安装 FRP/OpenSSH。包内包含经过锁定清单与文件哈希校验的客户端运行时及许可证，SSH 客户端使用系统自带的 `/usr/bin/ssh`。正式更新始终使用同一 Developer ID Application 签名证书；多个证书匹配时需指定准确名称或指纹。没有证书的开发环境可使用 `--signing-identity -` 生成本地 ad-hoc 包，但更新后可能需要重新授权钥匙串。签名后验证整个包，Apple 公证尚未执行。已有应用不会被打包脚本覆盖，可使用新的 `--output` 路径重新打包。
+
+启动时静默读取已保存的凭据；如果系统拒绝访问设备身份，客户端显示恢复页面并保留原数据。只有点击「授权后重试」才弹出系统授权框；拒绝后留在页面上，不退出或自动重建身份。详见 [设备身份与迁移](docs/machine-identity.md)。
 
 macOS 数据保存在 `~/Library/Application Support/StarBridge`，桌面和无界面模式共用默认身份与实例锁，升级或移动应用时保留；可通过 `--data-dir` 指定独立测试目录。验证本地三节点真实连接：
 
