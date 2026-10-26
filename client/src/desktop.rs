@@ -40,8 +40,6 @@ struct DesktopText {
     confirm_title: &'static str,
     confirm_message: &'static str,
     cancel: &'static str,
-    notice_title: &'static str,
-    notice_body: &'static str,
 }
 
 fn desktop_text(english: bool) -> DesktopText {
@@ -50,31 +48,20 @@ fn desktop_text(english: bool) -> DesktopText {
             exit: "Exit", exiting: "Exiting…", tooltip: "StarBridge · Running in background",
             confirm_title: "Exit StarBridge?",
             confirm_message: "Exiting will disconnect all connections on this computer, cancel queued tasks and connection tests, and stop background services.",
-            cancel: "Cancel", notice_title: "StarBridge is running in the background",
-            notice_body: "Connections stay active. Click the tray icon to reopen, or right-click and choose Exit to quit.",
+            cancel: "Cancel",
         }
     } else {
         DesktopText {
             exit: "退出", exiting: "正在退出…", tooltip: "StarBridge · 后台运行",
             confirm_title: "退出 StarBridge？",
             confirm_message: "退出将断开本机所有连接，取消等待任务和连接测试，并停止后台服务。",
-            cancel: "取消", notice_title: "StarBridge 已在后台运行",
-            notice_body: "连接保持不变。点击托盘图标打开窗口，右键选择“退出”结束程序。",
+            cancel: "取消",
         }
     }
 }
 
 fn current_text(handle: &tauri::AppHandle) -> DesktopText {
     desktop_text(handle.state::<DesktopLifecycle>().english.load(Ordering::Acquire))
-}
-
-fn tray_notice_copy(handle: &tauri::AppHandle) -> String {
-    let english = handle.state::<DesktopLifecycle>().english.load(Ordering::Acquire);
-    let text = desktop_text(english);
-    serde_json::json!({
-        "locale": if english { "en" } else { "zh-CN" },
-        "title": text.notice_title, "body": text.notice_body,
-    }).to_string()
 }
 
 #[tauri::command]
@@ -96,10 +83,6 @@ fn client_set_desktop_locale(handle: tauri::AppHandle, window: tauri::WebviewWin
     if let Some(tray) = handle.tray_by_id("main") {
         tray.set_tooltip(Some(text.tooltip)).map_err(|error| error.to_string())?;
     }
-    if let Some(notice) = handle.get_webview_window("tray-notice") {
-        notice.eval(format!("window.__STARBRIDGE_TRAY_NOTICE__ = {}; window.renderTrayNotice?.(window.__STARBRIDGE_TRAY_NOTICE__);", tray_notice_copy(&handle)))
-            .map_err(|error| error.to_string())?;
-    }
     Ok(())
 }
 
@@ -108,9 +91,6 @@ fn restore_main(handle: &tauri::AppHandle) -> tauri::Result<()> {
         window.show()?;
         window.unminimize()?;
         window.set_focus()?;
-    }
-    if let Some(notice) = handle.get_webview_window("tray-notice") {
-        let _ = notice.close();
     }
     Ok(())
 }
@@ -210,44 +190,6 @@ fn create_tray(handle: &tauri::AppHandle) -> anyhow::Result<()> {
     }
     handle.manage(ExitMenu(exit));
     Ok(())
-}
-
-fn show_tray_notice(handle: &tauri::AppHandle, window: &tauri::WebviewWindow, root: &std::path::Path) {
-    let marker = root.join("tray-notice-seen");
-    if marker.exists() || handle.get_webview_window("tray-notice").is_some() {
-        return;
-    }
-    // A non-activating local notice also works in the portable package without OS notification setup.
-    let mut notice = WebviewWindowBuilder::new(handle, "tray-notice", WebviewUrl::App("tray-notice.html".into()))
-        .title("StarBridge")
-        .initialization_script(format!("window.__STARBRIDGE_TRAY_NOTICE__ = {};", tray_notice_copy(handle)))
-        .inner_size(360.0, 138.0)
-        .decorations(false)
-        .resizable(false)
-        .skip_taskbar(true)
-        .always_on_top(true)
-        .focused(false)
-        .focusable(false);
-    if let Ok(Some(monitor)) = window.current_monitor() {
-        let area = monitor.work_area();
-        let scale = monitor.scale_factor();
-        notice = notice.position(
-            (area.position.x as f64 + area.size.width as f64) / scale - 376.0,
-            (area.position.y as f64 + area.size.height as f64) / scale - 154.0,
-        );
-    }
-    match notice.build() {
-        Ok(notice) => {
-            if let Err(error) = std::fs::write(marker, b"1\n") {
-                tracing::warn!(%error, "无法保存托盘提示状态");
-            }
-            tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-                let _ = notice.close();
-            });
-        }
-        Err(error) => tracing::warn!(%error, "无法显示首次托盘提示"),
-    }
 }
 
 #[tauri::command]
@@ -543,12 +485,9 @@ pub fn run(loaded: anyhow::Result<ClientApp>, role: Role, root: PathBuf) -> anyh
                 }
                 if tray_available && handle.try_state::<ClientApp>().is_some() && handle.tray_by_id("main").is_some() {
                     if let Some(window) = handle.get_webview_window("main") {
-                        match window.hide() {
-                            Ok(()) => show_tray_notice(handle, &window, &root),
-                            Err(error) => {
-                                tracing::warn!(%error, "隐藏窗口失败，改为正常退出");
-                                request_exit(handle);
-                            }
+                        if let Err(error) = window.hide() {
+                            tracing::warn!(%error, "隐藏窗口失败，改为正常退出");
+                            request_exit(handle);
                         }
                     }
                 } else {
@@ -581,8 +520,7 @@ mod tests {
         for (en, zh) in [
             (english.exiting, chinese.exiting), (english.tooltip, chinese.tooltip),
             (english.confirm_title, chinese.confirm_title), (english.confirm_message, chinese.confirm_message),
-            (english.cancel, chinese.cancel), (english.notice_title, chinese.notice_title),
-            (english.notice_body, chinese.notice_body),
+            (english.cancel, chinese.cancel),
         ] {
             assert!(!en.is_empty());
             assert_ne!(en, zh);

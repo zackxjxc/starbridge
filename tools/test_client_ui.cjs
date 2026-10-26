@@ -90,7 +90,7 @@ fs.mkdirSync(review, { recursive: true });
         return route.fulfill({ json: value });
       }
       const name = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
-      if (!['index.html', 'app.js', 'i18n.js', 'style.css', 'tray-notice.html', 'tray-notice.js'].includes(name)) return route.fulfill({ status: 404, body: '' });
+      if (!['index.html', 'app.js', 'i18n.js', 'style.css'].includes(name)) return route.fulfill({ status: 404, body: '' });
       return route.fulfill({ path: path.join(assets, name), contentType: name.endsWith('.js') ? 'text/javascript' : name.endsWith('.css') ? 'text/css' : 'text/html' });
     });
     const choose = async language => {
@@ -269,22 +269,6 @@ fs.mkdirSync(review, { recursive: true });
     assert.equal(await page.locator('input[type="password"]').count(), 1);
     assert.match(await page.locator('body').innerText(), /automatically restore this computer/);
 
-    const notice = await context.newPage();
-    await notice.setViewportSize({ width: 360, height: 138 });
-    await notice.addInitScript(() => {
-      window.__STARBRIDGE_TRAY_NOTICE__ = { locale: 'en', title: 'StarBridge is running in the background',
-        body: 'Connections stay active. Click the tray icon to reopen, or right-click and choose Exit to quit.' };
-    });
-    await notice.goto('http://starbridge.test/tray-notice.html');
-    assert.equal(await notice.locator('html').getAttribute('lang'), 'en');
-    assert.equal(await notice.locator('body').isVisible(), true);
-    assert.doesNotMatch(await notice.locator('body').innerText(), /[\u3400-\u9fff]/u);
-    assert.equal(await notice.evaluate(() => document.body.scrollHeight <= innerHeight), true, 'English tray notice must fit its window');
-    await notice.evaluate(() => window.renderTrayNotice({ locale: 'zh-CN', title: 'StarBridge 已在后台运行',
-      body: '连接保持不变。点击托盘图标打开窗口，右键选择“退出”结束程序。' }));
-    assert.equal(await notice.locator('html').getAttribute('lang'), 'zh-CN');
-    assert.match(await notice.locator('#notice-body').textContent(), /连接保持不变/);
-    await notice.close();
     await page.close();
 
     // Emulate only the web layout and IPC contract; native macOS authorization is separate.
