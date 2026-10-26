@@ -78,13 +78,13 @@ cargo build --release -p starbridge-client
 python tools/package_windows.py
 ```
 
-输出为 `dist/StarBridge-test/` 和 `dist/StarBridge-test.zip`。构建默认启用桌面和 `custom-protocol` 功能，将 UI 嵌入可执行文件；打包仅组装便携目录与 zip，不生成 MSI 或 NSIS 安装包。
+输出为 `dist/StarBridge-test/` 和 `dist/StarBridge-test.zip`。ZIP 根目录直接包含 `starbridge.exe`、`README.txt`、`runtime/` 和 `licenses/`，不再套一层包名目录。构建默认启用桌面和 `custom-protocol` 功能，将 UI 嵌入可执行文件；打包仅组装便携目录与 zip，不生成 MSI 或 NSIS 安装包。
 
-解压到可写目录后，双击 `starbridge.exe` 或 `start-node.bat`，使用用户名和密码登录或注册。连接服务已内置，不需要填写服务器地址。需要保留整个目录中的 `runtime/`、运行时校验清单和许可证文件。运行电脑需要已安装 WebView2 Runtime；不需要安装 StarBridge 或 Rust。
+完整解压到可写目录后，双击 `starbridge.exe`，使用用户名和密码登录或注册。连接服务已内置，不需要填写服务器地址。需要保留 `runtime/` 中的全部运行组件和 `runtime-manifest.json`，以及 `licenses/` 中的许可证文件。运行电脑需要已安装 WebView2 Runtime；不需要安装 StarBridge 或 Rust。
 
 默认设备数据保存在当前用户的系统目录：Windows 为 `%LOCALAPPDATA%/StarBridge`，macOS 为 `~/Library/Application Support/StarBridge`。重新解压或更换程序目录会继续使用同一身份和实例锁。同账号通过系统机器标识派生的内部查找键复用设备，设备凭据单独验证；凭据冲突或设备已删除时，登录后必须输入账号密码并明确确认重新绑定，后台不会替换凭据或恢复设备。详见 [设备身份与迁移](docs/machine-identity.md)。
 
-开发联调可继续使用不同的空 `--data-dir`，每个目录拥有独立测试身份和实例锁，避免覆盖默认正式设备；旧双实例启动脚本仍使用各自的显式目录。升级请保留旧数据目录，多个旧身份存在时用 `--import-data-dir PATH` 明确选择导入空默认目录，不要合并文件。`runtime/` 从数据目录及其父目录、可执行文件旁依次查找，兼容开发环境的 `state/runtime/`。发布 ZIP 仅打包程序、运行时、许可证和启动脚本，不含配置、身份、凭据或登录状态。
+开发联调可继续使用不同的空 `--data-dir`，每个目录拥有独立测试身份和实例锁，避免覆盖默认正式设备；旧双实例启动脚本仍使用各自的显式目录。升级请保留旧数据目录，多个旧身份存在时用 `--import-data-dir PATH` 明确选择导入空默认目录，不要合并文件。`runtime/` 从数据目录及其父目录、可执行文件旁依次查找，兼容开发环境的 `state/runtime/`。发布 ZIP 仅打包程序、README、运行时和许可证，不含配置、身份、凭据或登录状态；BAT、PS1 启动及测试脚本留在仓库供开发使用，不随包分发。
 
 ### macOS（Apple Silicon）
 

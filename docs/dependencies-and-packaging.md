@@ -80,14 +80,12 @@ python tools/package_windows.py
 
 ## 发布目录
 
-Windows 客户端便携目录布局：
+Windows 客户端便携目录布局；ZIP 直接以此目录内容为根，不再套一层 `StarBridge-test/`：
 
 ```text
 StarBridge-test/
   starbridge.exe
-  start-node.bat
-  start-controller.bat       兼容旧数据目录
-  start-executor.bat         兼容旧数据目录
+  README.txt
   runtime/
     frpc.exe
     ssh.exe
@@ -100,15 +98,15 @@ StarBridge-test/
     sftp-server.exe
     ssh-shellhost.exe
     libcrypto.dll
+    runtime-manifest.json
   licenses/
     frp/
     openssh/
-  runtime-manifest.json
 ```
 
-双击 `starbridge.exe` 或 `start-node.bat` 打开设备中心，同账户设备可互相连接。连接服务已内置。保留 `runtime/` 和许可证，运行电脑需已有 WebView2 Runtime；StarBridge 不运行安装器。默认数据在 Windows `%LOCALAPPDATA%/StarBridge` 或 macOS `~/Library/Application Support/StarBridge`，与程序位置无关；不同解压目录默认共用身份和实例锁。`--data-dir` 使用独立的开发测试身份，旧双实例脚本继续使用各自的显式目录。迁移及冲突处理见 [设备身份与迁移](machine-identity.md)。
+完整解压后双击 `starbridge.exe` 打开设备中心，同账户设备可互相连接。连接服务已内置。保留 `runtime/` 中的全部运行组件和校验清单，以及 `licenses/` 中的许可证；根目录不再重复放置 `runtime-manifest.json`。运行电脑需已有 WebView2 Runtime；StarBridge 不运行安装器。默认数据在 Windows `%LOCALAPPDATA%/StarBridge` 或 macOS `~/Library/Application Support/StarBridge`，与程序位置无关；不同解压目录默认共用身份和实例锁。`--data-dir` 使用独立的开发测试身份，旧双实例脚本继续使用各自的显式目录。迁移及冲突处理见 [设备身份与迁移](machine-identity.md)。
 
-发布脚本只复制程序、允许的运行时文件、许可证和启动脚本；运行时目录中意外混入的身份、登录文件及额外清单字段不会进入 ZIP。输出目录若含 `state/`、SSH 数据、机器识别文件、安全存储文件或迁移标记，打包会拒绝覆盖，要求选择新的输出目录。请保留旧数据，不要把使用过的身份或登录状态混入发布物。
+发布脚本按白名单只复制程序、README、允许的运行时文件和许可证。`start-node.bat`、`start-controller.bat`、`start-executor.bat` 及 `test-ssh.bat`、`test-ssh.ps1` 留在仓库供开发和兼容测试使用，不随包分发。运行时目录中意外混入的身份、登录文件及额外清单字段不会进入 ZIP。输出目录若含 `state/`、SSH 数据、机器识别文件、安全存储文件或迁移标记，打包会拒绝覆盖，要求选择新的输出目录。请保留旧数据，不要把使用过的身份或登录状态混入发布物。
 
 中心 Linux 部署包建议布局：
 

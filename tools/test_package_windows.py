@@ -52,20 +52,34 @@ class PortablePackageTests(unittest.TestCase):
         self.assertEqual(self.package(), 0)
         self.assertEqual((self.output / "starbridge.exe").read_bytes(), b"test-client")
         self.assertFalse((self.output / "runtime" / "frps.exe").exists())
-        manifest = json.loads((self.output / "runtime-manifest.json").read_text(encoding="utf-8"))
+        manifest = json.loads((self.output / "runtime" / "runtime-manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(len(manifest), 1)
         self.assertNotIn("frps.exe", manifest[0]["files"])
         self.assertNotIn("frps.exe", manifest[0]["file_sha256"])
         self.assertEqual(manifest[0]["file_sha256"]["frpc.exe"],
                          hashlib.sha256(b"frpc.exe").hexdigest())
-        self.assertEqual((self.output / "runtime" / "runtime-manifest.json").read_bytes(),
-                         (self.output / "runtime-manifest.json").read_bytes())
+        self.assertFalse((self.output / "runtime-manifest.json").exists())
         self.assertTrue((self.output / "licenses" / "frp" / "LICENSE").is_file())
         self.assertTrue((self.output / "licenses" / "openssh" / "NOTICE.txt").is_file())
-        self.assertIn("Tauri", (self.output / "README.txt").read_text(encoding="utf-8"))
+        readme = (self.output / "README.txt").read_text(encoding="utf-8")
+        self.assertIn("双击 starbridge.exe", readme)
+        self.assertNotIn(".bat", readme)
+        self.assertEqual({path.name for path in self.output.iterdir()},
+                         {"starbridge.exe", "README.txt", "runtime", "licenses"})
+        expected_files = {"starbridge.exe", "README.txt", "runtime/runtime-manifest.json"}
+        expected_files.update(f"runtime/{name}" for name in package_windows.CLIENT_RUNTIME)
+        for component, (_, names) in package_windows.LICENSES.items():
+            expected_files.update(f"licenses/{component}/{name}" for name in names)
+        self.assertEqual({path.relative_to(self.output).as_posix()
+                          for path in self.output.rglob("*") if path.is_file()}, expected_files)
         with zipfile.ZipFile(self.output.with_suffix(".zip")) as archive:
-            self.assertIn(f"{self.output.name}/starbridge.exe", archive.namelist())
-            self.assertFalse(any(name.endswith((".msi", "frps.exe")) for name in archive.namelist()))
+            self.assertIsNone(archive.testzip())
+            self.assertEqual({name.split("/")[0] for name in archive.namelist()},
+                             {"starbridge.exe", "README.txt", "runtime", "licenses"})
+            self.assertEqual({entry.filename for entry in archive.infolist() if not entry.is_dir()},
+                             expected_files)
+            for name in expected_files:
+                self.assertEqual(archive.read(name), (self.output / name).read_bytes())
 
     def test_used_output_is_preserved(self):
         data = self.output / "state" / "controller"

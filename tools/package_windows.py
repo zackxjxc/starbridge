@@ -107,10 +107,9 @@ def main() -> int:
          "file_sha256": {name: expected_files[name] for name in record["files"] if name in CLIENT_RUNTIME}}
         for record in manifest if any(name in CLIENT_RUNTIME for name in record["files"])
     ]
-    (args.output / "runtime-manifest.json").write_text(
+    (runtime / "runtime-manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
-    shutil.copy2(args.output / "runtime-manifest.json", runtime / "runtime-manifest.json")
     for component, (archive, names) in LICENSES.items():
         destination = args.output / "licenses" / component
         destination.mkdir(parents=True)
@@ -118,24 +117,18 @@ def main() -> int:
             for member in bundle.namelist():
                 if Path(member).name in names:
                     (destination / Path(member).name).write_bytes(bundle.read(member))
-    scripts = Path(__file__).resolve().parent.parent / "deploy" / "windows"
-    for script in [*scripts.glob("*.bat"), *scripts.glob("*.ps1")]:
-        shutil.copy2(script, args.output / script.name)
-
     (args.output / "README.txt").write_text(
-        "StarBridge Tauri 便携客户端\n\n"
-        "解压整个目录后，双击 starbridge.exe 或 start-node.bat 打开设备中心；同账户设备可以互相连接。\n"
+        "StarBridge 便携客户端\n\n"
+        "完整解压 ZIP 后，双击 starbridge.exe 打开设备中心；同账户设备可以互相连接。\n"
         "无需安装程序；请保留 runtime 和 licenses 目录。Windows 需要已安装 Microsoft Edge WebView2 Runtime。\n"
         "使用账号密码登录或注册，连接服务已内置。关闭窗口会退出客户端并停止其连接组件。\n\n"
         "账户和设备数据默认保存在当前用户的 %LOCALAPPDATA%\\StarBridge，与程序解压位置无关。\n"
-        "重新解压或移动程序可继续使用原有设备；请勿复制、删除或转发用户数据目录。分享时使用原始 ZIP。\n"
-        "开发者可用 --data-dir 指定独立测试目录；测试身份与默认设备隔离，请勿以此方式启动正式设备。\n"
-        "test-ssh.bat 使用独立的 state/controller-test 与 state/executor-test 测试数据。\n",
+        "重新解压或移动程序可继续使用原有设备；请勿复制、删除或转发用户数据目录。分享时使用原始 ZIP。\n",
         encoding="utf-8",
         newline="\n",
     )
 
-    archive = shutil.make_archive(str(args.output), "zip", args.output.parent, args.output.name)
+    archive = shutil.make_archive(str(args.output), "zip", args.output)
     print(archive)
     return 0
 
