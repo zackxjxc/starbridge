@@ -777,6 +777,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relay_only_readiness_accepts_an_initially_unknown_path() {
+        let mut fixture = ReadinessFixture::new(Some(false)).await;
+        fixture.session.policy = ConnectionPolicy::RelayOnly;
+        fixture.response.write().await["policy"] = "relay_only".into();
+        fixture.app.inner.write().await.sessions.get_mut(&fixture.session.session_id).unwrap().policy = ConnectionPolicy::RelayOnly;
+        let (app, session) = (fixture.app.clone(), fixture.session.clone());
+        let waiting = tokio::spawn(async move { app.wait_for_receiver_ready("remote", &session, 1, true).await });
+        fixture.entered.notified().await;
+        assert!(!waiting.is_finished(), "Relay-only sessions must wait for their receiver too");
+        fixture.response.write().await["receiver_ready"] = true.into();
+        tokio::time::timeout(std::time::Duration::from_secs(2), waiting).await.unwrap().unwrap().unwrap();
+        assert!(fixture.paths.read().await.iter().all(|path| path == "relay"));
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
     async fn late_receiver_ready_cannot_resume_a_cancelled_or_changed_account() {
         for change_account in [false, true] {
             let fixture = ReadinessFixture::new(Some(true)).await;
