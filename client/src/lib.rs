@@ -1094,6 +1094,9 @@ fn frpc_config(
 }
 
 fn runtime_file(runtime: &RuntimeStatus, name: &str) -> PathBuf {
+    if name == "ssh" {
+        return PathBuf::from(&runtime.ssh_path);
+    }
     let dir = FsPath::new(&runtime.frpc_path)
         .parent()
         .map(FsPath::to_path_buf)

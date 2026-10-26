@@ -439,7 +439,8 @@ pub(super) async fn components(State(app): State<ClientApp>) -> Result<Json<serd
         let path = runtime_file(&runtime,name);
         let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
         let actual = tokio::fs::read(&path).await.ok().map(|bytes|format!("{:x}",Sha256::digest(bytes)));
-        let record = manifest.as_array().and_then(|records| records.iter().find(|record|
+        let record = manifest.as_array().filter(|_| name != "ssh" || !runtime.ssh_from_system)
+            .and_then(|records| records.iter().find(|record|
             record["files"].as_array().is_some_and(|files|files.iter().any(|file|file.as_str()==Some(&filename)))));
         let expected = record.and_then(|record| record["file_sha256"][&filename].as_str());
         let (verification,message) = match (actual.as_deref(),expected) {
@@ -555,6 +556,42 @@ mod tests {
         app.shutdown().await;
         server.abort();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn component_checks_use_selected_system_ssh_without_requiring_a_bundled_copy() {
+        let (app, root, _, server) = fixture("refresh").await;
+        let runtime_dir = root.join("runtime");
+        let system_dir = root.join("system");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        std::fs::create_dir_all(&system_dir).unwrap();
+        let filename = if cfg!(windows) { "ssh.exe" } else { "ssh" };
+        let system_ssh = system_dir.join(filename);
+        std::fs::write(&system_ssh, b"selected system SSH").unwrap();
+        {
+            let mut inner = app.inner.write().await;
+            inner.runtime.frpc_path = runtime_dir.join(if cfg!(windows) { "frpc.exe" } else { "frpc" }).display().to_string();
+            inner.runtime.ssh_path = system_ssh.display().to_string();
+            inner.runtime.ssh_available = true;
+            inner.runtime.ssh_from_system = true;
+        }
+        for bundled_copy in [false, true] {
+            if bundled_copy {
+                std::fs::write(runtime_dir.join(filename), b"unused bundled SSH").unwrap();
+                save_json(&runtime_dir.join("runtime-manifest.json"), &serde_json::json!([{
+                    "files": [filename], "file_sha256": {filename: format!("{:x}", Sha256::digest(b"unused bundled SSH"))}
+                }])).await.unwrap();
+            }
+            // The diagnostic preflight and component list must inspect the same SSH
+            // that verify_ssh_command executes, with or without a bundled fallback.
+            assert_eq!(runtime_file(&app.inner.read().await.runtime, "ssh"), system_ssh);
+            let Json(report) = components(State(app.clone())).await.unwrap();
+            let ssh = report["files"].as_array().unwrap().iter().find(|file| file["name"] == filename).unwrap();
+            assert_eq!(ssh["path"], system_ssh.to_string_lossy().as_ref());
+            assert_eq!(ssh["sha256"], format!("{:x}", Sha256::digest(b"selected system SSH")));
+            assert_eq!(ssh["verification"], "not_verified");
+        }
+        finish(app, root, server).await;
     }
 
     #[tokio::test]
