@@ -51,6 +51,7 @@ async fn registration_response(response: reqwest::Response) -> anyhow::Result<De
     if !status.is_success() {
         // Never display response bodies or request identifiers in a device-authentication error.
         let message = match status {
+            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED => "连接服务版本过旧，尚不支持当前客户端的设备登记。请先升级连接服务，再重新登录。",
             StatusCode::CONFLICT => "设备身份存在冲突。请确认是否为本机的旧记录，再选择重新绑定；克隆电脑或独立测试请使用独立数据目录。",
             StatusCode::GONE => "此设备已被删除。请登录账号后明确重新绑定；后台不会重新添加。",
             StatusCode::UNAUTHORIZED => "账号或设备验证失败，请重新登录；重新绑定需要再次验证账号密码。",
@@ -134,16 +135,17 @@ async fn authenticate_account(app: &ClientApp, form: LoginForm, registering: boo
         inner.identity = selected;
         inner.auth = Some(auth.clone());
         inner.device_rebind_required = false;
-        inner.stage = "online".into();
+        inner.stage = "registering".into();
         inner.last_error = None;
         if form.remember { save_auth(&inner.root, &auth).await.map_err(ApiError::internal)?; }
     }
     drop(_gate);
     if let Err(error) = app.refresh_devices().await {
         let mut inner = app.inner.write().await;
+        if inner.auth_generation != generation { return Err(ApiError::bad_request("登录已取消")); }
         inner.device_rebind_required = matches!(registration_status(&error),
             Some(StatusCode::CONFLICT | StatusCode::GONE | StatusCode::FORBIDDEN));
-        inner.stage = "device_verification_required".into();
+        inner.stage = if inner.device_rebind_required { "device_verification_required" } else { "device_registration_failed" }.into();
         inner.last_error = Some(error.to_string());
     }
     Ok(Json(snapshot(&*app.inner.read().await)))
@@ -292,6 +294,14 @@ pub(super) async fn update_device(
         return Err(ApiError::bad_request("名称不能为空且最多 80 字，用途最多 240 字"));
     }
     let (auth, url, node) = app.auth_context().await?;
+    {
+        let inner = app.inner.read().await;
+        if inner.device_rebind_required || matches!(inner.stage.as_str(), "registering" | "device_registration_failed")
+            || !inner.devices.iter().any(|device| device.node_id == node.node_id) {
+            return Err(ApiError::new(StatusCode::CONFLICT, inner.last_error.clone()
+                .unwrap_or_else(|| "本机尚未完成设备登记，请等待登记成功后再修改设备信息。".into())));
+        }
+    }
     let response = app.http.put(format!("{url}/api/v1/devices/{}", form.node_id))
         .bearer_auth(auth.access_token)
         .json(&serde_json::json!({"display_name":name,"purpose":form.purpose.trim()}))
@@ -476,6 +486,104 @@ mod tests {
         let mut target = target.inner.write().await;
         target.identity.machine_key = source.identity.machine_key.clone();
         tokio::fs::copy(source.root.join("machine.json"), target.root.join("machine.json")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unsupported_identification_is_visible_and_cannot_save_an_unregistered_device() {
+        for status in [StatusCode::NOT_FOUND, StatusCode::METHOD_NOT_ALLOWED] {
+            let root = std::env::temp_dir().join(format!("starbridge-old-server-{}", uuid::Uuid::new_v4()));
+            let app = ClientApp::load(Role::Peer, root.clone()).await.unwrap();
+            let forbidden_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let register_calls = forbidden_calls.clone();
+            let metadata_calls = forbidden_calls.clone();
+            let routes = Router::new()
+                .route("/api/v1/auth/login", post(|| async { Json(AuthResponse {
+                    access_token: "fixture".into(), username: "alice".into(), expires_at: u64::MAX,
+                    refresh_token: None, refresh_expires_at: None,
+                }) }))
+                .route("/api/v1/devices", get(|| async { Json(Vec::<DeviceInfo>::new()) }))
+                .route("/api/v1/devices/identify", post(move || async move { status }))
+                .route("/api/v1/devices/register", post(move || {
+                    register_calls.fetch_add(1, Ordering::SeqCst);
+                    async { StatusCode::INTERNAL_SERVER_ERROR }
+                }))
+                .route("/api/v1/devices/{id}", axum::routing::put(move || {
+                    metadata_calls.fetch_add(1, Ordering::SeqCst);
+                    async { StatusCode::NOT_FOUND }
+                }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            app.inner.write().await.config.server_url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, routes).await.unwrap(); });
+            let state = sign_in(&app, "alice").await;
+            assert!(state.logged_in);
+            assert_eq!(state.stage, "device_registration_failed");
+            assert!(state.last_error.as_deref().unwrap().contains("连接服务版本过旧"));
+            assert!(!state.device_rebind_required);
+            assert!(state.devices.is_empty());
+            let error = update_device(State(app.clone()), Json(DeviceMetadataForm {
+                node_id: state.node_id, display_name: "新名称".into(), purpose: "新备注".into(),
+            })).await.unwrap_err();
+            assert_eq!(error.status, StatusCode::CONFLICT);
+            assert!(error.message.contains("连接服务版本过旧"));
+            assert_eq!(forbidden_calls.load(Ordering::SeqCst), 0);
+            let mut cached = serde_json::to_value(device_registration(&*app.inner.read().await)).unwrap();
+            cached["account"] = "alice".into();
+            cached["online"] = true.into();
+            cached["last_heartbeat"] = now_unix().into();
+            {
+                let mut inner = app.inner.write().await;
+                inner.devices = vec![serde_json::from_value(cached).unwrap()];
+                inner.stage = "online".into();
+                inner.last_error = None;
+            }
+            app.heartbeat_loop().await;
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    if app.inner.read().await.last_error.is_some() { break; }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
+            let state = snapshot(&*app.inner.read().await);
+            assert_eq!(state.devices.len(), 1);
+            assert_eq!(state.stage, "device_registration_failed");
+            assert!(state.last_error.as_deref().unwrap().contains("连接服务版本过旧"));
+            let error = update_device(State(app.clone()), Json(DeviceMetadataForm {
+                node_id: state.node_id, display_name: "缓存设备新名称".into(), purpose: "新备注".into(),
+            })).await.unwrap_err();
+            assert_eq!(error.status, StatusCode::CONFLICT);
+            assert!(error.message.contains("连接服务版本过旧"));
+            assert_eq!(forbidden_calls.load(Ordering::SeqCst), 0);
+            app.shutdown().await;
+            server.abort();
+            let _ = server.await;
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_devices_share_names_and_notes_after_metadata_updates() {
+        let fixture = Fixture::new().await;
+        let first = fixture.client("first-computer").await;
+        let second = fixture.client("second-computer").await;
+        let first_id = sign_in(&first, "alice").await.node_id;
+        let second_id = sign_in(&second, "alice").await.node_id;
+        assert_ne!(first_id, second_id);
+        let updated = update_device(State(first.clone()), Json(DeviceMetadataForm {
+            node_id: first_id.clone(), display_name: "宿主机".into(), purpose: "工作电脑".into(),
+        })).await.unwrap().0;
+        assert_eq!(updated.display_name, "宿主机");
+        assert_eq!(updated.purpose, "工作电脑");
+        let visible = second.refresh_devices().await.unwrap();
+        let peer = visible.iter().find(|device| device.node_id == first_id).unwrap();
+        assert_eq!((&*peer.display_name, &*peer.purpose), ("宿主机", "工作电脑"));
+        let _ = update_device(State(second.clone()), Json(DeviceMetadataForm {
+            node_id: second_id.clone(), display_name: "虚拟机".into(), purpose: "测试环境".into(),
+        })).await.unwrap();
+        let visible = first.refresh_devices().await.unwrap();
+        assert_eq!(visible.len(), 2);
+        let peer = visible.iter().find(|device| device.node_id == second_id).unwrap();
+        assert_eq!((&*peer.display_name, &*peer.purpose), ("虚拟机", "测试环境"));
+        fixture.cleanup(vec![first, second]).await;
     }
 
     #[tokio::test]

@@ -111,6 +111,9 @@
   }
   const s = () => ui.snapshot;
   const localId = () => s()?.node_id;
+  const localRegistered = () => !!s()?.logged_in && !s()?.device_rebind_required
+    && !['registering', 'device_registration_failed'].includes(s()?.stage)
+    && (s()?.devices || []).some(item => item.node_id === localId());
   const sessions = () => (s()?.sessions || []).filter(session => activeStates.has(session.status));
   const outgoing = () => sessions().filter(session => session.initiator_node_id === localId());
   const incoming = () => sessions().filter(session => session.target_node_id === localId());
@@ -145,6 +148,7 @@
   }
   function blockReason(item) {
     if (!item || item.node_id === localId()) return '这是本机。';
+    if (!localRegistered()) return '本机尚未完成设备登记，请先处理登记提示。';
     if (testBusy()) return '连接测试进行中，请等待测试结束。';
     if (incoming().length || device(localId())?.occupancy === 'incoming') return '本机正被其他设备连接，请先终止连接。';
     if (sessionFor(item.node_id)) return '';
@@ -156,6 +160,7 @@
   }
   function stateFor(item) {
     if (item.node_id === localId()) {
+      if (!localRegistered()) return { text: s()?.last_error ? '设备未登记' : '正在登记', tone: s()?.last_error ? 'bad' : 'warn' };
       if (testBusy()) return { text: test().state === 'cleaning' ? '正在结束测试' : '连接测试中', tone: 'warn' };
       const inbound = incoming()[0];
       if (inbound) return inbound.status === 'connected'
@@ -203,6 +208,7 @@
   }
   const testTone = () => testState() === 'passed' ? 'good' : ['failed', 'cleanup_failed'].includes(testState()) ? 'bad' : testBusy() ? 'warn' : 'muted';
   function testGate() {
+    if (!localRegistered()) return '本机尚未完成设备登记，请先处理登记提示。';
     if (testBusy()) return '';
     if (hasWork()) return '请先终止现有连接及连接任务，再开始测试。';
     if (s()?.allow_relay === false || s()?.direct_only === true) return '当前策略不允许中转，本机连接测试尚未验证。';
@@ -255,7 +261,7 @@
     const shown = all.filter(item => `${item.display_name || ''} ${item.purpose || ''}`.toLocaleLowerCase().includes(query))
       .sort((a, b) => rank(a) - rank(b) || (a.display_name || '').localeCompare(b.display_name || '', 'zh-CN') || a.node_id.localeCompare(b.node_id));
     return h('aside', { class: 'list-pane', 'aria-label': '我的设备', 'data-key': 'list-pane' },
-      h('div', { class: 'list-head' }, h('div', { class: 'list-title' }, h('h2', {}, '我的设备'), h('span', { class: 'muted' }, `在线 ${all.filter(item => item.online).length + 1} · 离线 ${all.filter(item => !item.online).length}`)),
+      h('div', { class: 'list-head' }, h('div', { class: 'list-title' }, h('h2', {}, '我的设备'), h('span', { class: 'muted' }, `在线 ${all.filter(item => item.online).length + Number(localRegistered())} · 离线 ${all.filter(item => !item.online).length}`)),
         h('label', { class: 'search' }, icon('search'), h('input', { type: 'search', id: 'device-search', value: ui.query, placeholder: '搜索名称或用途', 'aria-label': '搜索设备名称或用途', autocomplete: 'off' }))),
       h('div', { class: 'local-block' }, row(device(localId()), true), button(`连接测试 · ${testLabel()}`, 'test', { class: `local-test ${testTone()}`, 'aria-label': `连接测试，${testLabel()}` })),
       h('div', { class: 'device-list', 'data-key': 'device-list', 'aria-label': '其他设备' }, shown.length ? shown.map(item => row(item)) : h('div', { class: 'empty' }, query ? '没有匹配的设备' : '登录其他电脑后，设备会显示在这里。')),
@@ -274,8 +280,8 @@
       local ? field('本机名称', 'device-display-name', draft.display_name, { name: 'display_name', maxlength: 80, required: true, 'data-draft': item.node_id }) : null,
       field('用途备注', 'device-purpose', draft.purpose, { name: 'purpose', maxlength: 500, placeholder: '例如：开发环境、文件整理', 'data-draft': item.node_id, multiline: true }),
       h('div', { class: 'actions device-edit-actions' },
-        button(ui.busy.has('metadata') ? '正在保存…' : '保存修改', '', { type: 'submit', disabled: ui.busy.has('metadata') || !ui.drafts.has(item.node_id) }),
-        button('删除设备', 'delete-device', { class: 'button danger', 'data-id': item.node_id, disabled: ui.busy.has('delete-device') })));
+        button(ui.busy.has('metadata') ? '正在保存…' : '保存修改', '', { type: 'submit', disabled: !localRegistered() || ui.busy.has('metadata') || !ui.drafts.has(item.node_id) }),
+        button('删除设备', 'delete-device', { class: 'button danger', 'data-id': item.node_id, disabled: !localRegistered() || ui.busy.has('delete-device') })));
   }
   function devicePage() {
     const item = device(ui.selected); if (!item) return h('div', { class: 'empty' }, '这台设备已不在账号列表中。');
@@ -344,7 +350,7 @@
   function allPage() {
     const batch = s()?.batch;
     if (batch && !ui.allConfig) return batchPage(batch);
-    const counts = plan(); const locked = testBusy() || incoming().length > 0 || device(localId())?.occupancy === 'incoming';
+    const counts = plan(); const locked = !localRegistered() || testBusy() || incoming().length > 0 || device(localId())?.occupancy === 'incoming';
     return h('div', { 'data-key': 'all-config' }, heading('连接所有设备', `账号下除本机外的全部 ${peers().length} 台设备，搜索不会改变连接范围。`),
       modeOptions(!!batch?.running),
       h('p', { class: 'muted' }, '两种模式都需要登录和连接协商。仅限直连限制连接数据路径。'),
@@ -355,7 +361,7 @@
         counts.relay && !ui.rebuild ? summaryLine('保留现有中转', `${counts.relay} 台（不计本次直连成功）`) : null,
         summaryLine('跳过设备', `${counts.skip} 台`), counts.skip ? h('p', { class: 'muted' }, `离线 ${counts.offline} · 已被其他设备连接 ${counts.occupied}${counts.ending ? ` · 正在结束连接 ${counts.ending}` : ''} · 其他不可连接 ${counts.unsupported}`) : null),
       h('div', { class: 'bottom' }, ui.policy === 'direct_only' && ui.rebuild && counts.relay ? banner('现有 SSH 会中断', '点击开始后会断开已有中转连接。直连失败不回退，请确认相关工作已保存。', 'warn') : null,
-        locked ? h('p', { class: 'warn small' }, testBusy() ? '连接测试进行中，结束后可以连接设备。' : '本机正在接收连接，请先终止该连接。') : null,
+        locked ? h('p', { class: 'warn small' }, !localRegistered() ? '本机尚未完成设备登记，请先处理登记提示。' : testBusy() ? '连接测试进行中，结束后可以连接设备。' : '本机正在接收连接，请先终止该连接。') : null,
         button(batch?.running ? '查看连接进度' : ui.busy.has('connect-all') ? '正在开始…' : '开始连接', batch?.running ? 'all-progress' : 'start-all', { class: 'button primary wide', disabled: !batch?.running && (locked || !peers().length || ui.busy.has('connect-all')) })),
       allConnectionActions());
   }
@@ -514,7 +520,13 @@
         button('复制给 AI', 'copy-export', { class: 'button primary', disabled: ui.busy.has('export') || !!ui.syncError || !currentFingerprint }, 'copy')));
   }
   function renderDetail() {
-    return h('div', {}, rebindNotice(), ({ device: devicePage, configure: configurePage, all: allPage, history: historyPage, test: testPage, components: componentsPage, export: exportPage })[ui.view]?.() || devicePage());
+    return h('div', {}, registrationNotice(), rebindNotice(), ({ device: devicePage, configure: configurePage, all: allPage, history: historyPage, test: testPage, components: componentsPage, export: exportPage })[ui.view]?.() || devicePage());
+  }
+  function registrationNotice() {
+    if (localRegistered() || s()?.device_rebind_required) return null;
+    return h('div', { class: 'banner warn', 'data-key': 'device-registration-notice', role: 'alert' },
+      h('p', { class: 'banner-title' }, '账号已登录，本机尚未完成登记'),
+      h('p', { 'data-copyable': s()?.last_error ? '' : undefined }, s()?.last_error ? message(s().last_error) : '正在登记本机，完成后才能修改设备信息和建立连接。'));
   }
   function rebindNotice() {
     if (!s()?.device_rebind_required) return null;
@@ -555,8 +567,8 @@
     if (!s().logged_in) { patchChildren(root, [authPage()]); return; }
     const content = h('div', { class: 'shell', 'data-key': 'main-shell' }, header(true), h('div', { class: 'workspace' }, sidebar(),
       h('main', { class: `detail${ui.view === 'device' && ui.selected === localId() ? ' local-detail' : ''}`, 'data-key': `detail-${ui.view}-${ui.selected || ''}`, 'aria-label': '设备详情与操作' }, renderDetail())),
-      h('footer', { class: 'footbar' }, h('span', { class: ui.syncError || s().stage === 'heartbeat_failed' ? 'bad' : '', title: s().stage === 'heartbeat_failed' ? '暂时无法更新账号设备状态，请检查网络连接。' : undefined },
-        ui.syncError ? '状态更新失败，正在重试；复制操作暂不可用。' : s().stage === 'heartbeat_failed' ? '暂时无法更新账号设备状态，正在重试。' : `在线设备 ${peers().filter(item => item.online).length + 1} · SSH 已就绪 ${readySessions().length}`),
+      h('footer', { class: 'footbar' }, h('span', { class: !localRegistered() || ui.syncError || s().stage === 'heartbeat_failed' ? 'bad' : '', title: s().stage === 'heartbeat_failed' ? '暂时无法更新账号设备状态，请检查网络连接。' : undefined },
+        !localRegistered() ? '本机尚未登记，设备同步与连接暂不可用。' : ui.syncError ? '状态更新失败，正在重试；复制操作暂不可用。' : s().stage === 'heartbeat_failed' ? '暂时无法更新账号设备状态，正在重试。' : `在线设备 ${peers().filter(item => item.online).length + 1} · SSH 已就绪 ${readySessions().length}`),
         ui.syncError ? button('重新读取', 'retry', { class: 'link' }) : null));
     patchChildren(root, [content]);
   }
@@ -615,8 +627,8 @@
     const isLocal = id === localId(); const active = !!sessionFor(id) || workingStates.has(operation(id)?.state);
     menu.replaceChildren(...[
       !isLocal ? button(active ? '终止连接' : '连接设备', active ? 'terminate-one' : 'configure', { role: 'menuitem', 'data-id': id, disabled: !active && !!blockReason(item) }) : null,
-      button('重命名设备', 'rename', { role: 'menuitem', 'data-id': id }),
-      button('删除设备', 'delete-device', { role: 'menuitem', class: 'danger', 'data-id': id, disabled: ui.busy.has('delete-device') }),
+      button('重命名设备', 'rename', { role: 'menuitem', 'data-id': id, disabled: !localRegistered() }),
+      button('删除设备', 'delete-device', { role: 'menuitem', class: 'danger', 'data-id': id, disabled: !localRegistered() || ui.busy.has('delete-device') }),
     ].filter(Boolean));
     ui.menuNode = id; ui.menuReturn = document.activeElement; menu.hidden = false;
     menu.style.left = `${Math.max(6, Math.min(x, innerWidth - menu.offsetWidth - 6))}px`;

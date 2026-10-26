@@ -461,7 +461,10 @@ impl ClientApp {
                     } else {
                         let mut inner = app.inner.write().await;
                         if matches!(status, Some(StatusCode::CONFLICT | StatusCode::FORBIDDEN)) { inner.device_rebind_required = true; }
-                        inner.stage = "heartbeat_failed".into(); inner.last_error = Some(error.to_string());
+                        inner.stage = if matches!(status, Some(StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED)) {
+                            "device_registration_failed"
+                        } else { "heartbeat_failed" }.into();
+                        inner.last_error = Some(error.to_string());
                     }
                 }
             }
