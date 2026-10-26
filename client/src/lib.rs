@@ -237,7 +237,7 @@ impl ClientApp {
         }
         let pending_closes = load_json(&root.join("pending-closes.json"), HashSet::new()).await?;
         let restoring = auth.is_some();
-        let runtime = runtime_status(&root);
+        let runtime = runtime_status(&root).await;
         let app = Self {
             inner: Arc::new(RwLock::new(Inner {
                 role: Role::Peer,
@@ -916,9 +916,7 @@ fn session_ssh_command(inner: &Inner, session: &SessionInfo) -> Option<String> {
     inner.visitor_ports.get(&session.session_id)?;
     let target = inner.devices.iter().find(|device| device.node_id == session.target_node_id)?;
     let config = std::path::absolute(inner.root.join("ssh").join("sessions").join(&session.session_id).join("config")).ok()?;
-    let executable = if FsPath::new(&inner.runtime.ssh_path).is_file() {
-        std::path::absolute(&inner.runtime.ssh_path).ok()?.display().to_string()
-    } else { "ssh".into() };
+    let executable = std::path::absolute(&inner.runtime.ssh_path).ok()?.display().to_string();
     if cfg!(windows) {
         Some(format!("& '{}' -F '{}' '{}'", executable.replace('\'', "''"),
             config.display().to_string().replace('\'', "''"), target.ssh_alias.replace('\'', "''")))
@@ -928,13 +926,13 @@ fn session_ssh_command(inner: &Inner, session: &SessionInfo) -> Option<String> {
     }
 }
 
-fn runtime_status(root: &FsPath) -> RuntimeStatus {
+async fn runtime_status(root: &FsPath) -> RuntimeStatus {
     let executable = std::env::current_exe().ok();
     let runtime = runtime_directory(root, executable.as_deref().and_then(FsPath::parent));
     let frpc = runtime.join(if cfg!(windows) { "frpc.exe" } else { "frpc" });
-    let ssh = runtime.join(if cfg!(windows) { "ssh.exe" } else { "ssh" });
+    let bundled_ssh = runtime.join(if cfg!(windows) { "ssh.exe" } else { "ssh" });
     let frpc_available = frpc.is_file();
-    let ssh_available = ssh.is_file() || command_available("ssh");
+    let (ssh, ssh_available) = select_ssh_client(command_path("ssh"), bundled_ssh, ssh_client_available).await;
     RuntimeStatus {
         frpc_path: frpc.display().to_string(),
         frpc_available,
@@ -946,6 +944,26 @@ fn runtime_status(root: &FsPath) -> RuntimeStatus {
             "缺少 frpc，连接只能验证控制面".into()
         },
     }
+}
+
+async fn select_ssh_client<F, Fut>(system: Option<PathBuf>, bundled: PathBuf, mut probe: F) -> (PathBuf, bool)
+where
+    F: FnMut(PathBuf) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    if let Some(system) = system {
+        if probe(system.clone()).await { return (system, true); }
+    }
+    let available = probe(bundled.clone()).await;
+    (bundled, available)
+}
+
+async fn ssh_client_available(executable: PathBuf) -> bool {
+    // 实际启动而非只检查文件存在；超时后 kill_on_drop 会终止检测进程。
+    matches!(tokio::time::timeout(std::time::Duration::from_secs(3),
+        async_command(executable).arg("-V").stdin(Stdio::null())
+            .stdout(Stdio::null()).stderr(Stdio::null()).status()
+    ).await, Ok(Ok(status)) if status.success())
 }
 
 fn runtime_directory(root: &FsPath, executable_dir: Option<&FsPath>) -> PathBuf {
@@ -1183,18 +1201,18 @@ fn privilege_label(privilege: SshPrivilege) -> &'static str {
     }
 }
 
-fn command_available(name: &str) -> bool {
+fn command_path(name: &str) -> Option<PathBuf> {
     let directories: Vec<_> = std::env::var_os("PATH")
         .into_iter()
         .flat_map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
         .collect();
-    directories.into_iter().any(|dir| {
-        dir.join(if cfg!(windows) {
+    directories.into_iter().find_map(|dir| {
+        let path = dir.join(if cfg!(windows) {
             format!("{name}.exe")
         } else {
             name.into()
-        })
-        .is_file()
+        });
+        path.is_file().then(|| std::path::absolute(path).ok()).flatten()
     })
 }
 
@@ -1313,6 +1331,48 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn usable_system_ssh_is_preferred_without_probing_bundle() {
+        let system = PathBuf::from("system/ssh");
+        let (selected, available) = select_ssh_client(Some(system.clone()), "bundle/ssh".into(), |path| {
+            assert_eq!(path, system);
+            std::future::ready(true)
+        }).await;
+        assert_eq!(selected, system);
+        assert!(available);
+    }
+
+    #[tokio::test]
+    async fn missing_or_broken_system_ssh_falls_back_to_bundle() {
+        let bundled = PathBuf::from("bundle/ssh");
+        for system in [None, Some(PathBuf::from("broken/ssh"))] {
+            let mut probed = Vec::new();
+            let (selected, available) = select_ssh_client(system.clone(), bundled.clone(), |path| {
+                let works = path == bundled;
+                probed.push(path);
+                std::future::ready(works)
+            }).await;
+            assert_eq!(selected, bundled);
+            assert!(available);
+            assert_eq!(probed, system.into_iter().chain([bundled.clone()]).collect::<Vec<_>>());
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_ssh_clients_are_not_reported_as_ready() {
+        let bundled = PathBuf::from("bundle/ssh");
+        let (selected, available) = select_ssh_client(Some("broken/ssh".into()), bundled.clone(), |_| {
+            std::future::ready(false)
+        }).await;
+        assert_eq!(selected, bundled);
+        assert!(!available);
+
+        let missing = std::env::temp_dir().join(format!("starbridge-missing-{}", uuid::Uuid::new_v4()));
+        assert!(!ssh_client_available(missing).await);
+        // 测试程序不接受 -V，会以非零状态退出。
+        assert!(!ssh_client_available(std::env::current_exe().unwrap()).await);
+    }
 
     #[test]
     fn portable_runtime_preserves_instance_and_shared_overrides() {

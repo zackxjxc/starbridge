@@ -117,7 +117,7 @@ StarBridge-test/
 /opt/starbridge/runtime-manifest.json
 ```
 
-运行时只允许 StarBridge 启动发布目录中已经校验过的子组件，并使用绝对路径。用户可以选择使用系统已有的 `ssh`/`sftp`，但 UI 必须显示实际路径和版本；FRP 版本由 StarBridge 发布包固定，不从系统 PATH 随意拾取。
+运行时只允许 StarBridge 启动发布目录中已经校验过的子组件，并使用绝对路径。SSH 客户端启动时先按系统 PATH 定位 `ssh`，实际执行 `-V` 检测（限时 3 秒）；系统 SSH 缺失、启动失败、退出码非零或超时，才检测并使用包内 SSH。自动登录验证和导出的连接命令统一使用检测选定的路径；两者均不可用时不报告 SSH 就绪。用户可以选择使用系统已有的 `ssh`/`sftp`，但 UI 必须显示实际路径和版本；FRP 版本由 StarBridge 发布包固定，不从系统 PATH 随意拾取。
 
 ## 平台策略
 

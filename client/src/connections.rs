@@ -622,8 +622,8 @@ impl ClientApp {
 pub(super) async fn verify_ssh_command(runtime: &RuntimeStatus, config: &FsPath, alias: &str, marker: &str)
     -> anyhow::Result<()>
 {
-    let executable = if FsPath::new(&runtime.ssh_path).is_file() { PathBuf::from(&runtime.ssh_path) } else { PathBuf::from("ssh") };
-    let result = tokio::time::timeout(std::time::Duration::from_secs(7), async_command(executable)
+    anyhow::ensure!(runtime.ssh_available, "系统 SSH 和包内 SSH 均不可用");
+    let result = tokio::time::timeout(std::time::Duration::from_secs(7), async_command(&runtime.ssh_path)
         .args(["-T", "-o", "BatchMode=yes", "-o", "ConnectionAttempts=1", "-o", "ConnectTimeout=4",
             "-o", "ServerAliveInterval=2", "-o", "ServerAliveCountMax=1", "-F"])
         .arg(config).arg(alias).arg(format!("echo {marker}"))
