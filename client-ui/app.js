@@ -16,6 +16,7 @@
     policy: 'direct_preferred', rebuild: false, allConfig: true, failureGroup: null,
     components: null, exportData: null, exportIds: [], exportFingerprint: '', exportBack: 'device',
     historyItems: [], historyTotal: 0, historyOffset: 0, historyLoaded: false, historyError: '', historyRequest: 0,
+    historyDirection: 'all', historyFailed: false, historyAscending: false, historyExpanded: null,
     epoch: 0, poll: null, request: 0, applied: 0, mutating: 0, mutation: 0, mutationApplied: 0, menuNode: null, menuReturn: null, modalKind: null,
   };
   const routes = {
@@ -419,23 +420,62 @@
   function historyPage() {
     const loading = ui.busy.has('history');
     const statusLabels = { negotiating: '协商中', connected: '已建立', closed: '已结束', failed: '连接失败' };
-    return h('div', { 'data-key': 'history-page' }, heading('连接记录', '查看这台电脑连接过的设备，以及连接过这台电脑的设备。'),
-      h('div', { class: 'backline' }, h('span', { class: 'muted' }, ui.historyLoaded ? `已显示 ${ui.historyItems.length} / ${ui.historyTotal} 条，按发起时间从近到远排列` : '按发起时间从近到远排列'),
-        button(loading ? '正在读取…' : '刷新记录', 'history-refresh', { class: 'link', disabled: loading }, 'refresh')),
-      ui.historyError ? banner('连接记录读取失败', ui.historyError, 'warn', true) : null,
-      ui.historyItems.length ? h('ol', { class: 'history-list', 'aria-label': '本机连接记录' }, ui.historyItems.map(item =>
-        h('li', { class: 'history-entry', 'data-key': item.session_id },
-          h('div', { class: 'history-title' }, h('strong', {}, item.peer_name || '已删除的设备'),
-            h('span', { class: item.status === 'failed' ? 'bad' : 'muted' }, statusLabels[item.status] || '状态未知')),
-          h('p', {}, item.direction === 'incoming' ? '对方连接本机' : '本机连接对方'),
-          h('p', { class: 'muted' }, `发起时间：${formatTime(item.created_at) || '未记录'} · ${item.path === 'unknown' ? '连接方式未确定' : pathLabel(item.path)}`),
-          item.failure_reason ? h('p', { class: 'history-reason', 'data-copyable': '' }, message(item.failure_reason)) : null)))
-        : !ui.historyError ? h('p', { class: 'empty' }, loading ? '正在读取连接记录…' : ui.historyLoaded ? '这台电脑还没有连接记录。' : '尚未读取连接记录。') : null,
-      ui.historyLoaded && ui.historyOffset < ui.historyTotal ? button(loading ? '正在读取…' : '加载更多', 'history-more', { class: 'button wide', disabled: loading }) : null);
+    const filtered = ui.historyItems.filter(item => (ui.historyDirection === 'all' || item.direction === ui.historyDirection)
+      && (!ui.historyFailed || item.status === 'failed'));
+    const items = ui.historyAscending ? [...filtered].reverse() : filtered;
+    const localName = device(localId())?.display_name || '这台电脑';
+    const connectionPath = item => ({ direct: '直连', relay: '中转' })[item.path] || '方式未确定';
+    const rows = items.flatMap(item => {
+      const peer = item.peer_name || '已删除的设备'; const incoming = item.direction === 'incoming';
+      const expanded = ui.historyExpanded === item.session_id;
+      const detailsId = `history-details-${encodeURIComponent(item.session_id)}`;
+      return [h('tr', { 'data-key': `history-row-${item.session_id}`, class: expanded ? 'history-selected' : '' },
+        h('td', { class: 'history-time' }, formatTime(item.created_at) || '未记录'),
+        h('td', { class: incoming ? '' : 'history-local', title: incoming ? peer : localName }, incoming ? peer : '本机'),
+        h('td', { class: 'history-arrow', 'aria-label': '连接至' }, '→'),
+        h('td', { class: incoming ? 'history-local' : '', title: incoming ? localName : peer }, incoming ? '本机' : peer),
+        h('td', {}, connectionPath(item)),
+        h('td', {}, h('span', { class: `history-status${item.status === 'failed' ? ' bad' : item.status === 'connected' ? ' good' : ''}` }, statusLabels[item.status] || '状态未知')),
+        h('td', { class: 'history-action' }, button(expanded ? '收起' : item.failure_reason ? '查看原因' : '详情', 'history-details',
+          { class: 'link', 'data-session': item.session_id, 'aria-expanded': String(expanded), 'aria-controls': detailsId,
+            'aria-label': `${expanded ? '收起' : '查看'}${peer}的连接记录详情` }))),
+      h('tr', { 'data-key': `history-details-${item.session_id}`, hidden: !expanded }, h('td', { colspan: '7', class: 'history-detail-cell' },
+        h('div', { id: detailsId, class: 'history-details' },
+          h('p', {}, `${incoming ? `${peer} → 本机` : `本机 → ${peer}`} · ${connectionPath(item)} · ${statusLabels[item.status] || '状态未知'}`),
+          h('p', { class: 'muted' }, `发起时间：${formatTime(item.created_at) || '未记录'}`),
+          item.failure_reason ? h('p', { class: 'history-reason', 'data-copyable': '' }, message(item.failure_reason)) : null)))];
+    });
+    const count = ui.historyLoaded ? `显示 ${items.length} 条 · 已加载 ${ui.historyItems.length} / ${ui.historyTotal} 条` : loading ? '正在读取连接记录…' : '尚未读取连接记录';
+    return h('main', { class: 'history-page', 'data-key': 'history-page', 'aria-label': '这台电脑的连接记录' },
+      h('div', { class: 'history-top', 'data-key': 'history-top' }, button('返回设备', 'device', { class: 'link' }, 'back'),
+        button(loading ? '正在读取…' : '刷新记录', 'history-refresh', { disabled: loading }, 'refresh')),
+      heading('这台电脑的连接记录', `${localName}（本机）参与的全部连接，包含本机发起和接收的连接。`),
+      h('div', { class: 'history-toolbar', 'data-key': 'history-toolbar' },
+        h('div', { class: 'history-directions', role: 'group', 'aria-label': '连接方向' },
+          [['all', '全部'], ['outgoing', '我发起的'], ['incoming', '连接我的']].map(([value, label]) =>
+            button(label, 'history-direction', { class: 'history-filter', 'data-direction': value, 'aria-pressed': String(ui.historyDirection === value) }))),
+        h('label', { class: 'history-failed' }, h('input', { id: 'history-failed', type: 'checkbox', checked: ui.historyFailed }), '只看失败'),
+        h('span', { class: 'muted' }, '筛选与排序仅针对已加载记录')),
+      h('div', { 'data-key': 'history-notices' }, registrationNotice(), rebindNotice()),
+      ui.historyError ? h('div', { 'data-key': 'history-error' }, banner('连接记录读取失败', ui.historyError, 'warn', true)) : null,
+      h('div', { class: 'history-records', 'data-key': 'history-records' },
+        items.length ? h('table', { class: 'history-table', 'aria-label': '本机参与的连接记录' },
+          h('thead', {}, h('tr', {},
+            h('th', { scope: 'col', 'aria-sort': ui.historyAscending ? 'ascending' : 'descending' },
+              button(`发起时间 ${ui.historyAscending ? '↑' : '↓'}`, 'history-sort', { class: 'link', 'aria-label': `发起时间，当前从${ui.historyAscending ? '远到近' : '近到远'}排列` })),
+            h('th', { scope: 'col' }, '发起设备'), h('th', { scope: 'col', class: 'history-arrow', 'aria-label': '连接方向' }),
+            h('th', { scope: 'col' }, '接收设备'), h('th', { scope: 'col' }, '方式'), h('th', { scope: 'col' }, '记录状态'), h('th', { scope: 'col', class: 'history-action' }, '详情'))),
+          h('tbody', {}, rows))
+          : h('p', { class: 'empty', role: 'status' }, loading ? '正在读取连接记录…' : ui.historyError ? '记录暂时无法读取，请刷新重试。'
+            : !ui.historyLoaded ? '尚未读取连接记录。' : ui.historyItems.length ? '已加载记录中没有符合条件的记录。' : '这台电脑还没有连接记录。')),
+      h('div', { class: 'history-bottom', 'data-key': 'history-bottom' }, h('span', { class: 'muted', 'aria-live': 'polite' }, count),
+        ui.historyLoaded && ui.historyOffset < ui.historyTotal ? button(loading ? '正在读取…' : '加载更多', 'history-more', { disabled: loading }) : null),
+      h('p', { class: 'muted history-note', 'data-key': 'history-note' }, '状态为最近一次读取的记录；当前连接请返回设备查看。'));
   }
   function resetHistory() {
     ++ui.historyRequest; ui.historyItems = []; ui.historyTotal = 0; ui.historyOffset = 0;
     ui.historyLoaded = false; ui.historyError = ''; ui.busy.delete('history');
+    ui.historyDirection = 'all'; ui.historyFailed = false; ui.historyAscending = false; ui.historyExpanded = null;
   }
   async function loadHistory(append = false) {
     if (ui.busy.has('history') || !s()?.logged_in) return;
@@ -520,7 +560,7 @@
         button('复制给 AI', 'copy-export', { class: 'button primary', disabled: ui.busy.has('export') || !!ui.syncError || !currentFingerprint }, 'copy')));
   }
   function renderDetail() {
-    return h('div', {}, registrationNotice(), rebindNotice(), ({ device: devicePage, configure: configurePage, all: allPage, history: historyPage, test: testPage, components: componentsPage, export: exportPage })[ui.view]?.() || devicePage());
+    return h('div', {}, registrationNotice(), rebindNotice(), ({ device: devicePage, configure: configurePage, all: allPage, test: testPage, components: componentsPage, export: exportPage })[ui.view]?.() || devicePage());
   }
   function registrationNotice() {
     if (localRegistered() || s()?.device_rebind_required) return null;
@@ -565,7 +605,7 @@
     }
     root.setAttribute('aria-busy', 'false');
     if (!s().logged_in) { patchChildren(root, [authPage()]); return; }
-    const content = h('div', { class: 'shell', 'data-key': 'main-shell' }, header(true), h('div', { class: 'workspace' }, sidebar(),
+    const content = h('div', { class: 'shell', 'data-key': 'main-shell' }, header(true), ui.view === 'history' ? historyPage() : h('div', { class: 'workspace', 'data-key': 'device-workspace' }, sidebar(),
       h('main', { class: `detail${ui.view === 'device' && ui.selected === localId() ? ' local-detail' : ''}`, 'data-key': `detail-${ui.view}-${ui.selected || ''}`, 'aria-label': '设备详情与操作' }, renderDetail())),
       h('footer', { class: 'footbar' }, h('span', { class: !localRegistered() || ui.syncError || s().stage === 'heartbeat_failed' ? 'bad' : '', title: s().stage === 'heartbeat_failed' ? '暂时无法更新账号设备状态，请检查网络连接。' : undefined },
         !localRegistered() ? '本机尚未登记，设备同步与连接暂不可用。' : ui.syncError ? '状态更新失败，正在重试；复制操作暂不可用。' : s().stage === 'heartbeat_failed' ? '暂时无法更新账号设备状态，正在重试。' : `在线设备 ${peers().filter(item => item.online).length + 1} · SSH 已就绪 ${readySessions().length}`),
@@ -589,7 +629,9 @@
       closeMenu(); if (modal.open) modal.close();
     }
     if (!ui.auth.username) ui.auth.username = snapshot.last_username || snapshot.username || '';
-    if (ui.selected && ui.selected !== snapshot.node_id && !device(ui.selected)) { ui.selected = snapshot.node_id; ui.view = 'device'; }
+    if (ui.selected && ui.selected !== snapshot.node_id && !device(ui.selected)) {
+      ui.selected = snapshot.node_id; if (ui.view !== 'history') ui.view = 'device';
+    }
     return true;
   }
   async function refresh() {
@@ -720,6 +762,11 @@
       case 'history': navigate('history'); await loadHistory(); break;
       case 'history-refresh': await loadHistory(); break;
       case 'history-more': await loadHistory(true); break;
+      case 'history-direction':
+        if (['all', 'outgoing', 'incoming'].includes(target.dataset.direction)) { ui.historyDirection = target.dataset.direction; ui.historyExpanded = null; render(); }
+        break;
+      case 'history-sort': ui.historyAscending = !ui.historyAscending; render(); break;
+      case 'history-details': ui.historyExpanded = ui.historyExpanded === target.dataset.session ? null : target.dataset.session; render(); break;
       case 'rebind-device': rebindDialog(); break;
       case 'select-device': ui.failureGroup = null; navigate('device', id, false); break;
       case 'device': navigate('device'); break;
@@ -840,6 +887,7 @@
   document.addEventListener('change', event => {
     const input = event.target;
     if (input.id === 'auth-remember') ui.auth.remember = input.checked;
+    if (input.id === 'history-failed') { ui.historyFailed = input.checked; ui.historyExpanded = null; render(); }
     if (input.name === 'connection-policy') { ui.policy = input.value; render(); }
     if (input.name === 'relay-choice') { ui.rebuild = input.value === 'rebuild'; render(); }
   });
