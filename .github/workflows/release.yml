@@ -16,6 +16,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: '0'
+  PYTHONUTF8: '1'
+  PYTHONIOENCODING: utf-8
   RUST_TOOLCHAIN: '1.94.1'
 
 jobs:
