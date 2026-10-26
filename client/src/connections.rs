@@ -225,6 +225,19 @@ impl ClientApp {
     pub(super) async fn enqueue_connection(&self, target: String, policy: ConnectionPolicy, rebuild: bool, batch_id: Option<&str>)
         -> Result<(), ApiError>
     {
+        let refresh_occupancy = {
+            let inner = self.inner.read().await;
+            inner.auth.is_some() && !inner.closing_account
+                && inner.devices.iter().any(|device| device.node_id == target
+                    && !device.occupancy.is_empty() && device.occupancy != "idle")
+                && !inner.sessions.values().any(|session| session.initiator_node_id == inner.identity.node_id
+                    && session.target_node_id == target)
+        };
+        if refresh_occupancy {
+            // A just-closed route can leave the device cache busy until the next heartbeat.
+            // Recheck the center before rejecting an immediate reconnect.
+            self.refresh_devices().await.map_err(ApiError::internal)?;
+        }
         let generation = {
             let mut inner = self.inner.write().await;
             if let Some(batch_id) = batch_id {
@@ -566,6 +579,46 @@ pub(super) async fn export_connections(State(app): State<ClientApp>, Json(form):
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cached_occupancy_is_rechecked_before_reconnect_admission() {
+        for occupancy in ["idle", "incoming"] {
+            let root = std::env::temp_dir().join(format!("starbridge-reconnect-{}", uuid::Uuid::new_v4()));
+            let app = ClientApp::load(Role::Peer, root.clone()).await.unwrap();
+            let mut value = serde_json::to_value(device_registration(&*app.inner.read().await)).unwrap();
+            value["node_id"] = "remote".into();
+            value["account"] = "user".into();
+            value["online"] = true.into();
+            value["last_heartbeat"] = now_unix().into();
+            value["occupancy"] = occupancy.into();
+            let current: DeviceInfo = serde_json::from_value(value).unwrap();
+            let mut cached = current.clone();
+            cached.occupancy = "incoming".into();
+            let registry = Router::new().route("/api/v1/devices/register", post(move || {
+                let current = current.clone();
+                async move { Json(vec![current]) }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, registry).await.unwrap(); });
+            {
+                let mut inner = app.inner.write().await;
+                inner.config.server_url = format!("http://{address}");
+                inner.auth = Some(AuthResponse { access_token: "test".into(), username: "user".into(),
+                    expires_at: u64::MAX, refresh_token: None, refresh_expires_at: None });
+                inner.devices = vec![cached];
+            }
+            // Keep admitted workers queued; this test needs no SSH or FRP processes.
+            let _slots = app.connection_slots.acquire_many(3).await.unwrap();
+            let result = app.enqueue_connection("remote".into(), ConnectionPolicy::RelayOnly, false, None).await;
+            assert_eq!(result.is_ok(), occupancy == "idle");
+            assert_eq!(app.inner.read().await.devices[0].occupancy, occupancy);
+            app.inner.write().await.auth = None;
+            app.shutdown().await;
+            server.abort();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn terminate_all_also_invalidates_targets_not_yet_enqueued() {
