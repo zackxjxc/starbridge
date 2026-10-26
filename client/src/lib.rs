@@ -232,7 +232,8 @@ impl ClientApp {
 
     pub(crate) async fn load_with_interaction(_role: Role, root: PathBuf, interaction: secure_store::Interaction) -> anyhow::Result<Self> {
         tokio::fs::create_dir_all(&root).await?;
-        let mut config = load_json(&root.join("config.json"), ClientConfig::default()).await?;
+        let mut config = load_json(&root.join("config.json"), ClientConfig::default()).await
+            .map_err(|error| error.context("本机配置无法读取，请先检查配置后重试"))?;
         let mut identity = identity::load_identity_with_interaction(&root, interaction).await?;
         let loaded_auth = load_auth_with_interaction(&root, config.remember_login, interaction).await?;
         let auth = loaded_auth.auth;
@@ -1399,6 +1400,27 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn corrupt_configuration_reports_a_translatable_error_without_changing_credentials() {
+        let root = std::env::temp_dir().join(format!("starbridge-config-error-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        for name in ["config.json", "identity.secure", "auth.secure"] {
+            std::fs::write(root.join(name), b"preserve original test contents").unwrap();
+        }
+        let error = match ClientApp::load(Role::Peer, root.clone()).await {
+            Ok(_) => panic!("corrupt configuration must block startup"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "本机配置无法读取，请先检查配置后重试");
+        assert_eq!(profile::kind(&error), profile::FailureKind::Storage);
+        assert!(error.downcast_ref::<serde_json::Error>().is_some());
+        for name in ["config.json", "identity.secure", "auth.secure"] {
+            assert_eq!(std::fs::read(root.join(name)).unwrap(), b"preserve original test contents");
+        }
+        assert!(!root.join("recovery-backups").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn usable_system_ssh_is_preferred_without_probing_bundle() {
