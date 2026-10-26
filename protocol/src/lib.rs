@@ -104,6 +104,9 @@ pub struct DeviceMetadataUpdate {
 pub struct DeviceRegistration {
     pub node_id: String,
     pub device_token: String,
+    /// Application-scoped machine lookup key; never an authentication credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_key: Option<String>,
     pub display_name: String,
     #[serde(default)]
     pub purpose: String,
@@ -126,6 +129,20 @@ pub struct DeviceRegistration {
     pub os: String,
     pub arch: String,
     pub hostname: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DeviceRegistrationResponse {
+    /// Canonical protocol record ID, including after authenticated reuse.
+    pub node_id: String,
+    pub devices: Vec<DeviceInfo>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DeviceRebindRequest {
+    pub registration: DeviceRegistration,
+    /// Fresh account verification, supplied only by an explicit user action.
+    pub auth: AuthRequest,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -194,6 +211,29 @@ pub struct SessionInfo {
     pub expires_at: u64,
     pub failure_reason: Option<String>,
     pub route: Option<FrpRoute>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SessionHistoryEntry {
+    pub session_id: String,
+    pub peer_name: String,
+    pub direction: String,
+    pub status: SessionStatus,
+    pub path: SessionPath,
+    pub created_at: u64,
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SessionHistoryPage {
+    pub items: Vec<SessionHistoryEntry>,
+    pub total: usize,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct SessionHistoryQuery {
+    #[serde(default)]
+    pub offset: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

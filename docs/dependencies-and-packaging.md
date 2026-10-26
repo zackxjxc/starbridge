@@ -104,11 +104,11 @@ StarBridge-test/
     frp/
     openssh/
   runtime-manifest.json
-  state/                   首次运行时创建，不进入分发 zip
-    node/
 ```
 
-双击 `starbridge.exe` 或 `start-node.bat` 打开设备中心，同账户设备可互相连接。旧启动脚本仍可使用，并继续访问原来的数据目录。首次在界面配置中心服务器地址；默认值是本机开发地址。将整个便携目录放在可写位置，保留 `runtime/` 和许可证，运行电脑需已有 WebView2 Runtime；StarBridge 不运行安装器。默认数据目录基于 exe 位置，`--data-dir` 可覆盖；同时运行的实例不得共用数据目录。升级请保留已有 `state/`，不要将身份、密钥或登录状态混入发布物。
+双击 `starbridge.exe` 或 `start-node.bat` 打开设备中心，同账户设备可互相连接。连接服务已内置。保留 `runtime/` 和许可证，运行电脑需已有 WebView2 Runtime；StarBridge 不运行安装器。默认数据在 Windows `%LOCALAPPDATA%/StarBridge` 或 macOS `~/Library/Application Support/StarBridge`，与程序位置无关；不同解压目录默认共用身份和实例锁。`--data-dir` 使用独立的开发测试身份，旧双实例脚本继续使用各自的显式目录。迁移及冲突处理见 [设备身份与迁移](machine-identity.md)。
+
+发布脚本只复制程序、允许的运行时文件、许可证和启动脚本；运行时目录中意外混入的身份、登录文件及额外清单字段不会进入 ZIP。输出目录若含 `state/`、SSH 数据、机器识别文件、安全存储文件或迁移标记，打包会拒绝覆盖，要求选择新的输出目录。请保留旧数据，不要把使用过的身份或登录状态混入发布物。
 
 中心 Linux 部署包建议布局：
 
@@ -135,7 +135,7 @@ macOS ARM64 的清单是 `vendor/manifest.darwin-arm64.toml`：
 
 `cargo build --locked --release --workspace` 编译客户端与本地测试中心后，执行 `python3 tools/package_macos.py`，得到 `dist/StarBridge.app` 和 `dist/StarBridge.zip`。打包前核对来源归档与锁定清单、运行时文件 SHA-256 和 ARM64 架构；包中仅保留 `frpc`、五个 OpenSSH 服务组件和许可证，不包含 `frps`、中心程序或用户状态。SSH 客户端使用 macOS 系统提供的 `ssh`。
 
-应用主程序位于 `Contents/MacOS/starbridge`，运行时位于 `Contents/Resources/runtime/`。桌面数据位于用户的 `~/Library/Application Support/net.zackxjxc.starbridge/state/`，不会写入应用包。打包脚本对运行时和应用进行 ad-hoc 签名，签名后重新记录分发文件哈希并验证整个包；这是本地构建包，尚未进行 Developer ID 签名或 Apple 公证。ZIP 保留执行权限，脚本拒绝覆盖已有 `.app`。
+应用主程序位于 `Contents/MacOS/starbridge`，运行时位于 `Contents/Resources/runtime/`。桌面数据位于用户的 `~/Library/Application Support/StarBridge`，不会写入应用包。打包脚本对运行时和应用进行 ad-hoc 签名，签名后重新记录分发文件哈希并验证整个包；这是本地构建包，尚未进行 Developer ID 签名或 Apple 公证。ZIP 保留执行权限，脚本拒绝覆盖已有 `.app`。
 
 ## 待处理项
 

@@ -46,6 +46,17 @@ async fn client_login(
 }
 
 #[tauri::command]
+async fn client_rebind_device(
+    app: tauri::State<'_, ClientApp>,
+    form: DeviceRebindForm,
+) -> Result<ClientSnapshot, String> {
+    rebind_device(State(app.inner().clone()), Json(form))
+        .await
+        .map(|value| value.0)
+        .map_err(|error| error.message)
+}
+
+#[tauri::command]
 async fn client_register(
     app: tauri::State<'_, ClientApp>,
     form: RegisterForm,
@@ -136,6 +147,17 @@ async fn client_components(app: tauri::State<'_, ClientApp>) -> Result<serde_jso
 }
 
 #[tauri::command]
+async fn client_connection_history(
+    app: tauri::State<'_, ClientApp>,
+    form: SessionHistoryQuery,
+) -> Result<SessionHistoryPage, String> {
+    connection_history(State(app.inner().clone()), Json(form))
+        .await
+        .map(|value| value.0)
+        .map_err(|error| error.message)
+}
+
+#[tauri::command]
 async fn client_logout(app: tauri::State<'_, ClientApp>) -> Result<ClientSnapshot, String> {
     logout(State(app.inner().clone()))
         .await
@@ -191,6 +213,7 @@ pub fn run(app: ClientApp, _role: Role, root: PathBuf) -> anyhow::Result<()> {
             client_save_config,
             client_login,
             client_register,
+            client_rebind_device,
             client_update_device,
             client_delete_device,
             client_connect_all,
@@ -199,6 +222,7 @@ pub fn run(app: ClientApp, _role: Role, root: PathBuf) -> anyhow::Result<()> {
             client_start_test,
             client_cancel_test,
             client_components,
+            client_connection_history,
             client_logout,
             client_connect,
             client_disconnect,

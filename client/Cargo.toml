@@ -18,6 +18,7 @@ anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
 fs2 = "0.4"
+machine-uid = "=0.6.0"
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -29,3 +30,6 @@ tokio = { workspace = true, features = ["process"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+starbridge-server = { path = "../server" }

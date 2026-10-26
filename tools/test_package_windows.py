@@ -76,6 +76,34 @@ class PortablePackageTests(unittest.TestCase):
             self.package()
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "private")
 
+    def test_secure_and_migrated_profiles_are_preserved(self):
+        for name in ("identity.secure", "auth.secure", "machine.json", "instance-scope.json", "legacy-migration.json"):
+            with self.subTest(name=name):
+                data = self.output / "old-profile"
+                data.mkdir(parents=True, exist_ok=True)
+                sentinel = data / name
+                sentinel.write_text("private", encoding="utf-8")
+                with self.assertRaisesRegex(SystemExit, "客户端数据"):
+                    self.package()
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "private")
+                sentinel.unlink()
+
+    def test_runtime_input_cannot_copy_private_data_into_zip(self):
+        for name in ("identity.json", "identity.secure", "auth.secure", "machine.json", "instance-scope.json"):
+            (self.runtime / name).write_bytes(b"private-profile-sentinel")
+        ssh = self.runtime / "ssh"
+        ssh.mkdir()
+        (ssh / "id_ed25519").write_bytes(b"private-key-sentinel")
+        manifest_path = self.runtime / "runtime-manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest[0]["device_token"] = "private-token-sentinel"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.assertEqual(self.package(), 0)
+        with zipfile.ZipFile(self.output.with_suffix(".zip")) as archive:
+            self.assertFalse(any(Path(name).name in package_windows.PRIVATE_DATA_NAMES for name in archive.namelist()))
+            for name in archive.namelist():
+                self.assertNotIn(b"private-", archive.read(name))
+
     def test_missing_input_does_not_remove_previous_package(self):
         self.output.mkdir()
         sentinel = self.output / "previous.txt"

@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use starbridge_protocol::{
     AuthRequest, AuthResponse, AuthRefreshRequest, AuthLogoutRequest, ConnectionPolicy,
-    DeviceInfo, DeviceRegistration, DeviceMetadataUpdate, ErrorResponse,
+    DeviceInfo, DeviceRegistration, DeviceRegistrationResponse, DeviceRebindRequest, DeviceMetadataUpdate, ErrorResponse,
     FrpRoute, HealthResponse, HeartbeatRequest, SessionCreateRequest, SessionInfo,
+    SessionHistoryEntry, SessionHistoryPage, SessionHistoryQuery,
     SessionPath, SessionStatus, SessionStatusRequest, new_id, now_unix,
 };
 use std::{
@@ -53,6 +54,10 @@ struct StoredDevice {
 struct DeletedDevice {
     account: String,
     revoked_token_hashes: HashSet<String>,
+    #[serde(default)]
+    machine_key: Option<String>,
+    #[serde(default)]
+    display_name: String,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -118,8 +123,10 @@ impl AppState {
                     .clone()
                     .into_iter()
                     .map(|(id, mut session)| {
-                        session.status = SessionStatus::Closed;
-                        session.failure_reason = Some("中心服务重启，会话已结束".into());
+                        if is_active(&session) {
+                            session.status = SessionStatus::Closed;
+                            session.failure_reason = Some("中心服务重启，会话已结束".into());
+                        }
                         (id, session)
                     })
                     .collect()
@@ -170,7 +177,7 @@ fn load_persisted(data_path: &FsPath) -> Option<PersistedState> {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
             Ok(state) => Some(state),
             Err(error) => {
-                tracing::warn!(%error, "中心服务状态文件无法解析，将从空状态启动");
+                tracing::warn!(line = error.line(), column = error.column(), "中心服务状态文件无法解析，将从空状态启动");
                 None
             }
         },
@@ -212,11 +219,14 @@ pub fn app(state: AppState) -> Router {
         .route("/api/v1/auth/refresh", post(refresh_auth))
         .route("/api/v1/auth/logout", post(logout_auth))
         .route("/api/v1/devices/register", post(register_device))
+        .route("/api/v1/devices/identify", post(identify_device))
+        .route("/api/v1/devices/rebind", post(rebind_device))
         .route("/api/v1/devices/heartbeat", post(heartbeat))
         .route("/api/v1/devices", get(devices))
         .route("/api/v1/devices/{id}", axum::routing::put(update_device_metadata).delete(delete_device))
         .route("/api/v1/admin/summary", get(admin_summary))
         .route("/api/v1/sessions", post(create_session))
+        .route("/api/v1/sessions/history/{node_id}", get(session_history))
         .route(
             "/api/v1/sessions/assigned/{node_id}",
             get(assigned_sessions),
@@ -343,30 +353,151 @@ async fn logout_auth(
 async fn register_device(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(mut registration): Json<DeviceRegistration>,
+    Json(registration): Json<DeviceRegistration>,
 ) -> Result<Json<Vec<DeviceInfo>>, ApiError> {
+    // Preserve the legacy response shape; old clients cannot adopt a different ID.
+    let response = register_identified(&state, &headers, registration, false, None).await?;
+    Ok(Json(response.devices))
+}
+
+async fn identify_device(
+    State(state): State<AppState>, headers: HeaderMap, Json(registration): Json<DeviceRegistration>,
+) -> Result<Json<DeviceRegistrationResponse>, ApiError> {
+    Ok(Json(register_identified(&state, &headers, registration, true, None).await?))
+}
+
+async fn rebind_device(
+    State(state): State<AppState>, headers: HeaderMap, Json(request): Json<DeviceRebindRequest>,
+) -> Result<Json<DeviceRegistrationResponse>, ApiError> {
+    if request.registration.machine_key.is_none() {
+        return Err(ApiError::bad_request("请先完成本机身份初始化"));
+    }
+    Ok(Json(register_identified(&state, &headers, request.registration, true, Some(request.auth)).await?))
+}
+
+async fn register_identified(
+    state: &AppState, headers: &HeaderMap, registration: DeviceRegistration,
+    allow_canonical_id: bool, rebind_auth: Option<AuthRequest>,
+) -> Result<DeviceRegistrationResponse, ApiError> {
     let account = authenticate(&state, &headers).await?;
     validate_registration(&registration)?;
     let mut inner = state.inner.write().await;
-    ensure_device_not_deleted(&inner, &account, &registration.node_id, &registration.device_token)?;
+    if let Some(auth) = &rebind_auth {
+        if auth.username.trim() != account || !inner.accounts.get(&account)
+            .is_some_and(|stored| stored.password == password_digest(&auth.password)) {
+            return Err(ApiError::unauthorized("重新绑定需要验证当前账户密码"));
+        }
+    }
+    // Uniqueness, replacement and persistence share the same write lock.
+    let previous_devices = inner.devices.clone();
+    let previous_deleted = inner.deleted_devices.clone();
+    let node_id = store_registration(&mut inner, &account, registration, allow_canonical_id, rebind_auth.is_some())?;
+    if let Err(error) = persist_inner(&state.data_path, &inner) {
+        inner.devices = previous_devices;
+        inner.deleted_devices = previous_deleted;
+        return Err(ApiError::internal(error));
+    }
+    Ok(DeviceRegistrationResponse { node_id, devices: list_devices(&inner, Some(&account)) })
+}
+
+fn store_registration(
+    inner: &mut Inner, account: &str, mut registration: DeviceRegistration,
+    allow_canonical_id: bool, explicit_rebind: bool,
+) -> Result<String, ApiError> {
     if registration.direct_only && registration.allow_relay {
         return Err(ApiError::bad_request("只允许直连的节点不能同时允许中继"));
     }
-    let metadata_edited = if let Some(existing) = inner.devices.get(&registration.node_id) {
-        if existing.account != account || existing.device_token != registration.device_token {
-            return Err(ApiError::conflict("设备身份凭据与已有登记不一致"));
+    let requested_id = registration.node_id.clone();
+    let mut matches = HashSet::new();
+    let mut deleted_matches = HashSet::new();
+    if let Some(key) = &registration.machine_key {
+        for (id, device) in &inner.devices {
+            if device.account == account && device.registration.machine_key.as_ref() == Some(key) {
+                matches.insert(id.clone());
+            }
         }
-        if existing.metadata_edited {
+        for (id, deleted) in &inner.deleted_devices {
+            if deleted.account == account && deleted.machine_key.as_ref() == Some(key) {
+                // Deleted duplicate records keep their revocations even after the
+                // user resolves the duplicate by retaining just one live record.
+                if deleted.revoked_token_hashes.contains(&password_digest(&registration.device_token)) {
+                    return Err(ApiError::new(StatusCode::GONE, "此设备凭据已被撤销，请验证账户后明确重新添加"));
+                }
+                deleted_matches.insert(id.clone());
+            }
+        }
+    }
+    if matches.len() > 1 {
+        return Err(ApiError::conflict("此电脑存在多个历史设备记录，请在设备列表核对并删除多余记录后重试"));
+    }
+    let requested_belongs_elsewhere = inner.devices.get(&requested_id).is_some_and(|device| device.account != account)
+        || inner.deleted_devices.get(&requested_id).is_some_and(|device| device.account != account);
+    if matches.is_empty() && deleted_matches.len() > 1 && !explicit_rebind {
+        return Err(ApiError::conflict("此电脑的多个历史记录均已删除，请验证账户后明确重新添加"));
+    }
+    let canonical_id = matches.into_iter().next().or_else(|| {
+        if deleted_matches.len() == 1 { deleted_matches.into_iter().next() } else { None }
+    }).unwrap_or_else(|| {
+        if requested_belongs_elsewhere && allow_canonical_id && registration.machine_key.is_some() { new_id() }
+        else { requested_id.clone() }
+    });
+    if requested_belongs_elsewhere && canonical_id == requested_id {
+        return Err(ApiError::conflict("设备身份属于其他账户，请使用当前账户的独立身份"));
+    }
+    if canonical_id != requested_id {
+        if !allow_canonical_id {
+            return Err(ApiError::conflict("请升级客户端以复用已有设备记录"));
+        }
+        if inner.devices.get(&requested_id).is_some_and(|device| device.account == account) {
+            return Err(ApiError::conflict("本机与历史记录存在重复身份，请核对旧数据并删除多余记录后重试"));
+        }
+    }
+    ensure_device_not_deleted(inner, account, &canonical_id, &registration.device_token)?;
+    let metadata_edited = if let Some(existing) = inner.devices.get(&canonical_id).cloned() {
+        if existing.account != account {
+            return Err(ApiError::conflict("设备身份属于其他账户"));
+        }
+        if existing.registration.machine_key.is_some() && existing.registration.machine_key != registration.machine_key {
+            return Err(ApiError::conflict("本机识别来源与原设备不一致，请恢复原身份数据或使用独立测试目录"));
+        }
+        if existing.device_token != registration.device_token {
+            if existing.registration.machine_key.is_none() {
+                return Err(ApiError::conflict("迁移旧设备需要原设备凭据，请从原数据目录导入身份后重试"));
+            }
+            if !explicit_rebind {
+                return Err(ApiError::conflict("此电脑已有设备但凭据不同，请验证账户后明确重新绑定；克隆电脑请使用独立测试目录"));
+            }
+            if diagnostics::occupied(inner, &canonical_id) || inner.sessions.values().any(|session| is_active(session)
+                && (session.initiator_node_id == canonical_id || session.target_node_id == canonical_id)) {
+                return Err(ApiError::conflict("设备正在连接或测试，请先终止相关任务后重新绑定"));
+            }
+            inner.deleted_devices.entry(canonical_id.clone()).or_insert_with(|| DeletedDevice {
+                account: account.into(), revoked_token_hashes: HashSet::new(),
+                machine_key: existing.registration.machine_key.clone(),
+                display_name: existing.registration.display_name.clone(),
+            }).revoked_token_hashes.insert(password_digest(&existing.device_token));
+        }
+        if existing.metadata_edited || canonical_id != requested_id || explicit_rebind {
             registration.display_name = existing.registration.display_name.clone();
             registration.purpose = existing.registration.purpose.clone();
         }
         existing.metadata_edited
-    } else { false };
-    let account_name = account.clone();
+    } else {
+        if let Some(deleted) = inner.deleted_devices.get(&canonical_id) {
+            if !explicit_rebind {
+                return Err(ApiError::new(StatusCode::GONE, "此设备已被删除，请验证账户后明确重新添加"));
+            }
+            if deleted.machine_key.is_some() && deleted.machine_key != registration.machine_key {
+                return Err(ApiError::conflict("本机识别来源与已删除设备不一致，请核对身份数据"));
+            }
+        }
+        false
+    };
+    registration.node_id = canonical_id.clone();
     inner.devices.insert(
-        registration.node_id.clone(),
+        canonical_id.clone(),
         StoredDevice {
-            account,
+            account: account.into(),
             device_token: registration.device_token.clone(),
             registration,
             last_heartbeat: now_unix(),
@@ -374,10 +505,7 @@ async fn register_device(
             metadata_edited,
         },
     );
-    let response = Json(list_devices(&inner, Some(&account_name)));
-    drop(inner);
-    state.persist().await;
-    Ok(response)
+    Ok(canonical_id)
 }
 
 async fn update_device_metadata(
@@ -419,8 +547,13 @@ async fn delete_device(
     }
     let previous_tombstone = inner.deleted_devices.get(&id).cloned();
     inner.deleted_devices.entry(id.clone()).or_insert_with(|| DeletedDevice {
-        account: account.clone(), revoked_token_hashes: HashSet::new(),
-    }).revoked_token_hashes.insert(password_digest(&device.device_token));
+        account: account.clone(), revoked_token_hashes: HashSet::new(), machine_key: None,
+        display_name: String::new(),
+    });
+    let tombstone = inner.deleted_devices.get_mut(&id).unwrap();
+    tombstone.machine_key = device.registration.machine_key.clone();
+    tombstone.display_name = device.registration.display_name.clone();
+    tombstone.revoked_token_hashes.insert(password_digest(&device.device_token));
     inner.devices.remove(&id);
     if let Err(error) = persist_inner(&state.data_path, &inner) {
         inner.devices.insert(id.clone(), device);
@@ -585,6 +718,44 @@ async fn create_session(
     Ok(Json(info))
 }
 
+async fn session_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(node_id): Path<String>,
+    Query(query): Query<SessionHistoryQuery>,
+) -> Result<Json<SessionHistoryPage>, ApiError> {
+    let account = authenticate(&state, &headers).await?;
+    let mut inner = state.inner.write().await;
+    authenticate_device(&inner, &account, &node_id, device_token_header(&headers)?)?;
+    let changed = expire_sessions(&mut inner, now_unix());
+    let mut sessions: Vec<_> = inner.sessions.values().filter(|session| {
+        session.initiator_node_id == node_id || session.target_node_id == node_id
+    }).collect();
+    sessions.sort_by(|left, right| {
+        right.created_at.cmp(&left.created_at)
+            .then_with(|| left.session_id.cmp(&right.session_id))
+    });
+    let total = sessions.len();
+    let items = sessions.into_iter().skip(query.offset).take(50).map(|session| {
+        let outgoing = session.initiator_node_id == node_id;
+        let peer = if outgoing { &session.target_node_id } else { &session.initiator_node_id };
+        let peer_name = inner.devices.get(peer).filter(|device| device.account == account)
+            .map(|device| device.registration.display_name.clone())
+            .or_else(|| inner.deleted_devices.get(peer).filter(|device| device.account == account)
+                .map(|device| device.display_name.clone()))
+            .filter(|name| !name.is_empty()).unwrap_or_else(|| "已删除的设备".into());
+        SessionHistoryEntry {
+            session_id: session.session_id.clone(), peer_name,
+            direction: if outgoing { "outgoing" } else { "incoming" }.into(),
+            status: session.status, path: session.path, created_at: session.created_at,
+            failure_reason: session.failure_reason.clone(),
+        }
+    }).collect();
+    drop(inner);
+    if changed { state.persist().await; }
+    Ok(Json(SessionHistoryPage { items, total }))
+}
+
 async fn assigned_sessions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -680,6 +851,10 @@ async fn delete_session(
 }
 
 fn validate_registration(registration: &DeviceRegistration) -> Result<(), ApiError> {
+    if registration.machine_key.as_ref().is_some_and(|key| key.len() != 64
+        || !key.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))) {
+        return Err(ApiError::bad_request("本机身份数据格式错误，请检查数据目录"));
+    }
     if registration.node_id.trim().is_empty()
         || registration.node_id.len() > 128
         || registration.device_token.trim().is_empty()
@@ -808,7 +983,7 @@ fn ensure_device_not_deleted(inner: &Inner, account: &str, node_id: &str, token:
     if let Some(deleted) = inner.deleted_devices.get(node_id) {
         if deleted.account != account { return Err(ApiError::forbidden("设备身份属于其他账户")); }
         if deleted.revoked_token_hashes.contains(&password_digest(token)) {
-            return Err(ApiError::new(StatusCode::GONE, "此设备已被删除，请重新登录后添加"));
+            return Err(ApiError::new(StatusCode::GONE, "此设备凭据已撤销，请登录账号并明确重新绑定"));
         }
     }
     Ok(())
@@ -930,6 +1105,7 @@ mod tests {
         DeviceRegistration {
             node_id: "node".into(),
             device_token: "token".into(),
+            machine_key: None,
             display_name: "node".into(),
             purpose: String::new(),
             role: Role::Controller,
@@ -1008,6 +1184,133 @@ mod tests {
     async fn create_peer_session(state: &AppState, initiator: &str, target: &str) -> SessionInfo {
         create_session(State(state.clone()), peer_headers(initiator), Json(session_request(initiator, target)))
             .await.unwrap().0
+    }
+
+    async fn history_page(state: &AppState, node: &str, offset: usize) -> SessionHistoryPage {
+        session_history(State(state.clone()), peer_headers(node), Path(node.into()),
+            Query(SessionHistoryQuery { offset })).await.unwrap().0
+    }
+
+    #[tokio::test]
+    async fn session_history_keeps_repeated_connections_in_both_directions_and_deleted_peer_names() {
+        let app = test_app();
+        app.state.inner.write().await.devices.get_mut("b").unwrap().registration.display_name = "开发电脑".into();
+        let outgoing = create_peer_session(&app.state, "a", "b").await;
+        let _ = delete_session(State(app.state.clone()), peer_headers("a"), Path(outgoing.session_id.clone())).await.unwrap();
+        let incoming = create_peer_session(&app.state, "b", "a").await;
+        let _ = delete_session(State(app.state.clone()), peer_headers("b"), Path(incoming.session_id.clone())).await.unwrap();
+        create_peer_session(&app.state, "c", "d").await;
+        let page = history_page(&app.state, "a", 0).await;
+        assert_eq!(page.total, 2);
+        assert!(page.items.iter().any(|item| item.session_id == outgoing.session_id && item.direction == "outgoing"));
+        assert!(page.items.iter().any(|item| item.session_id == incoming.session_id && item.direction == "incoming"));
+        assert!(page.items.iter().all(|item| item.peer_name == "开发电脑"));
+        let json = serde_json::to_value(&page).unwrap();
+        assert!(json["items"].as_array().unwrap().iter().all(|item| item.as_object().unwrap().len() == 7));
+        let text = json.to_string();
+        for secret in ["frp-token", "secret_key", "route", "ssh_command", "device_token"] {
+            assert!(!text.contains(secret), "history exposed {secret}");
+        }
+        let _ = delete_device(State(app.state.clone()), peer_headers("a"), Path("b".into())).await.unwrap();
+        assert!(history_page(&app.state, "a", 0).await.items.iter().all(|item| item.peer_name == "开发电脑"));
+        app.state.inner.write().await.deleted_devices.get_mut("b").unwrap().display_name.clear();
+        assert!(history_page(&app.state, "a", 0).await.items.iter().all(|item| item.peer_name == "已删除的设备"));
+    }
+
+    #[tokio::test]
+    async fn session_history_requires_account_and_device_authentication_and_routes_default_offset() {
+        let app = test_app();
+        create_peer_session(&app.state, "a", "b").await;
+        let error = session_history(State(app.state.clone()), HeaderMap::new(), Path("a".into()),
+            Query(SessionHistoryQuery::default())).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        let mut missing = peer_headers("a");
+        missing.remove("x-starbridge-device-token");
+        for (headers, node) in [(missing, "a"), (peer_headers("b"), "a"), (peer_headers("z"), "z")] {
+            let error = session_history(State(app.state.clone()), headers, Path(node.into()),
+                Query(SessionHistoryQuery::default())).await.unwrap_err();
+            assert_eq!(error.status, StatusCode::FORBIDDEN);
+        }
+        assert_eq!(history_page(&app.state, "c", 0).await.total, 0);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = super::app(app.state.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+        let response = reqwest::Client::new().get(format!("http://{address}/api/v1/sessions/history/a"))
+            .headers(peer_headers("a")).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.json::<SessionHistoryPage>().await.unwrap().total, 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn session_history_paginates_with_stable_newest_first_order() {
+        let app = test_app();
+        let template = create_peer_session(&app.state, "a", "b").await;
+        {
+            let mut inner = app.state.inner.write().await;
+            inner.sessions.clear();
+            for index in 0..53 {
+                let mut session = template.clone();
+                session.session_id = format!("history-{index:02}");
+                session.created_at = 100 + index / 2;
+                session.status = SessionStatus::Closed;
+                inner.sessions.insert(session.session_id.clone(), session);
+            }
+        }
+        let first = history_page(&app.state, "a", 0).await;
+        let second = history_page(&app.state, "a", first.items.len()).await;
+        assert_eq!(first.total, 53);
+        assert_eq!(first.items.len(), 50);
+        assert_eq!(second.total, 53);
+        assert_eq!(second.items.len(), 3);
+        let ids: Vec<_> = first.items.iter().chain(&second.items).map(|item| item.session_id.as_str()).collect();
+        let mut expected: Vec<_> = (0..53).collect();
+        expected.sort_by_key(|index| (std::cmp::Reverse(index / 2), *index));
+        let expected: Vec<_> = expected.iter().map(|index| format!("history-{index:02}")).collect();
+        assert_eq!(ids, expected);
+        let empty = history_page(&app.state, "a", usize::MAX).await;
+        assert_eq!(empty.total, 53);
+        assert!(empty.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_history_expires_and_persists_records_without_overwriting_past_results_on_restart() {
+        let app = test_app();
+        let template = create_peer_session(&app.state, "a", "b").await;
+        {
+            let mut inner = app.state.inner.write().await;
+            inner.sessions.clear();
+            for (id, target, status, reason) in [
+                ("failed", "b", SessionStatus::Failed, Some("SSH 验证失败")),
+                ("closed", "b", SessionStatus::Closed, Some("用户已结束连接")),
+                ("connected", "c", SessionStatus::Connected, None),
+                ("expired", "d", SessionStatus::Negotiating, None),
+            ] {
+                let mut session = template.clone();
+                session.session_id = id.into(); session.target_node_id = target.into();
+                session.status = status; session.failure_reason = reason.map(str::to_string);
+                session.expires_at = 0;
+                inner.sessions.insert(id.into(), session);
+            }
+            inner.devices.get_mut("b").unwrap().registration.display_name = "历史目标电脑".into();
+        }
+        let page = history_page(&app.state, "a", 0).await;
+        assert_eq!(page.items.iter().find(|item| item.session_id == "expired").unwrap().status, SessionStatus::Failed);
+        assert_eq!(load_persisted(&app.state.data_path).unwrap().sessions["expired"].status, SessionStatus::Failed);
+        let _ = delete_device(State(app.state.clone()), peer_headers("a"), Path("b".into())).await.unwrap();
+        let restored = AppState::with_frp_and_data("localhost".into(), 17851, "frp-token".into(), app.state.data_path.as_ref().clone());
+        let auth = login(State(restored.clone()), Json(AuthRequest { username: "alice".into(), password: "test1234".into() })).await.unwrap().0;
+        let mut headers = peer_headers("a");
+        headers.insert(header::AUTHORIZATION, format!("Bearer {}", auth.access_token).parse().unwrap());
+        let page = session_history(State(restored), headers, Path("a".into()), Query(SessionHistoryQuery::default())).await.unwrap().0;
+        assert_eq!(page.total, 4);
+        for (id, expected) in [("failed", "SSH 验证失败"), ("closed", "用户已结束连接"),
+            ("expired", "连接协商已过期"), ("connected", "中心服务重启，会话已结束")] {
+            let item = page.items.iter().find(|item| item.session_id == id).unwrap();
+            assert_eq!(item.failure_reason.as_deref(), Some(expected));
+            if id != "expired" && id != "connected" { assert_eq!(item.peer_name, "历史目标电脑"); }
+        }
     }
 
     #[tokio::test]
@@ -1183,6 +1486,7 @@ mod tests {
             let registration = DeviceRegistration {
                 node_id: node_id.into(),
                 device_token: format!("{node_id}-token"),
+                machine_key: None,
                 display_name: node_id.into(),
                 purpose: String::new(),
                 role: Role::Executor,
@@ -1286,7 +1590,12 @@ mod tests {
         }
         let mut replacement = original.clone();
         replacement.device_token = "replacement-token".into();
-        let _ = register_device(State(app.state.clone()), peer_headers("a"), Json(replacement)).await.unwrap();
+        assert_eq!(register_device(State(app.state.clone()), peer_headers("a"), Json(replacement.clone())).await.unwrap_err().status, StatusCode::GONE);
+        replacement.machine_key = Some("b".repeat(64));
+        let _ = rebind_device(State(app.state.clone()), peer_headers("a"), Json(DeviceRebindRequest {
+            registration: replacement,
+            auth: AuthRequest { username: "alice".into(), password: "test1234".into() },
+        })).await.unwrap();
         assert_eq!(register_device(State(app.state.clone()), peer_headers("b"), Json(original)).await.unwrap_err().status, StatusCode::GONE);
         let _ = delete_device(State(app.state.clone()), peer_headers("a"), Path("b".into())).await.unwrap();
         let inner = app.state.inner.read().await;
@@ -1416,5 +1725,234 @@ mod tests {
         let token = auth.refresh_token.unwrap();
         app.state.inner.write().await.refresh_grants.get_mut(&password_digest(&token)).unwrap().expires_at = now_unix() - 1;
         assert!(refresh_auth(State(app.state.clone()), Json(AuthRefreshRequest { refresh_token: token })).await.is_err());
+    }
+
+    fn identified_registration(id: &str, token: &str, key_digit: &str) -> DeviceRegistration {
+        let mut registration = device(false, true);
+        registration.node_id = id.into();
+        registration.device_token = token.into();
+        registration.machine_key = Some(key_digit.repeat(64));
+        registration.capabilities = vec!["ssh_client".into(), "ssh_server".into(), "ssh".into()];
+        registration.ssh_public_key = format!("ssh-ed25519 {id}-public");
+        registration.ssh_host_key = format!("ssh-ed25519 {id}-host");
+        registration
+    }
+
+    fn rebind_request(registration: DeviceRegistration) -> DeviceRebindRequest {
+        DeviceRebindRequest {
+            registration, auth: AuthRequest { username: "alice".into(), password: "test1234".into() },
+        }
+    }
+
+    #[tokio::test]
+    async fn machine_identity_reuses_node_across_login_restart_and_client_directory() {
+        let app = test_app();
+        let registration = identified_registration("a", "a-token", "a");
+        let initial_count = app.state.inner.read().await.devices.len();
+        let first = identify_device(State(app.state.clone()), peer_headers("a"), Json(registration.clone())).await.unwrap().0;
+        assert_eq!(first.node_id, "a");
+        let _ = login(State(app.state.clone()), Json(AuthRequest { username: "alice".into(), password: "test1234".into() })).await.unwrap();
+        let repeated = identify_device(State(app.state.clone()), peer_headers("a"), Json(registration.clone())).await.unwrap().0;
+        assert_eq!(repeated.node_id, "a");
+        let mut other_directory = registration.clone();
+        other_directory.node_id = "different-extraction".into();
+        let adopted = identify_device(State(app.state.clone()), peer_headers("a"), Json(other_directory.clone())).await.unwrap().0;
+        assert_eq!(adopted.node_id, "a");
+        assert_eq!(app.state.inner.read().await.devices.len(), initial_count);
+        let restored = AppState::with_frp_and_data("localhost".into(), 17851, "token".into(), app.state.data_path.as_ref().clone());
+        let auth = login(State(restored.clone()), Json(AuthRequest { username: "alice".into(), password: "test1234".into() })).await.unwrap().0;
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, format!("Bearer {}", auth.access_token).parse().unwrap());
+        assert_eq!(identify_device(State(restored.clone()), headers, Json(other_directory)).await.unwrap().0.node_id, "a");
+        assert_eq!(restored.inner.read().await.devices.len(), initial_count);
+        let listing = serde_json::to_string(&adopted.devices).unwrap();
+        assert!(!listing.contains("machine_key") && !listing.contains("device_token"));
+    }
+
+    #[tokio::test]
+    async fn machine_keys_are_scoped_to_accounts_and_distinct_machines_remain_separate() {
+        let app = test_app();
+        let a = identify_device(State(app.state.clone()), peer_headers("a"), Json(identified_registration("a", "a-token", "a"))).await.unwrap().0;
+        let other = identify_device(State(app.state.clone()), peer_headers("a"), Json(identified_registration("new-machine", "other-token", "b"))).await.unwrap().0;
+        assert_ne!(a.node_id, other.node_id);
+        let mut bob = HeaderMap::new();
+        bob.insert(header::AUTHORIZATION, "Bearer bob-access".parse().unwrap());
+        let separate_account = identify_device(State(app.state.clone()), bob, Json(identified_registration("a", "bob-new-token", "a"))).await.unwrap().0;
+        assert_ne!(separate_account.node_id, a.node_id);
+        assert!(separate_account.devices.iter().all(|device| device.account == "bob"));
+        assert_eq!(app.state.inner.read().await.devices["a"].device_token, "a-token");
+    }
+
+    #[tokio::test]
+    async fn matching_machine_is_not_authentication_and_rebind_revokes_old_credential() {
+        let app = test_app();
+        let original = identified_registration("a", "a-token", "a");
+        let _ = identify_device(State(app.state.clone()), peer_headers("a"), Json(original.clone())).await.unwrap();
+        let mut replacement = identified_registration("fresh-install", "new-device-token", "a");
+        replacement.display_name = "must not replace existing name".into();
+        assert_eq!(identify_device(State(app.state.clone()), peer_headers("a"), Json(replacement.clone())).await.unwrap_err().status, StatusCode::CONFLICT);
+        let mut wrong_auth = rebind_request(replacement.clone());
+        wrong_auth.auth.password = "wrong-password".into();
+        assert_eq!(rebind_device(State(app.state.clone()), peer_headers("a"), Json(wrong_auth)).await.unwrap_err().status, StatusCode::UNAUTHORIZED);
+        let response = rebind_device(State(app.state.clone()), peer_headers("a"), Json(rebind_request(replacement.clone()))).await.unwrap().0;
+        assert_eq!(response.node_id, "a");
+        assert_eq!(app.state.inner.read().await.devices["a"].registration.display_name, original.display_name);
+        assert_eq!(heartbeat(State(app.state.clone()), peer_headers("a"), Json(HeartbeatRequest {
+            node_id: "a".into(), device_token: "a-token".into(), status: "online".into(),
+        })).await.unwrap_err().status, StatusCode::GONE);
+        assert_eq!(identify_device(State(app.state.clone()), peer_headers("a"), Json(original.clone())).await.unwrap_err().status, StatusCode::GONE);
+        assert_eq!(rebind_device(State(app.state.clone()), peer_headers("a"), Json(rebind_request(original))).await.unwrap_err().status, StatusCode::GONE);
+        let restored = AppState::with_frp_and_data("localhost".into(), 17851, "token".into(), app.state.data_path.as_ref().clone());
+        let inner = restored.inner.read().await;
+        assert_eq!(authenticate_device(&inner, "alice", "a", "a-token").err().unwrap().status, StatusCode::GONE);
+        assert!(authenticate_device(&inner, "alice", "a", "new-device-token").is_ok());
+    }
+
+    #[tokio::test]
+    async fn deleted_machine_cannot_be_restored_by_background_registration_or_a_new_id() {
+        let app = test_app();
+        let original = identified_registration("b", "b-token", "b");
+        let _ = identify_device(State(app.state.clone()), peer_headers("b"), Json(original.clone())).await.unwrap();
+        let _ = delete_device(State(app.state.clone()), peer_headers("a"), Path("b".into())).await.unwrap();
+        let replacement = identified_registration("new-local-id", "new-local-token", "b");
+        for registration in [original.clone(), replacement.clone()] {
+            assert_eq!(identify_device(State(app.state.clone()), peer_headers("b"), Json(registration)).await.unwrap_err().status, StatusCode::GONE);
+        }
+        let restored = AppState::with_frp_and_data("localhost".into(), 17851, "token".into(), app.state.data_path.as_ref().clone());
+        assert_eq!(restored.inner.read().await.deleted_devices["b"].machine_key, original.machine_key);
+        let response = rebind_device(State(app.state.clone()), peer_headers("a"), Json(rebind_request(replacement))).await.unwrap().0;
+        assert_eq!(response.node_id, "b");
+        assert_eq!(identify_device(State(app.state.clone()), peer_headers("b"), Json(original)).await.unwrap_err().status, StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn legacy_attachment_requires_original_credential_and_machine_source_cannot_change() {
+        let app = test_app();
+        let mut registration = identified_registration("a", "wrong-token", "a");
+        assert_eq!(identify_device(State(app.state.clone()), peer_headers("a"), Json(registration.clone())).await.unwrap_err().status, StatusCode::CONFLICT);
+        assert_eq!(rebind_device(State(app.state.clone()), peer_headers("a"), Json(rebind_request(registration.clone()))).await.unwrap_err().status, StatusCode::CONFLICT);
+        registration.device_token = "a-token".into();
+        let _ = identify_device(State(app.state.clone()), peer_headers("a"), Json(registration.clone())).await.unwrap();
+        registration.machine_key = None;
+        assert_eq!(register_device(State(app.state.clone()), peer_headers("a"), Json(registration.clone())).await.unwrap_err().status, StatusCode::CONFLICT);
+        registration.machine_key = Some("b".repeat(64));
+        assert_eq!(identify_device(State(app.state.clone()), peer_headers("a"), Json(registration.clone())).await.unwrap_err().status, StatusCode::CONFLICT);
+        assert_eq!(rebind_device(State(app.state.clone()), peer_headers("a"), Json(rebind_request(registration))).await.unwrap_err().status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn duplicate_legacy_records_are_reported_without_merging_or_deleting() {
+        let app = test_app();
+        let _ = identify_device(State(app.state.clone()), peer_headers("a"), Json(identified_registration("a", "a-token", "a"))).await.unwrap();
+        let duplicate = identified_registration("b", "b-token", "a");
+        assert_eq!(identify_device(State(app.state.clone()), peer_headers("b"), Json(duplicate.clone())).await.unwrap_err().status, StatusCode::CONFLICT);
+        {
+            let mut inner = app.state.inner.write().await;
+            assert!(inner.devices["b"].registration.machine_key.is_none());
+            inner.devices.get_mut("b").unwrap().registration.machine_key = duplicate.machine_key.clone();
+        }
+        assert_eq!(identify_device(State(app.state.clone()), peer_headers("b"), Json(duplicate)).await.unwrap_err().status, StatusCode::CONFLICT);
+        let inner = app.state.inner.read().await;
+        assert!(inner.devices.contains_key("a") && inner.devices.contains_key("b"));
+        drop(inner);
+        let _ = delete_device(State(app.state.clone()), peer_headers("c"), Path("b".into())).await.unwrap();
+        let retained = identified_registration("a", "a-token", "a");
+        assert_eq!(identify_device(State(app.state.clone()), peer_headers("a"), Json(retained.clone())).await.unwrap().0.node_id, "a");
+        assert_eq!(identify_device(State(app.state.clone()), peer_headers("a"), Json(identified_registration("new-id", "b-token", "a"))).await.unwrap_err().status, StatusCode::GONE);
+        let _ = delete_device(State(app.state.clone()), peer_headers("c"), Path("a".into())).await.unwrap();
+        let new_identity = identified_registration("explicit-new-record", "new-safe-token", "a");
+        assert_eq!(identify_device(State(app.state.clone()), peer_headers("c"), Json(new_identity.clone())).await.unwrap_err().status, StatusCode::CONFLICT);
+        assert_eq!(rebind_device(State(app.state.clone()), peer_headers("c"), Json(rebind_request(new_identity.clone()))).await.unwrap().0.node_id, "explicit-new-record");
+        assert_eq!(identify_device(State(app.state.clone()), peer_headers("c"), Json(new_identity)).await.unwrap().0.node_id, "explicit-new-record");
+    }
+
+    #[tokio::test]
+    async fn concurrent_machine_registrations_do_not_overwrite_credentials() {
+        let app = test_app();
+        let (first, second) = tokio::join!(
+            identify_device(State(app.state.clone()), peer_headers("a"), Json(identified_registration("race-a", "race-a-token", "c"))),
+            identify_device(State(app.state.clone()), peer_headers("a"), Json(identified_registration("race-b", "race-b-token", "c"))),
+        );
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        assert_eq!(first.err().or(second.err()).unwrap().status, StatusCode::CONFLICT);
+        let inner = app.state.inner.read().await;
+        let matches: Vec<_> = inner.devices.values().filter(|device| device.registration.machine_key == Some("c".repeat(64))).collect();
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].device_token == "race-a-token" || matches[0].device_token == "race-b-token");
+    }
+
+    #[tokio::test]
+    async fn explicit_isolated_instances_and_same_credential_races_keep_their_own_nodes() {
+        let app = test_app();
+        let (first, second) = tokio::join!(
+            identify_device(State(app.state.clone()), peer_headers("a"), Json(identified_registration("same-a", "same-token", "c"))),
+            identify_device(State(app.state.clone()), peer_headers("a"), Json(identified_registration("same-b", "same-token", "c"))),
+        );
+        assert_eq!(first.unwrap().0.node_id, second.unwrap().0.node_id);
+        let test_one = identify_device(State(app.state.clone()), peer_headers("a"), Json(identified_registration("test-one", "test-one-token", "d"))).await.unwrap().0;
+        let test_two = identify_device(State(app.state.clone()), peer_headers("a"), Json(identified_registration("test-two", "test-two-token", "e"))).await.unwrap().0;
+        assert_ne!(test_one.node_id, test_two.node_id);
+    }
+
+    #[tokio::test]
+    async fn rebind_response_retry_is_idempotent_and_busy_nodes_keep_their_original_credential() {
+        let app = test_app();
+        let _ = identify_device(State(app.state.clone()), peer_headers("a"), Json(identified_registration("a", "a-token", "a"))).await.unwrap();
+        let session = create_peer_session(&app.state, "a", "b").await;
+        let replacement = identified_registration("new-install", "replacement-token", "a");
+        assert_eq!(rebind_device(State(app.state.clone()), peer_headers("a"), Json(rebind_request(replacement.clone()))).await.unwrap_err().status, StatusCode::CONFLICT);
+        assert_eq!(app.state.inner.read().await.devices["a"].device_token, "a-token");
+        let _ = delete_session(State(app.state.clone()), peer_headers("a"), Path(session.session_id)).await.unwrap();
+        let _lost_response = rebind_device(State(app.state.clone()), peer_headers("a"), Json(rebind_request(replacement.clone()))).await.unwrap();
+        assert_eq!(identify_device(State(app.state.clone()), peer_headers("a"), Json(replacement.clone())).await.unwrap().0.node_id, "a");
+        assert_eq!(rebind_device(State(app.state.clone()), peer_headers("a"), Json(rebind_request(replacement))).await.unwrap().0.node_id, "a");
+        let inner = app.state.inner.read().await;
+        assert!(!inner.deleted_devices["a"].revoked_token_hashes.contains(&password_digest("replacement-token")));
+        assert_eq!(inner.deleted_devices["a"].revoked_token_hashes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_persistence_rolls_back_rebind_and_revocation() {
+        let app = test_app();
+        let _ = identify_device(State(app.state.clone()), peer_headers("a"), Json(identified_registration("a", "a-token", "a"))).await.unwrap();
+        let blocked_path = app.state.data_path.join("not-a-directory");
+        std::fs::write(&blocked_path, b"block persistence").unwrap();
+        let failing = AppState { data_path: Arc::new(blocked_path), ..app.state.clone() };
+        let error = rebind_device(State(failing), peer_headers("a"), Json(rebind_request(identified_registration("new-install", "replacement-token", "a")))).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        let inner = app.state.inner.read().await;
+        assert!(authenticate_device(&inner, "alice", "a", "a-token").is_ok());
+        assert_eq!(inner.devices["a"].device_token, "a-token");
+        assert!(!inner.deleted_devices.contains_key("a"));
+        let disk = load_persisted(&app.state.data_path).unwrap();
+        assert_eq!(disk.devices["a"].device_token, "a-token");
+        assert!(!disk.deleted_devices.contains_key("a"));
+    }
+
+    #[tokio::test]
+    async fn revoked_credentials_stay_revoked_through_delete_rebind_and_restart() {
+        let app = test_app();
+        let _ = identify_device(State(app.state.clone()), peer_headers("a"), Json(identified_registration("a", "a-token", "a"))).await.unwrap();
+        let _ = rebind_device(State(app.state.clone()), peer_headers("a"), Json(rebind_request(identified_registration("new-install", "second-token", "a")))).await.unwrap();
+        let _ = delete_device(State(app.state.clone()), peer_headers("b"), Path("a".into())).await.unwrap();
+        let _ = rebind_device(State(app.state.clone()), peer_headers("b"), Json(rebind_request(identified_registration("third-install", "third-token", "a")))).await.unwrap();
+        let restored = AppState::with_frp_and_data("localhost".into(), 17851, "token".into(), app.state.data_path.as_ref().clone());
+        let inner = restored.inner.read().await;
+        assert!(authenticate_device(&inner, "alice", "a", "third-token").is_ok());
+        for revoked in ["a-token", "second-token"] {
+            assert_eq!(authenticate_device(&inner, "alice", "a", revoked).err().unwrap().status, StatusCode::GONE);
+        }
+    }
+
+    #[test]
+    fn machine_key_wire_format_is_strict_and_not_copied_into_listings() {
+        let mut registration = identified_registration("test", "test-token", "a");
+        assert!(validate_registration(&registration).is_ok());
+        for invalid in ["", "a", &"A".repeat(64), &"g".repeat(64), &"0".repeat(65)] {
+            registration.machine_key = Some(invalid.into());
+            assert_eq!(validate_registration(&registration).unwrap_err().status, StatusCode::BAD_REQUEST);
+        }
+        registration.machine_key = None;
+        assert!(validate_registration(&registration).is_ok());
     }
 }

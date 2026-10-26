@@ -4,13 +4,11 @@
 )]
 
 use clap::Parser;
-use fs2::FileExt;
-use starbridge_client::ClientApp;
+use starbridge_client::{ClientApp, data_directory};
 use starbridge_protocol::Role;
 use std::{
-    fs::File,
     net::SocketAddr,
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 use tracing::info;
 
@@ -23,8 +21,12 @@ struct Args {
     /// Used only in headless mode.
     #[arg(long, default_value = "127.0.0.1:0")]
     listen: SocketAddr,
+    /// Run an independent test identity in this directory, isolated from the default device.
     #[arg(long)]
     data_dir: Option<PathBuf>,
+    /// Import one explicitly selected old profile into an empty default user directory.
+    #[arg(long, conflicts_with = "data_dir")]
+    import_data_dir: Option<PathBuf>,
     /// Run the local HTTP console without a desktop window.
     #[arg(long)]
     headless: bool,
@@ -57,20 +59,11 @@ fn run() -> anyhow::Result<()> {
         _ => anyhow::bail!("不支持的兼容启动参数；请省略 --role"),
     };
     let headless = args.headless || args.no_browser || !cfg!(feature = "desktop");
-    let directory = match args.role.to_ascii_lowercase().as_str() {
-        "controller" => "controller",
-        "executor" => "executor",
-        _ => "node",
-    };
-    let default_peer_directory = args.data_dir.is_none() && directory == "node";
-    let root = match args.data_dir {
-        Some(path) => std::path::absolute(path)?,
-        None if headless => std::env::current_dir()?.join("state").join(directory),
-        None => desktop_data_dir(directory)?,
-    };
-    let root = if default_peer_directory { compatible_data_dir(root) } else { root };
-    // Keep the lock open for the entire lifetime of this instance.
-    let _instance = lock_data_dir(&root)?;
+    let executable = std::env::current_exe()?;
+    let executable_dir = executable.parent().ok_or_else(|| anyhow::anyhow!("无法确定程序目录"))?;
+    // Both desktop and headless launches share the same user profile and lifetime lock.
+    let _instance = data_directory::prepare_with_import(args.data_dir, args.import_data_dir, &[executable_dir.to_path_buf(), std::env::current_dir()?])?;
+    let root = _instance.root.clone();
     let runtime = tokio::runtime::Runtime::new()?;
     let app = runtime.block_on(ClientApp::load(role, root.clone()))?;
     runtime.block_on(app.heartbeat_loop());
@@ -87,54 +80,6 @@ fn run() -> anyhow::Result<()> {
     };
     runtime.block_on(app.shutdown());
     result
-}
-
-fn desktop_data_dir(directory: &str) -> anyhow::Result<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        // App bundles may be read-only; user state must also survive app replacement.
-        let home = std::env::var_os("HOME")
-            .ok_or_else(|| anyhow::anyhow!("无法确定用户主目录"))?;
-        Ok(PathBuf::from(home)
-            .join("Library/Application Support/net.zackxjxc.starbridge/state")
-            .join(directory))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Ok(std::env::current_exe()?
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("无法确定程序目录"))?
-            .join("state")
-            .join(directory))
-    }
-}
-
-/// Reuse an existing portable installation without copying identities or keys.
-fn compatible_data_dir(root: PathBuf) -> PathBuf {
-    if !root.exists() {
-        let legacy = root.with_file_name("controller");
-        if legacy.join("identity.json").is_file() {
-            return legacy;
-        }
-    }
-    root
-}
-
-fn lock_data_dir(root: &Path) -> anyhow::Result<File> {
-    std::fs::create_dir_all(root)?;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(root.join("instance.lock"))?;
-    file.try_lock_exclusive().map_err(|error| {
-        anyhow::anyhow!(
-            "无法锁定数据目录 {}，请检查是否已有实例运行：{error}",
-            root.display()
-        )
-    })?;
-    Ok(file)
 }
 
 async fn serve(app: &ClientApp, listen: SocketAddr) -> anyhow::Result<()> {
@@ -185,34 +130,5 @@ fn show_error(message: &str) {
     // Both buffers remain valid and NUL terminated throughout this synchronous call.
     unsafe {
         MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), 0x10);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_directory_reuses_existing_identity_without_overriding_new_profile() {
-        let parent = std::env::temp_dir().join(format!("starbridge-profile-{}", uuid::Uuid::new_v4()));
-        let legacy = parent.join("controller");
-        let root = parent.join("node");
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(legacy.join("identity.json"), "{}").unwrap();
-        assert_eq!(compatible_data_dir(root.clone()), legacy);
-        std::fs::create_dir(&root).unwrap();
-        assert_eq!(compatible_data_dir(root.clone()), root);
-        std::fs::remove_dir_all(parent).unwrap();
-    }
-
-    #[test]
-    fn data_directory_is_exclusive_until_instance_exits() {
-        let root = std::env::temp_dir().join(format!("starbridge-lock-{}", uuid::Uuid::new_v4()));
-        let first = lock_data_dir(&root).unwrap();
-        assert!(lock_data_dir(&root).is_err());
-        drop(first);
-        let second = lock_data_dir(&root).unwrap();
-        drop(second);
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -35,6 +35,19 @@ LICENSES = {
     "openssh": ("OpenSSH-Win64.zip", ("LICENSE.txt", "NOTICE.txt")),
 }
 
+PRIVATE_DATA_NAMES = {
+    "state", "controller-data", "executor-data", "ssh", "config.json", "identity.json",
+    "identity.secure", "auth.json", "auth.secure", "machine.json",
+    "instance-scope.json", "migrated-to.json", "legacy-migration.json",
+}
+
+
+def contains_client_data(directory: Path) -> bool:
+    return directory.exists() and any(
+        path.name.lower() in PRIVATE_DATA_NAMES or path.suffix.lower() == ".secure"
+        for path in directory.rglob("*")
+    )
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -77,7 +90,7 @@ def main() -> int:
     if (output == output.parent or args.output.is_symlink()
             or any(source == output or output in source.parents for source in sources)):
         raise SystemExit("输出目录不能包含项目或打包输入文件，也不能是符号链接")
-    if any((args.output / name).exists() for name in ("state", "controller-data", "executor-data")):
+    if contains_client_data(args.output):
         raise SystemExit("输出目录包含客户端数据，请使用新的 --output 目录，避免删除数据或把登录状态打进 ZIP")
 
     if args.output.exists():
@@ -87,12 +100,13 @@ def main() -> int:
     shutil.copy2(args.binary, args.output / "starbridge.exe")
     for name in CLIENT_RUNTIME:
         shutil.copy2(args.runtime / name, runtime / name)
-    for record in manifest:
-        record["files"] = [name for name in record["files"] if name in CLIENT_RUNTIME]
-        record["file_sha256"] = {
-            name: expected_files[name] for name in record["files"]
-        }
-    manifest = [record for record in manifest if record["files"]]
+    # Publish only runtime metadata, never unrelated fields from a used directory.
+    manifest = [
+        {**{key: record[key] for key in ("name", "component", "version", "url", "sha256") if key in record},
+         "files": [name for name in record["files"] if name in CLIENT_RUNTIME],
+         "file_sha256": {name: expected_files[name] for name in record["files"] if name in CLIENT_RUNTIME}}
+        for record in manifest if any(name in CLIENT_RUNTIME for name in record["files"])
+    ]
     (args.output / "runtime-manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
@@ -113,8 +127,9 @@ def main() -> int:
         "解压整个目录后，双击 starbridge.exe 或 start-node.bat 打开设备中心；同账户设备可以互相连接。\n"
         "无需安装程序；请保留 runtime 和 licenses 目录。Windows 需要已安装 Microsoft Edge WebView2 Runtime。\n"
         "使用账号密码登录或注册，连接服务已内置。关闭窗口会退出客户端并停止其连接组件。\n\n"
-        "账户和设备数据保存在程序旁的 state/node（兼容启动脚本仍使用原有目录），移动程序时请一并保留。\n"
-        "请勿将使用过的目录转发给他人；分享时使用原始 ZIP。\n"
+        "账户和设备数据默认保存在当前用户的 %LOCALAPPDATA%\\StarBridge，与程序解压位置无关。\n"
+        "重新解压或移动程序可继续使用原有设备；请勿复制、删除或转发用户数据目录。分享时使用原始 ZIP。\n"
+        "开发者可用 --data-dir 指定独立测试目录；测试身份与默认设备隔离，请勿以此方式启动正式设备。\n"
         "test-ssh.bat 使用独立的 state/controller-test 与 state/executor-test 测试数据。\n",
         encoding="utf-8",
         newline="\n",

@@ -556,16 +556,16 @@ pub(super) async fn export_connections(State(app): State<ClientApp>, Json(form):
         if let (Some(session), Some(command)) = (session, command) {
             let path = match session.path { SessionPath::Direct => "直连", SessionPath::Relay => "中转", _ => "未确认" };
             let lifetime = "仅适用于发起连接的本机与当前会话；终止、退出或服务重启后请重新获取";
-            items.push(serde_json::json!({"node_id":id,"name":device.display_name,"purpose":device.purpose,
+            items.push(serde_json::json!({"name":device.display_name,"purpose":device.purpose,
                 "system":format!("{} / {}",device.os,device.arch),"ssh_user":device.ssh_user,
                 "privilege":device.ssh_privilege,"path":session.path,"ssh_command":command,
-                "source_node_id":inner.identity.node_id,"source_name":inner.config.display_name,"shell":shell,"lifetime":lifetime}));
-            lines.push(format!("设备：{}\n节点 ID：{}\n用途：{}\n系统：{} / {}\n登录用户：{}（{}）\n路径：{}\n来源电脑：{}（节点 ID：{}）\nShell：{}\nSSH：{}\n有效期：{}",
-                device.display_name,id,if device.purpose.is_empty(){"未设置"}else{&device.purpose},device.os,device.arch,
-                device.ssh_user,privilege_label(device.ssh_privilege),path,inner.config.display_name,inner.identity.node_id,shell,command,lifetime));
+                "source_name":inner.config.display_name,"shell":shell,"lifetime":lifetime}));
+            lines.push(format!("设备：{}\n用途：{}\n系统：{} / {}\n登录用户：{}（{}）\n路径：{}\n来源电脑：{}\nShell：{}\nSSH：{}\n有效期：{}",
+                device.display_name,if device.purpose.is_empty(){"未设置"}else{&device.purpose},device.os,device.arch,
+                device.ssh_user,privilege_label(device.ssh_privilege),path,inner.config.display_name,shell,command,lifetime));
         } else {
             let reason = inner.operations.get(&id).map(|operation| operation.message.as_str()).unwrap_or("当前没有已验证的 SSH 连接");
-            excluded.push(serde_json::json!({"node_id":id,"name":device.display_name,"reason":reason}));
+            excluded.push(serde_json::json!({"name":device.display_name,"reason":reason}));
         }
     }
     let mut text = lines.join("\n\n");
@@ -594,9 +594,11 @@ mod tests {
             let current: DeviceInfo = serde_json::from_value(value).unwrap();
             let mut cached = current.clone();
             cached.occupancy = "incoming".into();
-            let registry = Router::new().route("/api/v1/devices/register", post(move || {
+            let local_id = app.inner.read().await.identity.node_id.clone();
+            let registry = Router::new().route("/api/v1/devices/identify", post(move || {
                 let current = current.clone();
-                async move { Json(vec![current]) }
+                let node_id = local_id.clone();
+                async move { Json(DeviceRegistrationResponse { node_id, devices: vec![current] }) }
             }));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();

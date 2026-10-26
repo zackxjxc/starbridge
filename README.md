@@ -82,7 +82,9 @@ python tools/package_windows.py
 
 解压到可写目录后，双击 `starbridge.exe` 或 `start-node.bat`，使用用户名和密码登录或注册。连接服务已内置，不需要填写服务器地址。需要保留整个目录中的 `runtime/`、运行时校验清单和许可证文件。运行电脑需要已安装 WebView2 Runtime；不需要安装 StarBridge 或 Rust。
 
-新设备默认数据保存在可执行文件旁的 `state/node/`；升级时若该目录不存在且检测到旧 `state/controller/identity.json`，会继续使用旧目录。旧启动脚本继续使用各自的原数据目录。数据位置不依赖启动时的工作目录；可通过 `--data-dir` 指定其他位置。`runtime/` 从数据目录及其父目录、可执行文件旁依次查找，兼容开发环境的 `state/runtime/`。升级时请保留数据目录，不要把配置、身份或登录状态打进分发 zip。
+默认设备数据保存在当前用户的系统目录：Windows 为 `%LOCALAPPDATA%/StarBridge`，macOS 为 `~/Library/Application Support/StarBridge`。重新解压或更换程序目录会继续使用同一身份和实例锁。同账号通过系统机器标识派生的内部查找键复用设备，设备凭据单独验证；凭据冲突或设备已删除时，登录后必须输入账号密码并明确确认重新绑定，后台不会替换凭据或恢复设备。详见 [设备身份与迁移](docs/machine-identity.md)。
+
+开发联调可继续使用不同的空 `--data-dir`，每个目录拥有独立测试身份和实例锁，避免覆盖默认正式设备；旧双实例启动脚本仍使用各自的显式目录。升级请保留旧数据目录，多个旧身份存在时用 `--import-data-dir PATH` 明确选择导入空默认目录，不要合并文件。`runtime/` 从数据目录及其父目录、可执行文件旁依次查找，兼容开发环境的 `state/runtime/`。发布 ZIP 仅打包程序、运行时、许可证和启动脚本，不含配置、身份、凭据或登录状态。
 
 ### macOS（Apple Silicon）
 
@@ -102,7 +104,7 @@ python3 tools/package_macos.py
 
 输出为 `dist/StarBridge.app` 和 `dist/StarBridge.zip`，适用于 Apple Silicon、macOS 12+。解压后双击应用，或拖到“应用程序”目录；无需 Python、Rust 或独立安装 FRP/OpenSSH。包内包含经过锁定清单与文件哈希校验的客户端运行时及许可证，SSH 客户端使用系统自带的 `/usr/bin/ssh`。打包脚本使用本地 ad-hoc 签名并验证签名，尚未进行 Developer ID 签名或 Apple 公证。已有应用不会被打包脚本覆盖，可使用新的 `--output` 路径重新打包。
 
-macOS 桌面数据保存在 `~/Library/Application Support/net.zackxjxc.starbridge/state/node/`，升级或移动应用时保留；可通过 `--data-dir` 指定其他目录。无界面模式仍默认使用当前目录的 `state/node/`。验证本地三节点真实连接：
+macOS 数据保存在 `~/Library/Application Support/StarBridge`，桌面和无界面模式共用默认身份与实例锁，升级或移动应用时保留；可通过 `--data-dir` 指定独立测试目录。验证本地三节点真实连接：
 
 ```sh
 cargo test --locked --release --workspace

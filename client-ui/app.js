@@ -15,6 +15,7 @@
     authError: '', loadError: '', syncError: '', busy: new Set(), drafts: new Map(),
     policy: 'direct_preferred', rebuild: false, allConfig: true, failureGroup: null,
     components: null, exportData: null, exportIds: [], exportFingerprint: '', exportBack: 'device',
+    historyItems: [], historyTotal: 0, historyOffset: 0, historyLoaded: false, historyError: '', historyRequest: 0,
     epoch: 0, poll: null, request: 0, applied: 0, mutating: 0, mutation: 0, mutationApplied: 0, menuNode: null, menuReturn: null, modalKind: null,
   };
   const routes = {
@@ -23,8 +24,10 @@
     client_register: ['POST', '/api/v1/register'], client_logout: ['POST', '/api/v1/logout'],
     client_update_device: ['PUT', '/api/v1/devices'], client_connect: ['POST', '/api/v1/connect'],
     client_delete_device: ['POST', '/api/v1/devices/delete'],
+    client_rebind_device: ['POST', '/api/v1/devices/rebind'],
     client_connect_all: ['POST', '/api/v1/connect/all'], client_terminate: ['POST', '/api/v1/terminate'],
     client_export: ['POST', '/api/v1/export'], client_start_test: ['POST', '/api/v1/test/start'],
+    client_connection_history: ['POST', '/api/v1/history'],
     client_cancel_test: ['POST', '/api/v1/test/cancel'], client_components: ['GET', '/api/v1/components'],
   };
   async function api(command, args = {}) {
@@ -62,6 +65,7 @@
     test: 'M9 3h6 M10 3v6L4 19q-1 2 2 2h12q3 0 2-2L14 9V3 M8 14h8',
     more: 'M5 12h.01 M12 12h.01 M19 12h.01', check: 'm5 12 4 4L19 6', close: 'm6 6 12 12 M18 6 6 18',
     copy: 'M9 9h11v12H9z M15 9V3H3v12h6', refresh: 'M20 7A9 9 0 1 0 21 15 M20 2v5h-5', minimize: 'M5 12h14',
+    history: 'M3 12a9 9 0 1 0 3-6 M3 3v6h6 M12 7v5l3 2',
   };
   function icon(name) {
     const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -173,7 +177,6 @@
     if (!item.online) return { text: '离线', tone: 'muted' };
     if (isEnding(item)) return { text: '正在结束连接', tone: 'warn' };
     if (item.occupancy && item.occupancy !== 'idle') return { text: '已被其他设备连接', tone: 'muted' };
-    if (op?.state === 'terminated') return { text: '连接已终止', tone: 'muted' };
     if (op?.state === 'failed') return { text: '连接失败', tone: 'bad' };
     return { text: '在线', tone: 'good' };
   }
@@ -213,7 +216,6 @@
   function metadata(item) {
     return h('dl', { class: 'meta', 'data-key': 'metadata' },
       h('dt', {}, '系统'), h('dd', {}, item.os || '未提供'),
-      h('dt', {}, '设备 ID'), h('dd', {}, item.node_id),
       h('dt', {}, '登录用户'), h('dd', {}, item.ssh_user || (item.node_id === localId() ? s()?.ssh?.login_user : '') || '待连接后确认'));
   }
   function heading(title, subtitle, item) {
@@ -221,8 +223,8 @@
       h('div', { class: 'heading-copy' }, h('h1', { tabindex: '-1', 'data-page-heading': '' }, title), h('p', { class: 'muted' }, subtitle)),
       item ? button('', 'menu', { class: 'icon-button', 'aria-label': `更多设备操作：${item.display_name}`, 'aria-haspopup': 'menu', 'data-id': item.node_id }, 'more') : null);
   }
-  function banner(title, detail, tone = '') {
-    return h('div', { class: `banner ${tone}`, 'data-key': 'status-banner' }, h('p', { class: 'banner-title', title }, title), detail ? h('p', { class: 'muted' }, detail) : null);
+  function banner(title, detail, tone = '', copyableDetail = false) {
+    return h('div', { class: `banner ${tone}`, 'data-key': 'status-banner' }, h('p', { class: 'banner-title', title }, title), detail ? h('p', { class: 'muted', 'data-copyable': copyableDetail ? '' : undefined }, detail) : null);
   }
   function connectionError(error, stage) {
     const detail = message(error || '连接未完成，请重试。');
@@ -283,14 +285,14 @@
     const stateDetail = local ? incoming().length ? '本机当前正在接收连接，结束后可以发起新的连接。' : '连接信息仅在当前电脑和当前会话有效。'
       : ready(item.node_id) ? `已连接${item.display_name}。SSH 登录已验证，可复制命令。`
       : failure ? failure.summary
-      : blockReason(item) || (session ? message(op?.message || '网络通道建立后，还需要验证 SSH 登录。') : '点击连接后可选择连接方式。');
+      : blockReason(item) || (session ? message(op?.message || '网络通道建立后，还需要验证 SSH 登录。') : '设备在线，当前空闲。点击连接后可选择连接方式。');
     return h('div', { 'data-key': `device-page-${item.node_id}` },
       ui.failureGroup ? h('div', { class: 'backline' }, button('返回连接结果', 'all', { class: 'link' }, 'back'),
         h('div', { class: 'actions' }, button('上一台', 'failure-prev', { class: 'link' }), button('下一台同类设备', 'failure-next', { class: 'link' }))) : null,
       heading(local ? '本机信息' : item.display_name, local ? '这台电脑' : item.purpose || '设备详情', item),
-      banner(status.text, stateDetail, status.tone === 'good' ? 'good' : status.tone === 'bad' ? 'bad' : ''),
+      banner(status.text, stateDetail, status.tone === 'good' ? 'good' : status.tone === 'bad' ? 'bad' : '', !!failure),
       failure?.detail ? h('details', { class: 'details', 'data-key': 'connection-error-details' }, h('summary', {}, '技术详情'),
-        h('pre', { class: 'command' }, failure.detail)) : null,
+        h('pre', { class: 'command', 'data-copyable': '' }, failure.detail)) : null,
       local ? button(h('span', { class: 'identity' }, h('strong', {}, '连接测试'), h('p', { class: testTone() }, testLabel())), 'test', {
         class: 'test-entry', 'data-key': 'local-test-entry', title: test().finished_at ? `最近一次测试：${formatTime(test().finished_at)}` : '检查本机能否正常发起和接收连接',
       }, 'test') : null,
@@ -301,7 +303,7 @@
         canEnd ? button('终止连接', 'terminate-one', { class: 'button danger', 'data-id': item.node_id, disabled: ui.busy.has('terminate') }) : button('连接设备', 'configure', { class: 'button primary', 'data-id': item.node_id, disabled: !!blockReason(item) || ui.busy.has('connect') }),
         ready(item.node_id) ? button('复制 SSH', 'copy-ssh', { 'data-id': item.node_id, disabled: !!ui.syncError }, 'copy') : null,
         ready(item.node_id) ? button('复制给 AI', 'export-one', { 'data-id': item.node_id, disabled: !!ui.syncError }) : null),
-      ready(item.node_id) && !ui.syncError ? h('pre', { class: 'command', 'data-key': 'ssh-command', 'aria-label': '当前 SSH 命令' }, session.ssh_command) : null,
+      ready(item.node_id) && !ui.syncError ? h('pre', { class: 'command', 'data-key': 'ssh-command', 'aria-label': '当前 SSH 命令', 'data-copyable': '' }, session.ssh_command) : null,
       h('div', { class: 'section', 'data-key': 'device-fields' }, editForm(item, local), metadata(item)));
   }
   function modeOptions(disabled = false) {
@@ -408,6 +410,42 @@
     const date = new Date(typeof value === 'number' ? (value < 1e12 ? value * 1000 : value) : value);
     return Number.isNaN(date.getTime()) ? '' : date.toLocaleString('zh-CN', { hour12: false });
   }
+  function historyPage() {
+    const loading = ui.busy.has('history');
+    const statusLabels = { negotiating: '协商中', connected: '已建立', closed: '已结束', failed: '连接失败' };
+    return h('div', { 'data-key': 'history-page' }, heading('连接记录', '查看这台电脑连接过的设备，以及连接过这台电脑的设备。'),
+      h('div', { class: 'backline' }, h('span', { class: 'muted' }, ui.historyLoaded ? `已显示 ${ui.historyItems.length} / ${ui.historyTotal} 条，按发起时间从近到远排列` : '按发起时间从近到远排列'),
+        button(loading ? '正在读取…' : '刷新记录', 'history-refresh', { class: 'link', disabled: loading }, 'refresh')),
+      ui.historyError ? banner('连接记录读取失败', ui.historyError, 'warn', true) : null,
+      ui.historyItems.length ? h('ol', { class: 'history-list', 'aria-label': '本机连接记录' }, ui.historyItems.map(item =>
+        h('li', { class: 'history-entry', 'data-key': item.session_id },
+          h('div', { class: 'history-title' }, h('strong', {}, item.peer_name || '已删除的设备'),
+            h('span', { class: item.status === 'failed' ? 'bad' : 'muted' }, statusLabels[item.status] || '状态未知')),
+          h('p', {}, item.direction === 'incoming' ? '对方连接本机' : '本机连接对方'),
+          h('p', { class: 'muted' }, `发起时间：${formatTime(item.created_at) || '未记录'} · ${item.path === 'unknown' ? '连接方式未确定' : pathLabel(item.path)}`),
+          item.failure_reason ? h('p', { class: 'history-reason', 'data-copyable': '' }, message(item.failure_reason)) : null)))
+        : !ui.historyError ? h('p', { class: 'empty' }, loading ? '正在读取连接记录…' : ui.historyLoaded ? '这台电脑还没有连接记录。' : '尚未读取连接记录。') : null,
+      ui.historyLoaded && ui.historyOffset < ui.historyTotal ? button(loading ? '正在读取…' : '加载更多', 'history-more', { class: 'button wide', disabled: loading }) : null);
+  }
+  function resetHistory() {
+    ++ui.historyRequest; ui.historyItems = []; ui.historyTotal = 0; ui.historyOffset = 0;
+    ui.historyLoaded = false; ui.historyError = ''; ui.busy.delete('history');
+  }
+  async function loadHistory(append = false) {
+    if (ui.busy.has('history') || !s()?.logged_in) return;
+    const request = ++ui.historyRequest; const offset = append ? ui.historyOffset : 0;
+    ui.busy.add('history'); ui.historyError = ''; render();
+    try {
+      const result = await api('client_connection_history', { form: { offset } });
+      if (request !== ui.historyRequest) return;
+      const items = result?.items;
+      if (!Array.isArray(items) || !Number.isSafeInteger(result.total) || result.total < 0) throw new Error('连接记录响应无法读取，请稍后重试。');
+      const combined = append ? [...ui.historyItems, ...items] : items;
+      ui.historyItems = [...new Map(combined.map(item => [item.session_id, item])).values()];
+      ui.historyTotal = result.total; ui.historyOffset = offset + items.length; ui.historyLoaded = true;
+    } catch (error) { if (request === ui.historyRequest) ui.historyError = message(error); }
+    finally { if (request === ui.historyRequest) { ui.busy.delete('history'); render(); } }
+  }
   function testLinks() {
     return h('div', { class: 'actions', 'data-key': 'test-links' }, button('组件来源与校验', 'components', { class: 'link' }),
       isWindows() ? button('Windows 处理方法', 'windows-help', { class: 'link' }) : null);
@@ -427,14 +465,14 @@
       : current.message || stageLabel(current.stage);
     const stepText = { pending: '待执行', running: '进行中', passed: '通过', failed: '未通过', skipped: '未执行', unverified: '尚未验证', cancelled: '已取消' };
     return h('div', { 'data-key': 'test-page' }, heading('本机连接测试', initial ? '测试需要本机空闲，并允许使用中转。' : '显示最近一次测试状态。'),
-      initial ? testExplanation() : h('div', { 'data-key': 'test-result' }, banner(testLabel(), message(summary), testTone()),
+      initial ? testExplanation() : h('div', { 'data-key': 'test-result' }, banner(testLabel(), message(summary), testTone(), ['failed', 'cleanup_failed'].includes(testState())),
         (current.steps || []).map(step => h('div', { class: 'stage-row', 'data-key': step.id }, icon(step.state === 'passed' ? 'check' : step.state === 'failed' ? 'close' : 'test'),
-          h('div', {}, step.label, step.message ? h('p', {}, message(step.message)) : null), h('span', { class: step.state === 'passed' ? 'good small' : step.state === 'failed' ? 'bad small' : 'muted' }, stepText[step.state] || '尚未验证'))),
+          h('div', {}, step.label, step.message ? h('p', { 'data-copyable': step.state === 'failed' ? '' : undefined }, message(step.message)) : null), h('span', { class: step.state === 'passed' ? 'good small' : step.state === 'failed' ? 'bad small' : 'muted' }, stepText[step.state] || '尚未验证'))),
         current.finished_at ? h('p', { class: 'muted section' }, `最近一次测试：${formatTime(current.finished_at)}`) : null,
         h('details', { class: 'details', 'data-key': 'test-details' }, h('summary', {}, '测试范围与技术详情'),
           h('p', {}, '使用正式连接组件及隔离的临时 SSH 配置，经中转真实连接回本机，验证登录和固定数据回传。完成清理后才显示最终结果。'),
           h('p', {}, '本测试默认不验证跨设备直连。文件传输未测试。网络超时不代表安全软件已拦截。'),
-          current.id ? h('p', {}, `测试 ID：${current.id}`) : null), testLinks()),
+          current.id ? h('p', {}, '测试 ID：', h('span', { 'data-copyable': '' }, current.id)) : null), testLinks()),
       h('div', { class: 'bottom' }, gate ? h('p', { class: 'warn small' }, gate) : null,
         current.state === 'cleaning' ? button('正在清理测试连接…', '', { class: 'button wide', disabled: true })
           : current.state === 'running' ? button('取消测试', 'cancel-test', { class: 'button danger wide', disabled: ui.busy.has('cancel-test') })
@@ -453,34 +491,42 @@
           file.version ? h('p', { class: 'muted' }, `组件版本：${file.version}`) : null,
           h('p', { class: file.verification === 'verified' ? 'good' : ['missing', 'mismatch'].includes(file.verification) ? 'bad' : 'warn' },
             ({ verified: '与发布清单的校验值一致', missing: '文件缺失', mismatch: '与发布清单不一致', not_verified: '尚未完成来源校验' })[file.verification] || '尚未完成来源校验'),
-          file.path ? h('p', {}, `本机路径：${file.path}`) : null, file.sha256 ? h('p', {}, `SHA-256：${file.sha256}`) : null,
-          file.message ? h('p', { class: 'muted' }, message(file.message)) : null,
+          file.path ? h('p', {}, '本机路径：', h('span', { 'data-copyable': '' }, file.path)) : null, file.sha256 ? h('p', {}, 'SHA-256：', h('span', { 'data-copyable': '' }, file.sha256)) : null,
+          file.message ? h('p', { class: 'muted', 'data-copyable': '' }, message(file.message)) : null,
           file.source_url ? sourceLink('此文件的发布来源', file.source_url) : null)),
         isWindows() ? h('div', { class: 'section' }, button('Windows 处理方法', 'windows-help', { class: 'link' })) : null));
   }
   function sourceLink(label, url) {
     if (!url) return null;
-    return h('div', { class: 'section' }, h('h3', {}, label), h('p', { class: 'command' }, url), button('复制地址', 'copy-url', { class: 'link', 'data-url': url }, 'copy'));
+    return h('div', { class: 'section' }, h('h3', {}, label), h('p', { class: 'command', 'data-copyable': '' }, url), button('复制地址', 'copy-url', { class: 'link', 'data-url': url }, 'copy'));
   }
   function fingerprint(ids = ui.exportIds) {
     return readySessions().filter(session => !ids.length || ids.includes(session.target_node_id)).map(session => `${session.session_id}:${session.verified_at || ''}`).sort().join('|');
   }
   function exportPage() {
-    const changed = fingerprint() !== ui.exportFingerprint; const data = ui.exportData;
+    const currentFingerprint = fingerprint(); const changed = !currentFingerprint || currentFingerprint !== ui.exportFingerprint; const data = ui.exportData;
     return h('div', { 'data-key': 'export-page' }, h('div', { class: 'backline' }, button('返回', 'export-back', { class: 'link' }, 'back')),
       heading('复制连接信息给 AI', '仅包含当前已验证且仍活动的 SSH 连接。'),
       changed || ui.syncError ? banner('连接状态已变化', '复制前会重新读取有效连接。已结束的会话命令不再可用。', 'warn') : null,
-      h('textarea', { class: 'export-text', readOnly: true, value: changed || ui.syncError ? '连接状态已变化，请重新获取连接信息。' : data?.text || '正在生成连接信息…', 'aria-label': '将复制的连接信息', 'data-key': 'export-preview' }),
+      h('textarea', { class: 'export-text', readOnly: true, value: changed || ui.syncError ? '连接状态已变化，请重新获取连接信息。' : data?.text || '正在生成连接信息…', 'aria-label': '将复制的连接信息', 'data-key': 'export-preview', 'data-copyable': !changed && !ui.syncError && data?.text ? '' : undefined }),
       h('p', { class: 'muted' }, '这些命令只适用于发起连接的本机。断开、退出或服务重启后，请重新获取。'),
       h('div', { class: 'bottom actions stretch' }, button(changed ? '重新获取' : '刷新预览', 'refresh-export', { disabled: ui.busy.has('export') || !!ui.syncError }),
-        button('复制给 AI', 'copy-export', { class: 'button primary', disabled: ui.busy.has('export') || !!ui.syncError || !fingerprint() }, 'copy')));
+        button('复制给 AI', 'copy-export', { class: 'button primary', disabled: ui.busy.has('export') || !!ui.syncError || !currentFingerprint }, 'copy')));
   }
   function renderDetail() {
-    return ({ device: devicePage, configure: configurePage, all: allPage, test: testPage, components: componentsPage, export: exportPage })[ui.view]?.() || devicePage();
+    return h('div', {}, rebindNotice(), ({ device: devicePage, configure: configurePage, all: allPage, history: historyPage, test: testPage, components: componentsPage, export: exportPage })[ui.view]?.() || devicePage());
+  }
+  function rebindNotice() {
+    if (!s()?.device_rebind_required) return null;
+    return h('div', { class: 'banner warn', 'data-key': 'device-rebind-notice' },
+      h('p', { class: 'banner-title' }, '这台电脑需要确认重新绑定'),
+      h('p', {}, '现有设备凭据无法复用。确认账号后，可替换原凭据；旧客户端将失去访问权限。'),
+      button('重新绑定这台电脑', 'rebind-device', { class: 'button', disabled: ui.busy.has('rebind-device') }));
   }
   function header(loggedIn) {
     return h('header', { class: 'app-header', 'data-key': 'app-header' }, h('span', { class: 'brand-mark', 'aria-hidden': 'true' }, 'S'), h('span', {}, 'StarBridge'),
       h('div', { class: 'account' }, loggedIn ? [h('span', { class: 'account-name', title: s().username || '' }, s().username || ''),
+        button('连接记录', 'history', { class: 'link', 'aria-current': ui.view === 'history' ? 'page' : undefined }, 'history'),
         button('退出登录', 'logout', { class: 'link', disabled: ui.busy.has('logout') })] : null),
       frameless ? h('div', { class: 'window-controls', 'aria-label': '窗口操作' },
         button('', 'window-minimize', { class: 'window-button', 'aria-label': '最小化窗口', title: '最小化' }, 'minimize'),
@@ -494,14 +540,15 @@
         field('密码', 'auth-password', ui.auth.password, { name: 'password', type: 'password', autocomplete: registering ? 'new-password' : 'current-password', required: true, minlength: 4 }),
         registering ? field('确认密码', 'auth-confirm', ui.auth.confirm_password, { name: 'confirm_password', type: 'password', autocomplete: 'new-password', required: true, minlength: 4 }) : null,
         h('label', { class: 'remember', 'data-key': 'remember' }, h('input', { id: 'auth-remember', type: 'checkbox', name: 'remember', checked: ui.auth.remember }), '记住登录状态'),
-        ui.authError ? h('p', { class: 'auth-error', role: 'alert', 'data-key': 'auth-error' }, ui.authError) : null,
+        ui.authError ? h('p', { class: 'auth-error', role: 'alert', 'data-key': 'auth-error', 'data-copyable': '' }, ui.authError) : null,
+        rebindNotice(),
         button(ui.busy.has('auth') ? '正在处理…' : registering ? '注册并登录' : '登录', '', { type: 'submit', class: 'button primary wide', disabled: ui.busy.has('auth') }),
         h('div', { class: 'auth-switch' }, button(registering ? '已有账号，返回登录' : '没有账号？注册', 'auth-switch', { class: 'link', disabled: ui.busy.has('auth') })))));
   }
   function render() {
     if (!s()) {
       patchChildren(root, [h('div', { class: 'shell', 'data-key': 'startup-shell' }, header(false),
-        h('main', { class: 'startup', role: 'status' }, ui.loadError || '正在读取登录状态…', ui.loadError ? button('重试', 'retry') : null))]);
+        h('main', { class: 'startup', role: 'status' }, ui.loadError ? h('span', { 'data-copyable': '' }, ui.loadError) : '正在读取登录状态…', ui.loadError ? button('重试', 'retry') : null))]);
       return;
     }
     root.setAttribute('aria-busy', 'false');
@@ -519,6 +566,7 @@
   }
   function applySnapshot(snapshot) {
     if (!snapshot || typeof snapshot.logged_in !== 'boolean') return false;
+    if (snapshot.logged_in !== s()?.logged_in || snapshot.username !== s()?.username || snapshot.node_id !== localId()) resetHistory();
     const wasLogged = s()?.logged_in; ui.snapshot = snapshot; ui.syncError = ''; ui.loadError = '';
     if (!ui.selected || (!wasLogged && snapshot.logged_in)) {
       ui.selected = snapshot.node_id; ui.view = 'device'; ui.query = ''; ui.failureGroup = null;
@@ -596,9 +644,19 @@
     const local = id === localId();
     showModal('delete-device', [h('h2', { id: 'modal-title' }, '删除设备？'),
       h('p', { class: 'modal-copy' }, `将从账号的设备列表中删除“${item.display_name}”。不会删除这台电脑上的文件。`),
-      h('p', { class: 'modal-copy' }, local ? '删除本机后会退出登录；重新登录可再次添加。' : '设备在线时也会被移除并退出登录；需要在该电脑重新登录才能再次添加。'),
+      h('p', { class: 'modal-copy' }, local ? '删除本机后会退出登录；重新登录并确认重新绑定后可再次添加。' : '设备在线时也会被移除并退出登录；需要在该电脑重新登录并确认重新绑定后才能再次添加。'),
       h('p', { class: 'muted' }, '请先终止该设备的连接、等待任务或连接测试。'),
       h('div', { class: 'actions' }, button('取消', 'close-modal'), button('删除设备', 'confirm-delete-device', { class: 'button danger', 'data-id': id, disabled: ui.busy.has('delete-device') }))]);
+  }
+  function rebindDialog() {
+    if (!s()?.device_rebind_required) return;
+    showModal('rebind-device', [h('h2', { id: 'modal-title' }, '确认重新绑定这台电脑'),
+      h('p', { class: 'modal-copy' }, '请先终止旧设备的活动连接。此操作会替换账号下这台设备的旧凭据并吊销旧凭据，旧客户端将无法继续访问。请仅在确认这是自己的设备时继续。'),
+      h('form', { 'data-form': 'rebind-device' },
+        field('账号密码', 'rebind-password', '', { name: 'password', type: 'password', autocomplete: 'current-password', required: true, minlength: 4 }),
+        h('p', { class: 'auth-error', role: 'alert', 'data-rebind-error': '', 'data-copyable': '' }),
+        h('div', { class: 'actions' }, button('取消', 'close-modal'), button('确认替换旧凭据并重新绑定', '', { type: 'submit', class: 'button danger' })))]);
+    document.getElementById('rebind-password')?.focus();
   }
   function showWindowsHelp() {
     if (!isWindows()) return;
@@ -615,13 +673,25 @@
   }
   async function fetchExport(copy = false) {
     if (ui.busy.has('export')) return;
+    const requestedFingerprint = fingerprint(); const epoch = ui.epoch;
+    const username = s()?.username; const nodeId = localId();
+    if (!requestedFingerprint || !s()?.logged_in || ui.syncError) {
+      ui.exportData = null; ui.exportFingerprint = null; render();
+      if (copy) throw new Error('当前没有可复制的有效 SSH 连接。');
+      return;
+    }
     ui.busy.add('export'); render();
     try {
       // The backend revalidates readiness at export time, rather than trusting a stale UI snapshot.
       const result = await api('client_export', { form: { target_node_ids: ui.exportIds } });
-      ui.exportData = result; ui.exportFingerprint = fingerprint();
+      if (epoch !== ui.epoch || !s()?.logged_in || username !== s()?.username || nodeId !== localId()
+        || ui.syncError || requestedFingerprint !== fingerprint() || !result?.items?.length || !result?.text) {
+        ui.exportData = null; ui.exportFingerprint = null;
+        if (copy) throw new Error('连接状态已变化，请重新获取连接信息。');
+        return;
+      }
+      ui.exportData = result; ui.exportFingerprint = requestedFingerprint;
       if (copy) {
-        if (!result?.items?.length) throw new Error('当前没有可复制的有效 SSH 连接。');
         await writeClipboard(result.text);
       }
     } finally { ui.busy.delete('export'); render(); }
@@ -635,6 +705,10 @@
         if (frameless) await desktop.invoke('client_window_action', { action: actionName === 'window-close' ? 'close' : 'minimize' });
         break;
       case 'retry': await refresh(); break;
+      case 'history': navigate('history'); await loadHistory(); break;
+      case 'history-refresh': await loadHistory(); break;
+      case 'history-more': await loadHistory(true); break;
+      case 'rebind-device': rebindDialog(); break;
       case 'select-device': ui.failureGroup = null; navigate('device', id, false); break;
       case 'device': navigate('device'); break;
       case 'configure': navigate('configure', id || ui.selected); break;
@@ -677,7 +751,7 @@
       case 'confirm-logout': modal.close(); await mutate('logout', 'client_logout'); break;
       case 'copy-ssh': {
         const result = await api('client_export', { form: { target_node_ids: [id] } });
-        const item = result?.items?.find(entry => entry.node_id === id);
+        const item = result?.items?.[0];
         const command = item?.ssh_command || item?.command;
         if (!command) throw new Error('该连接尚未就绪或已经结束，请重新连接后再复制。');
         await writeClipboard(command); break;
@@ -704,6 +778,26 @@
       default: break;
     }
   }
+  function guardClipboard(event) {
+    const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+    // Input selections are separate from document selections; never use a stale document range for them.
+    if (target?.matches('input, textarea')) {
+      if (target.matches(':read-write') || (event.type === 'copy' && target.matches('[data-copyable]:not(:disabled)'))) return;
+      event.preventDefault(); return;
+    }
+    const selection = window.getSelection();
+    if (selection?.rangeCount === 1 && !selection.isCollapsed) {
+      const range = selection.getRangeAt(0);
+      const ancestor = range.commonAncestorContainer;
+      const element = ancestor instanceof Element ? ancestor : ancestor.parentElement;
+      // A range crossing a copyable value and surrounding UI has no permitted common ancestor.
+      if (element?.isContentEditable && !range.cloneContents().querySelector('[contenteditable="false"]')) return;
+      if (event.type === 'copy' && element?.closest('[data-copyable]')) return;
+    }
+    event.preventDefault();
+  }
+  document.addEventListener('copy', guardClipboard);
+  document.addEventListener('cut', guardClipboard);
   document.addEventListener('mousedown', event => {
     if (!frameless || event.button !== 0 || event.detail > 1 || !event.target.closest('.app-header')
       || event.target.closest('button, a, input, textarea, select, [contenteditable], [role="button"]')) return;
@@ -748,6 +842,18 @@
         ui.authError = '';
         try { await mutate('auth', ui.authMode === 'register' ? 'client_register' : 'client_login', { form: { ...ui.auth } }); ui.auth.password = ''; ui.auth.confirm_password = ''; ui.view = 'device'; ui.selected = localId(); render(); }
         catch (error) { ui.authError = message(error); render(); }
+      } else if (form.dataset.form === 'rebind-device') {
+        if (ui.busy.has('rebind-device') || !s()?.device_rebind_required) return;
+        const password = String(new FormData(form).get('password') || '');
+        form.reset();
+        const submit = form.querySelector('button[type="submit"]'); submit.disabled = true;
+        try {
+          await mutate('rebind-device', 'client_rebind_device', { form: { password } });
+          modal.close(); toast('设备已重新绑定，旧凭据已吊销');
+        } catch (error) {
+          const alert = form.querySelector('[data-rebind-error]'); if (alert) alert.textContent = message(error);
+          document.getElementById('rebind-password')?.focus();
+        } finally { if (submit.isConnected) submit.disabled = false; }
       } else if (form.dataset.form === 'metadata' || form.dataset.form === 'rename') {
         const item = device(form.dataset.id); if (!item || ui.busy.has('metadata')) return;
         const rename = form.dataset.form === 'rename'; const values = new FormData(form);
@@ -761,6 +867,9 @@
         if (rename) modal.close(); render(); toast('设备信息已保存');
       }
     })().catch(error => toast(message(error)));
+  });
+  modal.addEventListener('close', () => {
+    for (const input of modal.querySelectorAll('input[type="password"]')) input.value = '';
   });
   document.addEventListener('keydown', event => {
     if (event.key === 'Escape') { if (!menu.hidden) { closeMenu(true); event.preventDefault(); } return; }

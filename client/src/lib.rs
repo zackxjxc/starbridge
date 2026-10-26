@@ -7,8 +7,10 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use starbridge_protocol::{
-    AuthRequest, AuthResponse, ConnectionPolicy, DeviceInfo, DeviceRegistration, ErrorResponse,
+    AuthRequest, AuthResponse, ConnectionPolicy, DeviceInfo, DeviceRegistration,
+    DeviceRegistrationResponse, DeviceRebindRequest, ErrorResponse,
     FrpRoute, HealthResponse, HeartbeatRequest, Role, SessionCreateRequest, SessionInfo,
+    SessionHistoryPage, SessionHistoryQuery,
     SessionPath, SessionStatus, SessionStatusRequest, SshPrivilege, new_token, now_unix,
 };
 use std::{
@@ -23,12 +25,18 @@ use std::{
 use tokio::sync::{Mutex, RwLock};
 
 mod account;
+mod identity;
+mod secure_store;
+pub mod data_directory;
+pub use identity::Identity;
 mod connections;
 mod diagnostics;
+mod history;
 mod process;
 use account::*;
 use connections::*;
 use diagnostics::*;
+use history::*;
 
 #[cfg(feature = "desktop")]
 pub mod desktop;
@@ -75,21 +83,6 @@ impl Default for ClientConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Identity {
-    pub node_id: String,
-    pub device_token: String,
-}
-
-impl Default for Identity {
-    fn default() -> Self {
-        Self {
-            node_id: starbridge_protocol::new_id(),
-            device_token: new_token(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize)]
 pub struct RuntimeStatus {
     pub frpc_path: String,
@@ -125,6 +118,7 @@ pub struct ClientSnapshot {
     pub sessions: Vec<SessionView>,
     pub stage: String,
     pub last_error: Option<String>,
+    pub device_rebind_required: bool,
     pub runtime: RuntimeStatus,
     pub ssh: SshStatus,
     pub ssh_command: Option<String>,
@@ -200,6 +194,7 @@ struct Inner {
     self_test: TestView,
     auth_generation: u64,
     closing_account: bool,
+    device_rebind_required: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -222,8 +217,12 @@ impl ClientApp {
     pub async fn load(_role: Role, root: PathBuf) -> anyhow::Result<Self> {
         tokio::fs::create_dir_all(&root).await?;
         let mut config = load_json(&root.join("config.json"), ClientConfig::default()).await?;
-        let identity = load_json(&root.join("identity.json"), Identity::default()).await?;
+        let mut identity = identity::load_identity(&root).await?;
         let auth = load_auth(&root, config.remember_login).await.unwrap_or(None);
+        if let Some(auth) = &auth {
+            identity.select_account(&account_scope(&config.server_url, &auth.username));
+            identity::save_identity(&root, &identity).await?;
+        }
         if config.last_username.is_empty() {
             if let Some(auth) = &auth { config.last_username = auth.username.clone(); }
         }
@@ -257,6 +256,7 @@ impl ClientApp {
                 verified_sessions: HashMap::new(), operations: HashMap::new(),
                 connection_generations: HashMap::new(), blocked_peers: HashSet::new(),
                 batch: None, self_test, auth_generation: 0, closing_account: false,
+                device_rebind_required: false,
             })),
             http: reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(15)).build()?,
             frpc_processes: Arc::new(Mutex::new(HashMap::new())),
@@ -416,6 +416,7 @@ impl ClientApp {
             .route("/api/v1/device", axum::routing::put(update_device))
             .route("/api/v1/devices", axum::routing::put(update_device))
             .route("/api/v1/devices/delete", post(delete_device))
+            .route("/api/v1/devices/rebind", post(rebind_device))
             .route("/api/v1/connect", post(connect))
             .route("/api/v1/connect/all", post(connect_all))
             .route("/api/v1/terminate", post(terminate))
@@ -423,6 +424,7 @@ impl ClientApp {
             .route("/api/v1/test/start", post(start_test))
             .route("/api/v1/test/cancel", post(cancel_test))
             .route("/api/v1/components", get(components))
+            .route("/api/v1/history", post(connection_history))
             .route("/api/v1/disconnect", delete(disconnect))
             .route("/api/v1/sessions/{id}", delete(disconnect_session))
             .route("/api/v1/copy/nodes", get(copy_nodes))
@@ -437,11 +439,11 @@ impl ClientApp {
                 interval.tick().await;
                 {
                     let inner=app.inner.read().await;
-                    if inner.auth.is_none() || inner.closing_account {continue;}
+                    if inner.auth.is_none() || inner.closing_account || inner.device_rebind_required {continue;}
                 }
                 let attempted = app.inner.read().await.auth_generation;
                 if let Err(error) = app.heartbeat_once().await {
-                    let status = error.downcast_ref::<reqwest::Error>().and_then(reqwest::Error::status);
+                    let status = registration_status(&error);
                     let unauthorized = status == Some(StatusCode::UNAUTHORIZED);
                     if app.inner.read().await.auth_generation != attempted { continue; }
                     if status == Some(StatusCode::GONE) {
@@ -458,6 +460,7 @@ impl ClientApp {
                         inner.stage = "ready".into(); inner.last_error = Some("登录已失效，请重新登录".into());
                     } else {
                         let mut inner = app.inner.write().await;
+                        if matches!(status, Some(StatusCode::CONFLICT | StatusCode::FORBIDDEN)) { inner.device_rebind_required = true; }
                         inner.stage = "heartbeat_failed".into(); inner.last_error = Some(error.to_string());
                     }
                 }
@@ -738,7 +741,8 @@ fn device_registration(inner: &Inner) -> DeviceRegistration {
     }
     DeviceRegistration {
         node_id: inner.identity.node_id.clone(),
-        device_token: inner.identity.device_token.clone(),
+        device_token: inner.identity.pending_rebind_token.as_ref().unwrap_or(&inner.identity.device_token).clone(),
+        machine_key: Some(inner.identity.machine_key.clone()),
         display_name: inner.config.display_name.clone(),
         purpose: inner.config.purpose.clone(),
         role: Role::Peer,
@@ -818,11 +822,10 @@ async fn copy_nodes(State(app): State<ClientApp>) -> Json<serde_json::Value> {
         .filter(|d| d.node_id != inner.identity.node_id && d.online && d.capabilities.iter().any(|capability| capability == "ssh_server"))
         .map(|d| {
             format!(
-                "{} ({}) · {} · {}",
+                "{} · {} · {} · 在线",
                 d.display_name,
-                d.ssh_alias,
+                if d.purpose.is_empty() { "未设置用途" } else { &d.purpose },
                 d.os,
-                d.capabilities.join(", ")
             )
         })
         .collect::<Vec<_>>()
@@ -886,6 +889,7 @@ fn snapshot(inner: &Inner) -> ClientSnapshot {
         sessions,
         stage: inner.stage.clone(),
         last_error: inner.last_error.clone(),
+        device_rebind_required: inner.device_rebind_required,
         runtime: inner.runtime.clone(),
         ssh: inner.ssh.clone(),
         updated_at: now_unix(),
@@ -1491,6 +1495,10 @@ mod tests {
             inner.verified_sessions.insert(info.session_id.clone(),now_unix());
             assert!(session_ssh_command(&inner,&info).is_some());
         }
+        let ready_export = export_connections(State(app.clone()),Json(ExportForm {target_node_ids:vec![]})).await.unwrap().0;
+        assert!(!ready_export["text"].as_str().unwrap().contains("节点 ID"));
+        assert!(ready_export["items"][0].get("node_id").is_none());
+        assert!(ready_export["items"][0].get("source_node_id").is_none());
         app.terminate_targets(None,false).await;
         let exported = export_connections(State(app.clone()),Json(ExportForm {target_node_ids:vec![]})).await.unwrap().0;
         assert_eq!(exported["items"].as_array().unwrap().len(),0);

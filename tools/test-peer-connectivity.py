@@ -48,6 +48,61 @@ class SetupError(Exception):
   pass
 
 
+def read_test_identity(work, name):
+  """Read only this run's isolated profile; never print decrypted credential data."""
+  if name not in {"node-a", "node-b", "node-c"}:
+    raise RegressionError("Unexpected test profile")
+  root = (work / name).resolve()
+  if root.parent != work.resolve():
+    raise RegressionError("Test profile escaped the isolated work directory")
+  try:
+    payload = (root / "identity.secure").read_bytes()
+    if os.name == "nt":
+      from ctypes import wintypes
+
+      class Blob(ctypes.Structure):
+        _fields_ = [("size", wintypes.DWORD), ("data", ctypes.POINTER(ctypes.c_ubyte))]
+
+      crypt = ctypes.WinDLL("crypt32", use_last_error=True)
+      kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+      crypt.CryptUnprotectData.argtypes = [ctypes.POINTER(Blob), ctypes.c_void_p,
+          ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(Blob)]
+      crypt.CryptUnprotectData.restype = wintypes.BOOL
+      kernel.LocalFree.argtypes = [ctypes.c_void_p]
+      kernel.LocalFree.restype = ctypes.c_void_p
+      buffer = (ctypes.c_ubyte * len(payload)).from_buffer_copy(payload)
+      source, output = Blob(len(payload), buffer), Blob()
+      if not crypt.CryptUnprotectData(ctypes.byref(source), None, None, None, None, 1, ctypes.byref(output)):
+        raise ValueError("Unable to read test credentials")
+      try:
+        payload = ctypes.string_at(output.data, output.size)
+      finally:
+        kernel.LocalFree(output.data)
+    elif sys.platform == "darwin":
+      security = ctypes.CDLL("/System/Library/Frameworks/Security.framework/Security")
+      security.SecKeychainFindGenericPassword.argtypes = [ctypes.c_void_p,
+          ctypes.c_uint32, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_char_p,
+          ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
+      security.SecKeychainFindGenericPassword.restype = ctypes.c_int32
+      security.SecKeychainItemFreeContent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+      service = b"net.starbridge.client.credentials.v1"
+      length, data = ctypes.c_uint32(), ctypes.c_void_p()
+      status = security.SecKeychainFindGenericPassword(None, len(service), service,
+          len(payload), payload, ctypes.byref(length), ctypes.byref(data), None)
+      if status != 0:
+        raise ValueError("Unable to read test credentials")
+      try:
+        payload = ctypes.string_at(data, length.value)
+      finally:
+        security.SecKeychainItemFreeContent(None, data)
+    identity = json.loads(payload)
+    if not isinstance(identity.get("node_id"), str) or not isinstance(identity.get("device_token"), str):
+      raise ValueError("Invalid test credentials")
+    return identity
+  except (OSError, ValueError, AttributeError):
+    raise RegressionError("Unable to read the isolated test device credentials") from None
+
+
 class WindowsJob:
   """Closing a job kills its complete process tree, including orphaned FRP/SSH."""
 
@@ -359,7 +414,7 @@ class PeerRegression:
     api(self.urls[index], "/api/v1/sessions/" + session["session_id"], "DELETE")
 
   def assert_occupied(self, index, target):
-    identity = json.loads((self.work / ("node-" + "abc"[index]) / "identity.json").read_text(encoding="utf-8"))
+    identity = read_test_identity(self.work, "node-" + "abc"[index])
     try:
       api(self.center, "/api/v1/sessions", "POST", {
         "initiator_node_id": identity["node_id"], "device_token": identity["device_token"],
@@ -421,7 +476,8 @@ class PeerRegression:
     def collect(value):
       if isinstance(value, dict):
         for key, child in value.items():
-          if key in {"access_token", "refresh_token", "device_token", "secret_key", "auth_token", "password"}:
+          if key in {"access_token", "refresh_token", "device_token", "pending_rebind_token",
+                     "secret_key", "auth_token", "password", "machine_key", "machine_uid", "account_bindings"}:
             if isinstance(child, str):
               sensitive.add(child)
           collect(child)
@@ -431,7 +487,13 @@ class PeerRegression:
 
     for path in self.work.rglob("*.json"):
       with contextlib.suppress(OSError, ValueError):
-        collect(json.loads(path.read_text(encoding="utf-8")))
+        value = json.loads(path.read_text(encoding="utf-8"))
+        collect(value)
+        if path.name == "machine.json" and isinstance(value, dict) and isinstance(value.get("key"), str):
+          sensitive.add(value["key"])
+    for name in "abc":
+      with contextlib.suppress(RegressionError):
+        collect(read_test_identity(self.work, "node-" + name))
     sensitive = {value for value in sensitive if value and len(value) >= 8}
     leaks = []
     for path in self.work.rglob("*.log"):
@@ -524,7 +586,7 @@ class PeerRegression:
 
     self.verify_offline_disconnect(ids[1])
 
-    identities = [(self.work / ("node-" + name) / "identity.json").read_bytes() for name in "abc"]
+    identities = [read_test_identity(self.work, "node-" + name) for name in "abc"]
     for process in self.nodes:
       process.stop()
       self.processes.remove(process)
@@ -536,8 +598,10 @@ class PeerRegression:
     if [(self.work / ("node-" + name) / "ssh" / filename).read_bytes()
         for name in "abc" for filename in ("id_ed25519.pub", "host_ed25519.pub")] != keys:
       raise RegressionError("SSH client/host identity changed after restart")
-    if [(self.work / ("node-" + name) / "identity.json").read_bytes() for name in "abc"] != identities:
+    if [read_test_identity(self.work, "node-" + name) for name in "abc"] != identities:
       raise RegressionError("Persisted device credentials changed after restart")
+    if any((self.work / ("node-" + name) / "identity.json").exists() for name in "abc"):
+      raise RegressionError("Plaintext device credentials remained after secure migration")
     self.wait_sessions([])
     ba = self.connect(1, ids[0])
     self.wait_sessions([ba["session_id"]])
@@ -647,7 +711,7 @@ def main():
           print("FAIL: test credentials appeared in logs: " + ", ".join(leaks), file=sys.stderr)
           exit_code = 1
         else:
-          print("PASS: logs contain no test passwords or access/device/FRP/session tokens", flush=True)
+          print("PASS: logs contain no test passwords, machine lookup keys or access/device/FRP/session tokens", flush=True)
     except (OSError, RegressionError) as error:
       print(f"FAIL: cleanup/log check: {error}", file=sys.stderr)
       exit_code = 1

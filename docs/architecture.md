@@ -34,7 +34,7 @@ Windows 桌面窗口由 Tauri 配置 `decorations(false)` 与 `shadow(true)`，�
 
 `--headless` 保留本地 HTTP 控制台与原有版本化 REST API，供联调和自动化使用，`--no-browser` 兼容该模式。两种入口复用登录、配置、设备、会话和传输逻辑；`--no-default-features` 可构建不依赖 Tauri 系统库的无界面客户端。
 
-便携版默认将设备数据写入可执行文件旁的 `state/node/`，`--data-dir` 可覆盖；新目录不存在时，若旧 `state/controller/` 含设备身份，会原地复用。旧启动脚本仍使用原数据目录，旧 `--role controller|executor` 参数只用于兼容目录选择，不再限制连接方向。运行时依次查找数据目录、其父目录和可执行文件旁的 `runtime/`。关闭桌面窗口时先停止后台任务，再清理受管子进程，避免窗口退出后留下隧道或 SSH 服务。
+便携版默认将设备数据写入当前用户的系统目录：Windows `%LOCALAPPDATA%/StarBridge`，macOS `~/Library/Application Support/StarBridge`。同一用户从不同程序目录启动共用默认身份和实例锁。显式 `--data-dir` 为开发联调提供独立身份隔离域，旧双实例启动脚本仍使用各自的显式目录。机器识别、凭据验证、旧数据迁移及冲突处理见 [设备身份与迁移](machine-identity.md)。运行时依次查找数据目录、其父目录和可执行文件旁的 `runtime/`。关闭桌面窗口时先停止后台任务，再清理受管子进程，避免窗口退出后留下隧道或 SSH 服务。
 
 ## 统一设备与会话准入
 

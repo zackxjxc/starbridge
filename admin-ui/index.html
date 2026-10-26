@@ -6,7 +6,8 @@
   <title>StarBridge 管理台</title>
   <style>
     :root { color-scheme: dark; font-family: system-ui, sans-serif; background:#10141d; color:#e7edf7; }
-    body { max-width:1100px; margin:0 auto; padding:32px 20px; }
+    body { max-width:1100px; margin:0 auto; padding:32px 20px; -webkit-user-select:none; user-select:none; }
+    input:read-write, textarea:read-write, [data-copyable] { -webkit-user-select:text; user-select:text; }
     h1 { margin:0 0 6px; } .muted { color:#95a2b7; }
     .toolbar { display:flex; gap:12px; align-items:center; margin:24px 0 16px; flex-wrap:wrap; }
     button { border:0; border-radius:8px; padding:9px 14px; background:#4f8cff; color:white; cursor:pointer; }
@@ -26,9 +27,26 @@
   <script>
     let token='';
     function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+    function showMessage(text, copyable=false){ const element=document.querySelector('#message'); element.textContent=text; element.toggleAttribute('data-copyable',copyable&&String(text??'').trim().length>0); }
+    function copyableRegion(node){ return (node?.nodeType===Node.ELEMENT_NODE?node:node?.parentElement)?.closest('[data-copyable]'); }
+    function guardClipboard(event){
+      const editor=event.target instanceof Element?event.target.closest('input,textarea'):null;
+      if(editor){
+        if(!editor.disabled&&!editor.readOnly&&(editor.tagName==='TEXTAREA'||['text','password','search','email','url','tel'].includes(editor.type))) return;
+        event.preventDefault(); return;
+      }
+      const selection=window.getSelection();
+      if(event.type==='copy'&&selection&&selection.rangeCount===1&&!selection.isCollapsed&&selection.toString().trim()){
+        const range=selection.getRangeAt(0); const region=copyableRegion(range.startContainer);
+        if(region&&region===copyableRegion(range.endContainer)&&region.contains(range.commonAncestorContainer)) return;
+      }
+      event.preventDefault();
+    }
+    document.addEventListener('copy',guardClipboard);
+    document.addEventListener('cut',guardClipboard);
     async function loadHealth(){ const r=await fetch('/api/health'); const j=await r.json(); document.querySelector('#health').textContent=`${j.service} ${j.version} · ${new Date(j.now*1000).toLocaleTimeString()}`; }
-    async function login(){ try { const r=await fetch('/api/v1/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:document.querySelector('#username').value,password:document.querySelector('#password').value})}); const j=await r.json(); if(!r.ok) throw new Error(j.error); token=j.access_token; await loadSummary(); } catch(e){ document.querySelector('#message').textContent=e.message; } }
-    async function loadSummary(){ if(!token){ document.querySelector('#message').textContent='请先登录管理台。'; return; } try { const r=await fetch('/api/v1/admin/summary',{headers:{Authorization:`Bearer ${token}`}}); const j=await r.json(); if(!r.ok) throw new Error(j.error); document.querySelector('#devices').innerHTML=j.devices.length?j.devices.map(d=>`<tr><td>${esc(d.display_name)}<br><span class="muted">${esc(d.ssh_alias)}</span></td><td>${esc(d.account)}</td><td>${esc(d.os)}/${esc(d.arch)}</td><td>${esc(d.capabilities.join(', '))}</td><td class="${d.online?'online':''}">${d.online?'在线':'离线'}</td></tr>`).join(''):'<tr><td colspan="5">暂无设备</td></tr>'; document.querySelector('#sessions').innerHTML=j.sessions.length?j.sessions.map(s=>`<tr><td>${esc(s.session_id.slice(0,8))}</td><td>${esc(s.policy)}</td><td>${esc(s.path)}</td><td>${esc(s.status)}</td><td>${esc(s.failure_reason||'')}</td></tr>`).join(''):'<tr><td colspan="5">暂无会话</td></tr>'; document.querySelector('#message').textContent=`账户 ${j.account} · 已刷新`; } catch(e){ document.querySelector('#message').textContent=e.message; } }
+    async function login(){ try { const r=await fetch('/api/v1/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:document.querySelector('#username').value,password:document.querySelector('#password').value})}); const j=await r.json(); if(!r.ok) throw new Error(j.error); token=j.access_token; await loadSummary(); } catch(e){ showMessage(e.message,true); } }
+    async function loadSummary(){ if(!token){ showMessage('请先登录管理台。'); return; } try { const r=await fetch('/api/v1/admin/summary',{headers:{Authorization:`Bearer ${token}`}}); const j=await r.json(); if(!r.ok) throw new Error(j.error); document.querySelector('#devices').innerHTML=j.devices.length?j.devices.map(d=>`<tr><td data-copyable>${esc(d.display_name)}</td><td data-copyable>${esc(d.account)}</td><td>${esc(d.os)}/${esc(d.arch)}</td><td>${esc(d.capabilities.join(', '))}</td><td class="${d.online?'online':''}">${d.online?'在线':'离线'}</td></tr>`).join(''):'<tr><td colspan="5">暂无设备</td></tr>'; document.querySelector('#sessions').innerHTML=j.sessions.length?j.sessions.map(s=>`<tr><td>${esc(s.session_id.slice(0,8))}</td><td>${esc(s.policy)}</td><td>${esc(s.path)}</td><td>${esc(s.status)}</td><td${s.failure_reason?' data-copyable':''}>${esc(s.failure_reason||'')}</td></tr>`).join(''):'<tr><td colspan="5">暂无会话</td></tr>'; showMessage(`账户 ${j.account} · 已刷新`); } catch(e){ showMessage(e.message,true); } }
     loadHealth();
   </script>
 </body>
