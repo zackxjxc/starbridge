@@ -10,6 +10,7 @@
   const languageMenu = document.getElementById('language-menu');
   const desktop = window.__TAURI__?.core;
   const frameless = !!desktop && window.__STARBRIDGE_FRAMELESS__ === true;
+  const closeLabel = window.__STARBRIDGE_TRAY__ === true ? '关闭到托盘' : '关闭';
   const activeStates = new Set(['negotiating', 'connected']);
   const workingStates = new Set(['queued', 'connecting', 'verifying']);
   const ui = {
@@ -609,7 +610,7 @@
         button(t("退出登录"), 'logout', { class: 'link', disabled: ui.busy.has('logout') })] : null),
       frameless ? h('div', { class: 'window-controls', 'aria-label': t("窗口操作") },
         button('', 'window-minimize', { class: 'window-button', 'aria-label': t("最小化窗口"), title: t("最小化") }, 'minimize'),
-        button('', 'window-close', { class: 'window-button window-close', 'aria-label': t("关闭窗口"), title: t("关闭") }, 'close')) : null);
+        button('', 'window-close', { class: 'window-button window-close', 'aria-label': t(closeLabel), title: t(closeLabel) }, 'close')) : null);
   }
   function authPage() {
     const registering = ui.authMode === 'register';

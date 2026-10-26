@@ -1,6 +1,159 @@
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tauri::{RunEvent, WebviewUrl, WebviewWindowBuilder};
+use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+
+#[derive(Default)]
+struct DesktopLifecycle {
+    exit_pending: AtomicBool,
+    shutdown_complete: AtomicBool,
+}
+
+struct ExitMenu(MenuItem<tauri::Wry>);
+
+fn restore_main(handle: &tauri::AppHandle) -> tauri::Result<()> {
+    if let Some(window) = handle.get_webview_window("main") {
+        window.show()?;
+        window.unminimize()?;
+        window.set_focus()?;
+    }
+    if let Some(notice) = handle.get_webview_window("tray-notice") {
+        let _ = notice.close();
+    }
+    Ok(())
+}
+
+fn start_shutdown(handle: tauri::AppHandle) {
+    if let Some(item) = handle.try_state::<ExitMenu>() {
+        let _ = item.0.set_enabled(false);
+        let _ = item.0.set_text("正在退出…");
+    }
+    tauri::async_runtime::spawn(async move {
+        handle.state::<ClientApp>().shutdown().await;
+        handle.state::<DesktopLifecycle>().shutdown_complete.store(true, Ordering::Release);
+        handle.exit(0);
+    });
+}
+
+fn requires_exit_confirmation<'a>(
+    mut sessions: impl Iterator<Item = SessionStatus>,
+    mut operations: impl Iterator<Item = &'a str>,
+    test_state: &str,
+) -> bool {
+    sessions.any(|status| matches!(status, SessionStatus::Negotiating | SessionStatus::Connected))
+        || operations.any(|state| matches!(state, "queued" | "connecting" | "verifying"))
+        || matches!(test_state, "running" | "cleaning")
+}
+
+fn request_exit(handle: &tauri::AppHandle) {
+    // Reserve the whole check / confirmation / cleanup flow, including repeated OS exit requests.
+    if handle.state::<DesktopLifecycle>().exit_pending.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let handle = handle.clone();
+    tauri::async_runtime::spawn(async move {
+        let active = {
+            let core = handle.state::<ClientApp>();
+            let inner = core.inner.read().await;
+            requires_exit_confirmation(
+                inner.sessions.values().map(|session| session.status),
+                inner.operations.values().map(|operation| operation.state.as_str()),
+                &inner.self_test.state,
+            )
+        };
+        if !active {
+            start_shutdown(handle);
+            return;
+        }
+        let _ = restore_main(&handle);
+        let mut dialog = handle.dialog()
+            .message("退出将断开本机所有连接，取消等待任务和连接测试，并停止后台服务。")
+            .title("退出 StarBridge？")
+            .kind(MessageDialogKind::Warning)
+            .buttons(MessageDialogButtons::OkCancelCustom("退出".into(), "取消".into()));
+        if let Some(window) = handle.get_webview_window("main") {
+            dialog = dialog.parent(&window);
+        }
+        dialog.show(move |confirmed| {
+            if confirmed {
+                start_shutdown(handle);
+            } else {
+                handle.state::<DesktopLifecycle>().exit_pending.store(false, Ordering::Release);
+            }
+        });
+    });
+}
+
+fn create_tray(handle: &tauri::AppHandle) -> anyhow::Result<()> {
+    let exit = MenuItem::with_id(handle, "exit", "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(handle, &[&exit])?;
+    let icon = handle.default_window_icon().cloned()
+        .ok_or_else(|| anyhow::anyhow!("缺少应用图标"))?;
+    let _tray = TrayIconBuilder::with_id("main")
+        .icon(icon)
+        .tooltip("StarBridge · 后台运行")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|handle, event| {
+            if event.id.as_ref() == "exit" {
+                request_exit(handle);
+            }
+        })
+        .on_tray_icon_event(|tray, event| {
+            if matches!(event, TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. }) {
+                if let Err(error) = restore_main(tray.app_handle()) {
+                    tracing::warn!(%error, "无法从托盘恢复窗口");
+                }
+            }
+        })
+        .build(handle)?;
+    #[cfg(windows)]
+    if _tray.rect()?.is_none() {
+        handle.remove_tray_by_id("main");
+        anyhow::bail!("系统托盘区域不可用");
+    }
+    handle.manage(ExitMenu(exit));
+    Ok(())
+}
+
+fn show_tray_notice(handle: &tauri::AppHandle, window: &tauri::WebviewWindow, root: &std::path::Path) {
+    let marker = root.join("tray-notice-seen");
+    if marker.exists() || handle.get_webview_window("tray-notice").is_some() {
+        return;
+    }
+    // A non-activating local notice also works in the portable package without OS notification setup.
+    let mut notice = WebviewWindowBuilder::new(handle, "tray-notice", WebviewUrl::App("tray-notice.html".into()))
+        .title("StarBridge")
+        .inner_size(360.0, 138.0)
+        .decorations(false)
+        .resizable(false)
+        .skip_taskbar(true)
+        .always_on_top(true)
+        .focused(false)
+        .focusable(false);
+    if let Ok(Some(monitor)) = window.current_monitor() {
+        let area = monitor.work_area();
+        let scale = monitor.scale_factor();
+        notice = notice.position(
+            (area.position.x as f64 + area.size.width as f64) / scale - 376.0,
+            (area.position.y as f64 + area.size.height as f64) / scale - 154.0,
+        );
+    }
+    match notice.build() {
+        Ok(notice) => {
+            if let Err(error) = std::fs::write(marker, b"1\n") {
+                tracing::warn!(%error, "无法保存托盘提示状态");
+            }
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+                let _ = notice.close();
+            });
+        }
+        Err(error) => tracing::warn!(%error, "无法显示首次托盘提示"),
+    }
+}
 
 #[tauri::command]
 fn client_window_action(window: tauri::WebviewWindow, action: String) -> Result<(), String> {
@@ -202,10 +355,11 @@ async fn client_copy_nodes(app: tauri::State<'_, ClientApp>) -> Result<serde_jso
 
 /// The event loop stays on the main thread and shares the core's Tokio runtime.
 pub fn run(app: ClientApp, _role: Role, root: PathBuf) -> anyhow::Result<()> {
-    let core = app.clone();
     let desktop = tauri::Builder::default()
         .manage(app)
+        .manage(DesktopLifecycle::default())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             client_window_action,
             client_state,
@@ -230,6 +384,18 @@ pub fn run(app: ClientApp, _role: Role, root: PathBuf) -> anyhow::Result<()> {
             client_copy_nodes,
         ])
         .build(tauri::generate_context!())?;
+    // Linux does not deliver tray left-click events, so this one-item menu cannot restore a window there.
+    let tray_available = if cfg!(target_os = "linux") {
+        false
+    } else {
+        match create_tray(desktop.handle()) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, "托盘创建失败，关闭窗口将退出客户端");
+                false
+            }
+        }
+    };
     // Build before run so startup failures return to main's error dialog and cleanup.
     let window = WebviewWindowBuilder::new(&desktop, "main", WebviewUrl::App("index.html".into()))
         .title("StarBridge")
@@ -238,6 +404,7 @@ pub fn run(app: ClientApp, _role: Role, root: PathBuf) -> anyhow::Result<()> {
         .max_inner_size(900.0, 600.0)
         .resizable(false)
         .maximizable(false)
+        .initialization_script(format!("Object.defineProperty(window, '__STARBRIDGE_TRAY__', {{ value: {tray_available} }});"))
         .data_directory(root.join("webview"))
         .on_navigation(|url| {
             (url.scheme() == "tauri" && url.host_str() == Some("localhost"))
@@ -250,19 +417,73 @@ pub fn run(app: ClientApp, _role: Role, root: PathBuf) -> anyhow::Result<()> {
         .shadow(true)
         .initialization_script("Object.defineProperty(window, '__STARBRIDGE_FRAMELESS__', { value: true });");
     window.build()?;
-    let closing = AtomicBool::new(false);
     desktop.run(move |handle, event| {
-        if let RunEvent::ExitRequested { api, .. } = event {
-            if !closing.swap(true, Ordering::SeqCst) {
-                api.prevent_exit();
-                let core = core.clone();
-                let handle = handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    core.shutdown().await;
-                    handle.exit(0);
-                });
+        match event {
+            RunEvent::WindowEvent { label, event: WindowEvent::CloseRequested { api, .. }, .. }
+                if label == "main" => {
+                api.prevent_close();
+                if handle.state::<DesktopLifecycle>().exit_pending.load(Ordering::Acquire) {
+                    return;
+                }
+                if tray_available && handle.tray_by_id("main").is_some() {
+                    if let Some(window) = handle.get_webview_window("main") {
+                        match window.hide() {
+                            Ok(()) => show_tray_notice(handle, &window, &root),
+                            Err(error) => {
+                                tracing::warn!(%error, "隐藏窗口失败，改为正常退出");
+                                request_exit(handle);
+                            }
+                        }
+                    }
+                } else {
+                    request_exit(handle);
+                }
             }
+            RunEvent::ExitRequested { api, .. } => {
+                if handle.state::<DesktopLifecycle>().shutdown_complete.load(Ordering::Acquire) {
+                    return;
+                }
+                api.prevent_exit();
+                request_exit(handle);
+            }
+            _ => {}
         }
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_confirms_any_active_session_including_incoming() {
+        for status in [SessionStatus::Negotiating, SessionStatus::Connected] {
+            assert!(requires_exit_confirmation(
+                [SessionStatus::Closed, status].into_iter(), std::iter::empty(), "idle",
+            ));
+        }
+        assert!(!requires_exit_confirmation(
+            [SessionStatus::Closed, SessionStatus::Failed].into_iter(), std::iter::empty(), "idle",
+        ));
+    }
+
+    #[test]
+    fn exit_confirms_queued_connections_and_test_cleanup() {
+        for state in ["queued", "connecting", "verifying"] {
+            assert!(requires_exit_confirmation(std::iter::empty(), ["failed", state].into_iter(), "idle"));
+        }
+        for state in ["running", "cleaning"] {
+            assert!(requires_exit_confirmation(std::iter::empty(), std::iter::empty(), state));
+        }
+    }
+
+    #[test]
+    fn exit_does_not_confirm_idle_or_finished_work() {
+        for state in ["idle", "passed", "failed", "cancelled", "unverified"] {
+            assert!(!requires_exit_confirmation(
+                std::iter::empty(), ["failed", "terminated", "skipped"].into_iter(), state,
+            ));
+        }
+    }
 }
