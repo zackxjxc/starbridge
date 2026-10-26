@@ -90,6 +90,8 @@ pub struct RuntimeStatus {
     pub frpc_available: bool,
     pub ssh_path: String,
     pub ssh_available: bool,
+    #[serde(skip)]
+    ssh_from_system: bool,
     pub message: String,
 }
 
@@ -916,6 +918,22 @@ fn session_ssh_command(inner: &Inner, session: &SessionInfo) -> Option<String> {
     inner.visitor_ports.get(&session.session_id)?;
     let target = inner.devices.iter().find(|device| device.node_id == session.target_node_id)?;
     let config = std::path::absolute(inner.root.join("ssh").join("sessions").join(&session.session_id).join("config")).ok()?;
+    if inner.runtime.ssh_from_system {
+        let config = config.display().to_string();
+        let config = if cfg!(windows) {
+            config.replace('`', "``").replace('$', "`$").replace('"', "`\"")
+        } else {
+            config.replace('\\', "\\\\").replace('$', "\\$").replace('`', "\\`").replace('"', "\\\"")
+        };
+        let alias = if target.ssh_alias.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) {
+            target.ssh_alias.clone()
+        } else if cfg!(windows) {
+            format!("'{}'", target.ssh_alias.replace('\'', "''"))
+        } else {
+            format!("'{}'", target.ssh_alias.replace('\'', "'\"'\"'"))
+        };
+        return Some(format!("ssh -F \"{config}\" {alias}"));
+    }
     let executable = std::path::absolute(&inner.runtime.ssh_path).ok()?.display().to_string();
     if cfg!(windows) {
         Some(format!("& '{}' -F '{}' '{}'", executable.replace('\'', "''"),
@@ -932,12 +950,15 @@ async fn runtime_status(root: &FsPath) -> RuntimeStatus {
     let frpc = runtime.join(if cfg!(windows) { "frpc.exe" } else { "frpc" });
     let bundled_ssh = runtime.join(if cfg!(windows) { "ssh.exe" } else { "ssh" });
     let frpc_available = frpc.is_file();
-    let (ssh, ssh_available) = select_ssh_client(command_path("ssh"), bundled_ssh, ssh_client_available).await;
+    let system_ssh = command_path("ssh");
+    let (ssh, ssh_available) = select_ssh_client(system_ssh.clone(), bundled_ssh, ssh_client_available).await;
+    let ssh_from_system = ssh_available && system_ssh.as_ref() == Some(&ssh);
     RuntimeStatus {
         frpc_path: frpc.display().to_string(),
         frpc_available,
         ssh_path: ssh.display().to_string(),
         ssh_available,
+        ssh_from_system,
         message: if frpc_available {
             "FRP 运行时已找到".into()
         } else {
@@ -1558,7 +1579,19 @@ mod tests {
             inner.visitor_ports.insert(info.session_id.clone(),22000);
             assert!(session_ssh_command(&inner,&info).is_none());
             inner.verified_sessions.insert(info.session_id.clone(),now_unix());
-            assert!(session_ssh_command(&inner,&info).is_some());
+            let config = std::path::absolute(root.join("ssh/sessions").join(&info.session_id).join("config")).unwrap();
+            inner.runtime.ssh_from_system = true;
+            assert_eq!(session_ssh_command(&inner,&info).unwrap(),
+                format!("ssh -F \"{}\" node-alias", config.display()));
+            inner.runtime.ssh_from_system = false;
+            inner.runtime.ssh_path = root.join("bundled runtime/ssh").display().to_string();
+            let executable = std::path::absolute(&inner.runtime.ssh_path).unwrap();
+            let expected = if cfg!(windows) {
+                format!("& '{}' -F '{}' 'node-alias'", executable.display(), config.display())
+            } else {
+                format!("'{}' -F '{}' 'node-alias'", executable.display(), config.display())
+            };
+            assert_eq!(session_ssh_command(&inner,&info).unwrap(), expected);
         }
         let ready_export = export_connections(State(app.clone()),Json(ExportForm {target_node_ids:vec![]})).await.unwrap().0;
         assert!(!ready_export["text"].as_str().unwrap().contains("节点 ID"));
