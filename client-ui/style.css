@@ -116,6 +116,11 @@ svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width:
 .field { display: flex; flex-direction: column; gap: 6px; font-size: 11px; color: var(--dim); margin-bottom: 13px; }
 .field input, .field textarea { width: 100%; color: var(--ink); font-size: 12px; }
 .field textarea { min-height: 60px; max-height: 120px; }
+.device-name-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.device-name-support { padding: 1px 6px; border-radius: 3px; background: var(--picked); color: var(--main); font-weight: 500; white-space: nowrap; }
+.device-name-hint { color: var(--dim); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.device-name-hint p + p { margin-top: 3px; }
+.name-sync-note { padding-top: 11px; border-top: 1px solid var(--line); line-height: 1.6; }
 .meta { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 7px 12px; margin: 14px 0 16px; font-size: 11px; }
 .meta dt { color: var(--dim); }
 .meta dd { margin: 0; overflow-wrap: anywhere; }
@@ -135,6 +140,7 @@ svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width:
 .local-detail .field { gap: 4px; margin-bottom: 10px; }
 .local-detail .field input { height: 31px; }
 .local-detail .field textarea { height: 56px; min-height: 56px; max-height: 56px; padding: 7px 10px; resize: none; overflow-y: auto; }
+.local-detail .device-name-hint { margin-top: 2px; }
 .local-detail .button { min-height: 31px; padding-top: 5px; padding-bottom: 5px; }
 .local-detail .meta { gap: 5px 10px; margin: 12px 0 0; }
 .command { margin: 10px 0; padding: 10px; border: 1px solid var(--line); border-radius: 5px; background: var(--soft); font-family: Consolas, monospace; font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }

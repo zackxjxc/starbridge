@@ -219,6 +219,14 @@
   function field(label, id, value, attrs = {}) {
     return h('label', { class: 'field', 'data-key': `field-${id}`, for: id }, label, h(attrs.multiline ? 'textarea' : 'input', { id, value, ...attrs, multiline: undefined }));
   }
+  function deviceNameField(label, id, value, attrs = {}) {
+    return h('div', { class: 'field device-name-field', 'data-key': `field-${id}` },
+      h('div', { class: 'device-name-heading' }, h('label', { for: id }, label), h('span', { class: 'device-name-support' }, '支持中文')),
+      h('input', { id, value, ...attrs, 'aria-describedby': `${id}-hint` }),
+      h('div', { class: 'device-name-hint', id: `${id}-hint` },
+        h('p', {}, '建议起个好记、易区分的名字，方便与 AI 沟通时指明设备。'),
+        h('p', {}, '例如：开发机、测试机、打包机、宠物喵、侠客剑。')));
+  }
   function metadata(item) {
     return h('dl', { class: 'meta', 'data-key': 'metadata' },
       h('dt', {}, '系统'), h('dd', {}, item.os || '未提供'),
@@ -277,7 +285,7 @@
   function editForm(item, local) {
     const draft = draftFor(item);
     return h('form', { 'data-form': 'metadata', 'data-id': item.node_id, 'data-key': `edit-${item.node_id}` },
-      local ? field('本机名称', 'device-display-name', draft.display_name, { name: 'display_name', maxlength: 80, required: true, 'data-draft': item.node_id }) : null,
+      local ? deviceNameField('本机名称', 'device-display-name', draft.display_name, { name: 'display_name', maxlength: 80, required: true, 'data-draft': item.node_id }) : null,
       field('用途备注', 'device-purpose', draft.purpose, { name: 'purpose', maxlength: 500, placeholder: '例如：开发环境、文件整理', 'data-draft': item.node_id, multiline: true }),
       h('div', { class: 'actions device-edit-actions' },
         button(ui.busy.has('metadata') ? '正在保存…' : '保存修改', '', { type: 'submit', disabled: !localRegistered() || ui.busy.has('metadata') || !ui.drafts.has(item.node_id) }),
@@ -641,8 +649,8 @@
   function renameDialog(id) {
     const item = device(id); if (!item) return;
     showModal('rename', [h('h2', { id: 'modal-title' }, '重命名设备'), h('form', { 'data-form': 'rename', 'data-id': id },
-      field('设备名称', 'rename-name', item.display_name, { name: 'display_name', maxlength: 80, required: true }),
-      h('p', { class: 'muted' }, '名称将同步到账号下的设备列表，当前连接保持不变。'),
+      deviceNameField('设备名称', 'rename-name', item.display_name, { name: 'display_name', maxlength: 80, required: true }),
+      h('p', { class: 'muted name-sync-note' }, '名称将同步到账号下的设备列表，当前连接保持不变。'),
       h('div', { class: 'actions' }, button('取消', 'close-modal'), button('保存', '', { type: 'submit', class: 'button primary' })))]);
     const input = document.getElementById('rename-name'); input.focus(); input.select();
   }
