@@ -106,8 +106,13 @@ impl Identity {
     }
 }
 
+#[cfg(test)]
 pub(super) async fn load_identity(root: &Path) -> anyhow::Result<Identity> {
-    let bytes = match secure_store::read_secret(root, "identity").await? {
+    load_identity_with_interaction(root, secure_store::Interaction::Silent).await
+}
+
+pub(super) async fn load_identity_with_interaction(root: &Path, interaction: secure_store::Interaction) -> anyhow::Result<Identity> {
+    let bytes = match secure_store::read_secret_with_interaction(root, "identity", interaction).await? {
         Some(bytes) => Some(bytes),
         None => match tokio::fs::read(root.join("identity.json")).await {
             Ok(bytes) => Some(bytes),
@@ -131,14 +136,18 @@ pub(super) async fn load_identity(root: &Path) -> anyhow::Result<Identity> {
         anyhow::bail!("设备识别来源发生变化；请保留原数据并通过账号验证处理设备绑定");
     }
     identity.machine_key = key;
-    save_identity(root, &identity).await?;
+    save_identity_with_interaction(root, &identity, interaction).await?;
     Ok(identity)
 }
 
 pub(super) async fn save_identity(root: &Path, identity: &Identity) -> anyhow::Result<()> {
+    save_identity_with_interaction(root, identity, secure_store::Interaction::Silent).await
+}
+
+pub(super) async fn save_identity_with_interaction(root: &Path, identity: &Identity, interaction: secure_store::Interaction) -> anyhow::Result<()> {
     let mut identity = identity.clone();
     identity.remember_account();
-    secure_store::write_secret(root, "identity", &serde_json::to_vec(&identity)?).await?;
+    secure_store::write_secret_with_interaction(root, "identity", &serde_json::to_vec(&identity)?, interaction).await?;
     match tokio::fs::remove_file(root.join("identity.json")).await {
         Ok(()) => {},
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},

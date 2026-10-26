@@ -27,6 +27,8 @@ use tokio::sync::{Mutex, RwLock};
 mod account;
 mod identity;
 mod secure_store;
+#[cfg(feature = "desktop")]
+mod startup;
 pub mod data_directory;
 pub use identity::Identity;
 mod connections;
@@ -224,13 +226,17 @@ pub struct ConnectForm {
 
 impl ClientApp {
     pub async fn load(_role: Role, root: PathBuf) -> anyhow::Result<Self> {
+        Self::load_with_interaction(_role, root, secure_store::Interaction::Silent).await
+    }
+
+    pub(crate) async fn load_with_interaction(_role: Role, root: PathBuf, interaction: secure_store::Interaction) -> anyhow::Result<Self> {
         tokio::fs::create_dir_all(&root).await?;
         let mut config = load_json(&root.join("config.json"), ClientConfig::default()).await?;
-        let mut identity = identity::load_identity(&root).await?;
-        let auth = load_auth(&root, config.remember_login).await.unwrap_or(None);
+        let mut identity = identity::load_identity_with_interaction(&root, interaction).await?;
+        let auth = load_auth_with_interaction(&root, config.remember_login, interaction).await?;
         if let Some(auth) = &auth {
             identity.select_account(&account_scope(&config.server_url, &auth.username));
-            identity::save_identity(&root, &identity).await?;
+            identity::save_identity_with_interaction(&root, &identity, interaction).await?;
         }
         if config.last_username.is_empty() {
             if let Some(auth) = &auth { config.last_username = auth.username.clone(); }

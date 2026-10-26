@@ -400,9 +400,14 @@ pub(super) async fn clear_saved_auth(root: &FsPath) {
     let _ = tokio::fs::remove_file(root.join("auth.json")).await;
 }
 
+#[cfg(test)]
 pub(super) async fn load_auth(root: &FsPath, remember: bool) -> anyhow::Result<Option<AuthResponse>> {
+    load_auth_with_interaction(root, remember, secure_store::Interaction::Silent).await
+}
+
+pub(super) async fn load_auth_with_interaction(root: &FsPath, remember: bool, interaction: secure_store::Interaction) -> anyhow::Result<Option<AuthResponse>> {
     if !remember { clear_saved_auth(root).await; return Ok(None); }
-    let bytes = match secure_store::read_secret(root, "auth").await? {
+    let bytes = match secure_store::read_secret_with_interaction(root, "auth", interaction).await? {
         Some(bytes) => bytes,
         None => match tokio::fs::read(root.join("auth.json")).await {
             Ok(bytes) => bytes,
@@ -412,13 +417,17 @@ pub(super) async fn load_auth(root: &FsPath, remember: bool) -> anyhow::Result<O
     };
     let auth: Option<AuthResponse> = serde_json::from_slice(&bytes)
         .map_err(|_| anyhow::anyhow!("已保存的登录状态无法读取，请重新登录"))?;
-    if let Some(auth) = &auth { save_auth(root, auth).await?; }
+    if let Some(auth) = &auth { save_auth_with_interaction(root, auth, interaction).await?; }
     Ok(auth.filter(|auth| auth.expires_at > now_unix()
         || auth.refresh_expires_at.is_some_and(|expiry| expiry > now_unix())))
 }
 
 pub(super) async fn save_auth(root: &FsPath, auth: &AuthResponse) -> anyhow::Result<()> {
-    secure_store::write_secret(root, "auth", &serde_json::to_vec(auth)?).await?;
+    save_auth_with_interaction(root, auth, secure_store::Interaction::Silent).await
+}
+
+async fn save_auth_with_interaction(root: &FsPath, auth: &AuthResponse, interaction: secure_store::Interaction) -> anyhow::Result<()> {
+    secure_store::write_secret_with_interaction(root, "auth", &serde_json::to_vec(auth)?, interaction).await?;
     match tokio::fs::remove_file(root.join("auth.json")).await {
         Ok(()) => {},
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},

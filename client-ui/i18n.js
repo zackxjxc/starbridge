@@ -3,6 +3,13 @@
 // Source strings are the Chinese fallback. Parameters are inserted once and never translated.
 (() => {
   const english = Object.freeze({
+    "无法读取已保存的设备信息": "Unable to read saved device information",
+    "原设备身份和登录凭据已保留，不会自动创建新设备或覆盖原数据。": "Your original device identity and saved sign-in data are preserved. No new device will be created and no existing data will be overwritten.",
+    "更新后的应用可能需要 macOS 重新授权。系统弹窗要求的是 Mac 登录钥匙串密码，不是 StarBridge 账号密码。拒绝或取消后会留在此页面，可稍后重试。": "macOS may require permission for the updated app. The system dialog asks for your Mac login keychain password, not your StarBridge password. If you deny or cancel, this page stays open so you can retry later.",
+    "请检查数据目录和当前系统用户的访问权限，再重试读取。": "Check the data directory and access permissions for your current system user, then retry.",
+    "授权后重试": "Allow access and retry",
+    "重试读取": "Retry reading",
+    "未获得系统钥匙串访问许可，原设备身份和登录凭据已保留。请点击“授权后重试”并在系统弹窗中允许访问。": "Keychain access was not granted. Your original device identity and sign-in data are preserved. Click Allow access and retry, then allow access in the system dialog.",
     "请选择这台电脑的使用方式": "Choose how to use this computer",
     "账号已验证。你可以新增一台设备，或替换已有实例，无需再次输入密码。": "Your account is verified. Add another device or replace an existing instance without entering your password again.",
     "选择设备使用方式": "Choose device setup",

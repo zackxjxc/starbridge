@@ -23,7 +23,7 @@
   const ui = {
     snapshot: null, config: null, view: 'device', selected: null, query: '',
     authMode: 'login', auth: { username: '', password: '', confirm_password: '', remember: true },
-    authError: '', loadError: '', syncError: '', busy: new Set(), drafts: new Map(), reauthenticate: false,
+    authError: '', loadError: '', startupError: null, syncError: '', busy: new Set(), drafts: new Map(), reauthenticate: false,
     policy: 'direct_preferred', rebuild: false, allConfig: true, failureGroup: null,
     components: null, exportData: null, exportIds: [], exportFingerprint: '', exportBack: 'device',
     historyItems: [], historyTotal: 0, historyOffset: 0, historyLoaded: false, historyError: '', historyRequest: 0,
@@ -636,6 +636,19 @@
   }
   function render() {
     renderLanguageMenu();
+    if (ui.startupError) {
+      const keychainRecovery = macosOverlay && ui.startupError.includes('钥匙串');
+      root.setAttribute('aria-busy', 'false');
+      patchChildren(root, [h('div', { class: 'shell', 'data-key': 'recovery-shell' }, header(false),
+        h('main', { class: 'auth' }, h('div', { class: 'auth-form' },
+          h('h1', {}, t("无法读取已保存的设备信息")),
+          h('p', { class: 'intro' }, t("原设备身份和登录凭据已保留，不会自动创建新设备或覆盖原数据。")),
+          h('p', { class: 'auth-error', role: 'alert', 'data-copyable': '' }, displayMessage(ui.startupError)),
+          keychainRecovery ? h('p', { class: 'muted section' }, t("更新后的应用可能需要 macOS 重新授权。系统弹窗要求的是 Mac 登录钥匙串密码，不是 StarBridge 账号密码。拒绝或取消后会留在此页面，可稍后重试。"))
+            : h('p', { class: 'muted section' }, t("请检查数据目录和当前系统用户的访问权限，再重试读取。")),
+          button(ui.busy.has('startup-retry') ? t("正在读取…") : keychainRecovery ? t("授权后重试") : t("重试读取"), 'startup-retry', { class: 'button primary wide', disabled: ui.busy.has('startup-retry') }))))]);
+      return;
+    }
     if (!s()) {
       patchChildren(root, [h('div', { class: 'shell', 'data-key': 'startup-shell' }, header(false),
         h('main', { class: 'startup', role: 'status' }, ui.loadError ? h('span', { 'data-copyable': '' }, displayMessage(ui.loadError)) : t("正在读取登录状态…"), ui.loadError ? button(t("重试"), 'retry') : null))]);
@@ -673,6 +686,7 @@
     return true;
   }
   async function refresh() {
+    if (ui.startupError || ui.busy.has('startup-retry')) return;
     const epoch = ui.epoch; const request = ++ui.request;
     try {
       const snapshot = await api('client_state');
@@ -681,6 +695,7 @@
     } catch (error) { if (epoch === ui.epoch) { if (s()) ui.syncError = message(error); else ui.loadError = message(error); render(); } }
   }
   async function polling() {
+    if (ui.startupError) return;
     await refresh(); clearTimeout(ui.poll);
     ui.poll = setTimeout(polling, s()?.logged_in && (hasWork() || testBusy()) ? 1000 : 3000);
   }
@@ -833,7 +848,14 @@
       case 'window-minimize': case 'window-close':
         if (frameless) await desktop.invoke('client_window_action', { action: actionName === 'window-close' ? 'close' : 'minimize' });
         break;
-      case 'retry': await refresh(); break;
+      case 'retry': if (s()) await refresh(); else await init(); break;
+      case 'startup-retry':
+        if (!desktop || ui.busy.has('startup-retry')) break;
+        ui.busy.add('startup-retry'); render();
+        try { await api('client_startup_retry'); ui.startupError = null; await init(); }
+        catch (error) { ui.startupError = message(error); }
+        finally { ui.busy.delete('startup-retry'); render(); }
+        break;
       case 'history': navigate('history'); await loadHistory(); break;
       case 'history-refresh': await loadHistory(); break;
       case 'history-more': await loadHistory(true); break;
@@ -1056,8 +1078,11 @@
     }
   });
   async function init() {
+    clearTimeout(ui.poll); ui.loadError = '';
     await syncDesktopLocale();
     try {
+      ui.startupError = desktop ? await api('client_startup_status') : null;
+      if (ui.startupError) { render(); return; }
       const [snapshot, config] = await Promise.all([api('client_state'), api('client_config')]);
       ui.config = config; ui.policy = ['direct_preferred', 'direct_only'].includes(config.connection_policy) ? config.connection_policy : config.direct_only ? 'direct_only' : 'direct_preferred';
       ui.rebuild = config.rebuild_relay === true; applySnapshot(snapshot);

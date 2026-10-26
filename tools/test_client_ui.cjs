@@ -7,6 +7,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { chromium } = require('playwright');
 const assets = path.join(__dirname, '../client-ui');
+const review = path.join(__dirname, '../.cache/client-ui-review');
+fs.mkdirSync(review, { recursive: true });
 
 (async () => {
   const browser = await chromium.launch({ headless: true, ...(process.platform === 'win32' ? { channel: 'msedge' } : {}) });
@@ -16,10 +18,11 @@ const assets = path.join(__dirname, '../client-ui');
       window.__STARBRIDGE_FRAMELESS__ = true;
       window.__STARBRIDGE_TRAY__ = true;
       window.__desktopLocales = [];
+      window.__windowActions = [];
       window.__TAURI__ = { core: { invoke: async (command, args) => {
         if (command === 'client_set_desktop_locale') { window.__desktopLocales.push(args.locale); return; }
         if (command === 'plugin:clipboard-manager|write_text') { window.__copied = args.text; return; }
-        if (command === 'client_window_action') return;
+        if (command === 'client_window_action') { window.__windowActions.push(args.action); return; }
         const response = await fetch('/fixture/' + command, { method: 'POST', body: JSON.stringify(args || {}) });
         const value = await response.json();
         if (!response.ok) throw new Error(value.error);
@@ -30,6 +33,9 @@ const assets = path.join(__dirname, '../client-ui');
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
     let authFailure = false;
+    let startupError = null;
+    let startupRetryDenied = false;
+    let startupRetries = 0;
     const enrollmentRequests = [];
     const calls = [];
     const state = {
@@ -46,7 +52,13 @@ const assets = path.join(__dirname, '../client-ui');
       if (url.pathname.startsWith('/fixture/')) {
         const command = url.pathname.slice('/fixture/'.length); calls.push(command);
         let value;
-        if (command === 'client_config') value = { connection_policy: 'direct_preferred', rebuild_relay: false };
+        if (command === 'client_startup_status') value = startupError;
+        else if (command === 'client_startup_retry') {
+          ++startupRetries;
+          if (startupRetryDenied) return route.fulfill({ status: 403, json: { error: startupError } });
+          startupError = null; value = null;
+        }
+        else if (command === 'client_config') value = { connection_policy: 'direct_preferred', rebuild_relay: false };
         else if (command === 'client_state') value = state;
         else if (command === 'client_login' || command === 'client_register') {
           if (authFailure) return route.fulfill({ status: 401, json: { error: '账户不存在或密码不正确，请检查后登录或注册' } });
@@ -100,7 +112,7 @@ const assets = path.join(__dirname, '../client-ui');
     await page.locator('#auth-username').fill('tester');
     await page.locator('#auth-password').fill('fixture-password');
     await page.locator('#auth-remember').uncheck();
-    const mutationsBefore = calls.filter(call => !['client_state', 'client_config'].includes(call)).length;
+    const mutationsBefore = calls.filter(call => !['client_state', 'client_config', 'client_startup_status'].includes(call)).length;
     await choose('zh-CN');
     assert.equal(await page.locator('#auth-password').inputValue(), 'fixture-password');
     assert.equal(await page.locator('#auth-username').inputValue(), 'tester');
@@ -110,7 +122,7 @@ const assets = path.join(__dirname, '../client-ui');
     await page.locator('#auth-confirm').fill('register-password');
     await choose('en');
     assert.equal(await page.locator('#auth-confirm').inputValue(), 'register-password');
-    assert.equal(calls.filter(call => !['client_state', 'client_config'].includes(call)).length, mutationsBefore);
+    assert.equal(calls.filter(call => !['client_state', 'client_config', 'client_startup_status'].includes(call)).length, mutationsBefore);
     await noChineseUI();
     await page.locator('[data-action="auth-switch"]').click();
     await page.locator('#auth-password').fill('fixture-password');
@@ -224,7 +236,7 @@ const assets = path.join(__dirname, '../client-ui');
     assert.equal(await page.locator('#modal input[type="password"]').count(), 0);
     assert.match(await page.locator('#modal').innerText(), /Active connections: 2/);
     await noChineseUI();
-    await page.screenshot({ path: path.join(__dirname, '../.cache/device-enrollment-review/enrollment-choice.png') });
+    await page.screenshot({ path: path.join(review, 'enrollment-choice.png') });
     await page.locator('[data-action="add-instance"]').click();
     await page.waitForFunction(() => !document.querySelector('#modal').open);
     assert.deepEqual(enrollmentRequests.at(-1), { choice: 'add', target_node_id: null });
@@ -262,8 +274,47 @@ const assets = path.join(__dirname, '../client-ui');
     assert.equal(await notice.locator('html').getAttribute('lang'), 'zh-CN');
     assert.match(await notice.locator('#notice-body').textContent(), /连接保持不变/);
     await notice.close();
+    await page.close();
+
+    // Emulate only the web layout and IPC contract; native macOS authorization is separate.
+    startupError = '未获得系统钥匙串访问许可，原设备身份和登录凭据已保留。请点击“授权后重试”并在系统弹窗中允许访问。';
+    startupRetryDenied = true;
+    Object.assign(state, { logged_in: false, username: null, devices: [], device_rebind_required: false, enrollment_candidates: [] });
+    const recovery = await context.newPage();
+    await recovery.addInitScript(() => {
+      Object.defineProperty(window, '__STARBRIDGE_FRAMELESS__', { get: () => false, set() {}, configurable: true });
+      window.__STARBRIDGE_MACOS_OVERLAY__ = true;
+    });
+    recovery.on('pageerror', error => errors.push(error.message));
+    const recoveryStart = calls.length;
+    await recovery.goto('http://starbridge.test/');
+    await recovery.locator('[data-key="recovery-shell"]').waitFor();
+    assert.match(await recovery.locator('body').innerText(), /Unable to read saved device information/);
+    assert.match(await recovery.locator('body').innerText(), /Mac login keychain password/);
+    assert.equal(await recovery.locator('[data-action="window-close"]').count(), 0);
+    assert.equal(await recovery.locator('.app-header').evaluate(node => getComputedStyle(node).height), '44px');
+    assert.equal(await recovery.locator('.app-header').evaluate(node => getComputedStyle(node).paddingLeft), '84px');
+    await recovery.locator('.app-header').dispatchEvent('mousedown', { button: 0, detail: 1 });
+    assert.equal(await recovery.evaluate(() => window.__windowActions.at(-1)), 'drag');
+    const dragCount = await recovery.evaluate(() => window.__windowActions.length);
+    await recovery.locator('#language-trigger').dispatchEvent('mousedown', { button: 0, detail: 1 });
+    assert.equal(await recovery.evaluate(() => window.__windowActions.length), dragCount);
+    await recovery.waitForTimeout(1350);
+    assert.equal(startupRetries, 0, 'Reading startup status must never request authorization');
+    await recovery.locator('[data-action="startup-retry"]').click();
+    await recovery.waitForFunction(() => !document.querySelector('[data-action="startup-retry"]').disabled);
+    assert.equal(startupRetries, 1);
+    assert.equal(await recovery.locator('[data-key="recovery-shell"]').count(), 1);
+    assert.ok(calls.slice(recoveryStart).every(command => ['client_startup_status', 'client_startup_retry'].includes(command)), 'Recovery must block all account/device commands');
+    await recovery.screenshot({ path: path.join(review, 'recovery-macos-layout.png') });
+    startupRetryDenied = false;
+    await recovery.locator('[data-action="startup-retry"]').click();
+    await recovery.locator('[data-form="auth"]').waitFor();
+    assert.equal(startupRetries, 2);
+    assert.equal(await recovery.locator('[data-key="recovery-shell"]').count(), 0);
+    await recovery.close();
     assert.deepEqual(errors, []);
     await context.close();
-    console.log('PASS: 900×600 desktop chrome, login/register, service errors, language persistence, drafts/search/scroll, keyboard/outside click, history filters, configuration, diagnostics, dialogs, export preview and clipboard, sign-out, reload, dark theme');
+    console.log('PASS: 900×600 desktop chrome, login/register, service errors, language persistence, drafts/search/scroll, keyboard/outside click, history filters, configuration, diagnostics, dialogs, export preview and clipboard, sign-out, reload, dark theme, macOS overlay layout, authorization-denial recovery and retry');
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

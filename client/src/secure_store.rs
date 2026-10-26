@@ -1,7 +1,21 @@
 //! User-scoped credential persistence. Never include payloads in errors or logs.
 use std::path::Path;
 
+#[derive(Clone, Copy)]
+pub(super) enum Interaction {
+    Silent,
+    #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+    UserInitiated,
+}
+
+#[cfg(test)]
 pub(super) async fn read_secret(root: &Path, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    read_secret_with_interaction(root, name, Interaction::Silent).await
+}
+
+pub(super) async fn read_secret_with_interaction(root: &Path, name: &str, interaction: Interaction) -> anyhow::Result<Option<Vec<u8>>> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = interaction;
     let bytes = match tokio::fs::read(root.join(format!("{name}.secure"))).await {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -12,13 +26,20 @@ pub(super) async fn read_secret(root: &Path, name: &str) -> anyhow::Result<Optio
     #[cfg(target_os = "macos")]
     {
         let account = String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("凭据引用损坏"))?;
-        return keychain::read(&account).map(Some);
+        return keychain::read(&account, interaction).map(Some);
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     Ok(Some(bytes))
 }
 
+#[cfg(test)]
 pub(super) async fn write_secret(root: &Path, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    write_secret_with_interaction(root, name, bytes, Interaction::Silent).await
+}
+
+pub(super) async fn write_secret_with_interaction(root: &Path, name: &str, bytes: &[u8], interaction: Interaction) -> anyhow::Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = interaction;
     #[cfg(windows)]
     let bytes = protect(bytes, true)?;
     #[cfg(target_os = "macos")]
@@ -26,7 +47,7 @@ pub(super) async fn write_secret(root: &Path, name: &str, bytes: &[u8]) -> anyho
         use sha2::{Digest, Sha256};
         let root = std::fs::canonicalize(root)?;
         let account = format!("{:x}", Sha256::digest(format!("{}\0{name}", root.display())));
-        keychain::write(&account, bytes)?;
+        keychain::write(&account, bytes, interaction)?;
         account.into_bytes()
     };
     let path = root.join(format!("{name}.secure"));
@@ -90,9 +111,12 @@ fn protect(bytes: &[u8], encrypt: bool) -> anyhow::Result<Vec<u8>> {
 
 #[cfg(target_os = "macos")]
 mod keychain {
+    use super::Interaction;
     use std::ffi::c_void;
+    use std::sync::{Mutex, MutexGuard};
     const SERVICE: &[u8] = b"net.starbridge.client.credentials.v1";
     const NOT_FOUND: i32 = -25300;
+    static ACCESS: Mutex<()> = Mutex::new(());
     #[link(name = "Security", kind = "framework")]
     unsafe extern "C" {
         fn SecKeychainFindGenericPassword(keychain: *const c_void, service_len: u32, service: *const u8,
@@ -103,14 +127,37 @@ mod keychain {
             length: u32, data: *const c_void) -> i32;
         fn SecKeychainItemDelete(item: *mut c_void) -> i32;
         fn SecKeychainItemFreeContent(attributes: *mut c_void, data: *mut c_void) -> i32;
+        fn SecKeychainGetUserInteractionAllowed(state: *mut u8) -> i32;
+        fn SecKeychainSetUserInteractionAllowed(state: u8) -> i32;
     }
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" { fn CFRelease(item: *const c_void); }
     fn check(status: i32) -> anyhow::Result<()> {
-        if status != 0 { anyhow::bail!("无法访问系统钥匙串，请解锁当前用户的登录钥匙串后重试（状态 {status}）"); }
+        if matches!(status, -128 | -25293 | -25308) {
+            anyhow::bail!("未获得系统钥匙串访问许可，原设备身份和登录凭据已保留。请点击“授权后重试”并在系统弹窗中允许访问。");
+        }
+        if status != 0 { anyhow::bail!("无法访问系统钥匙串，请检查当前用户的登录钥匙串后重试（状态 {status}）"); }
         Ok(())
     }
-    pub fn read(account: &str) -> anyhow::Result<Vec<u8>> {
+    // This setting belongs to this process, not the user's Keychain configuration.
+    // Serialize every operation and restore it before releasing the lock; no await
+    // occurs while the setting is changed. Only an explicit recovery may show UI.
+    struct InteractionGuard { previous: u8, _lock: MutexGuard<'static, ()> }
+    impl InteractionGuard {
+        fn new(interaction: Interaction) -> anyhow::Result<Self> {
+            let lock = ACCESS.lock().map_err(|_| anyhow::anyhow!("钥匙串访问暂不可用，请重新打开客户端"))?;
+            let mut previous = 0;
+            check(unsafe { SecKeychainGetUserInteractionAllowed(&mut previous) })?;
+            let guard = Self { previous, _lock: lock };
+            check(unsafe { SecKeychainSetUserInteractionAllowed(u8::from(matches!(interaction, Interaction::UserInitiated))) })?;
+            Ok(guard)
+        }
+    }
+    impl Drop for InteractionGuard {
+        fn drop(&mut self) { unsafe { SecKeychainSetUserInteractionAllowed(self.previous); } }
+    }
+    pub fn read(account: &str, interaction: Interaction) -> anyhow::Result<Vec<u8>> {
+        let _interaction = InteractionGuard::new(interaction)?;
         let mut length = 0;
         let mut data = std::ptr::null_mut();
         check(unsafe { SecKeychainFindGenericPassword(std::ptr::null(), SERVICE.len() as u32, SERVICE.as_ptr(),
@@ -119,7 +166,8 @@ mod keychain {
         unsafe { SecKeychainItemFreeContent(std::ptr::null_mut(), data); }
         Ok(bytes)
     }
-    pub fn write(account: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    pub fn write(account: &str, bytes: &[u8], interaction: Interaction) -> anyhow::Result<()> {
+        let _interaction = InteractionGuard::new(interaction)?;
         let mut item = std::ptr::null_mut();
         let status = unsafe { SecKeychainFindGenericPassword(std::ptr::null(), SERVICE.len() as u32, SERVICE.as_ptr(),
             account.len() as u32, account.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), &mut item) };
@@ -133,6 +181,7 @@ mod keychain {
         check(status)
     }
     pub fn remove(account: &str) -> anyhow::Result<()> {
+        let _interaction = InteractionGuard::new(Interaction::Silent)?;
         let mut item = std::ptr::null_mut();
         let status = unsafe { SecKeychainFindGenericPassword(std::ptr::null(), SERVICE.len() as u32, SERVICE.as_ptr(),
             account.len() as u32, account.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), &mut item) };
@@ -141,6 +190,27 @@ mod keychain {
         let status = unsafe { SecKeychainItemDelete(item) };
         unsafe { CFRelease(item); }
         check(status)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn denial_is_an_error_and_silent_policy_is_restored() {
+            let guard = InteractionGuard::new(Interaction::Silent).unwrap();
+            let previous = guard.previous;
+            let mut actual = 1;
+            assert_eq!(unsafe { SecKeychainGetUserInteractionAllowed(&mut actual) }, 0);
+            assert_eq!(actual, 0);
+            for status in [-128, -25293, -25308] {
+                assert!(check(status).unwrap_err().to_string().contains("已保留"));
+            }
+            drop(guard);
+            let _lock = ACCESS.lock().unwrap();
+            assert_eq!(unsafe { SecKeychainGetUserInteractionAllowed(&mut actual) }, 0);
+            assert_eq!(actual, previous);
+        }
     }
 }
 

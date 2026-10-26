@@ -14,6 +14,18 @@ struct DesktopLifecycle {
 
 struct ExitMenu(MenuItem<tauri::Wry>);
 
+#[tauri::command]
+async fn client_startup_status(startup: tauri::State<'_, crate::startup::ProfileStartup>) -> Result<Option<String>, String> {
+    Ok(startup.error().await)
+}
+
+#[tauri::command]
+async fn client_startup_retry(handle: tauri::AppHandle, startup: tauri::State<'_, crate::startup::ProfileStartup>) -> Result<(), String> {
+    let core = startup.retry().await?;
+    if handle.manage(core.clone()) { core.heartbeat_loop().await; }
+    Ok(())
+}
+
 struct DesktopText {
     exit: &'static str,
     exiting: &'static str,
@@ -97,12 +109,13 @@ fn restore_main(handle: &tauri::AppHandle) -> tauri::Result<()> {
 }
 
 fn start_shutdown(handle: tauri::AppHandle) {
+    handle.state::<crate::startup::ProfileStartup>().begin_shutdown();
     if let Some(item) = handle.try_state::<ExitMenu>() {
         let _ = item.0.set_enabled(false);
         let _ = item.0.set_text(current_text(&handle).exiting);
     }
     tauri::async_runtime::spawn(async move {
-        handle.state::<ClientApp>().shutdown().await;
+        handle.state::<crate::startup::ProfileStartup>().shutdown().await;
         handle.state::<DesktopLifecycle>().shutdown_complete.store(true, Ordering::Release);
         handle.exit(0);
     });
@@ -126,13 +139,14 @@ fn request_exit(handle: &tauri::AppHandle) {
     let handle = handle.clone();
     tauri::async_runtime::spawn(async move {
         let active = {
-            let core = handle.state::<ClientApp>();
-            let inner = core.inner.read().await;
-            requires_exit_confirmation(
-                inner.sessions.values().map(|session| session.status),
-                inner.operations.values().map(|operation| operation.state.as_str()),
-                &inner.self_test.state,
-            )
+            if let Some(core) = handle.try_state::<ClientApp>() {
+                let inner = core.inner.read().await;
+                requires_exit_confirmation(
+                    inner.sessions.values().map(|session| session.status),
+                    inner.operations.values().map(|operation| operation.state.as_str()),
+                    &inner.self_test.state,
+                )
+            } else { false }
         };
         if !active {
             start_shutdown(handle);
@@ -436,13 +450,16 @@ async fn client_copy_nodes(app: tauri::State<'_, ClientApp>) -> Result<serde_jso
 }
 
 /// The event loop stays on the main thread and shares the core's Tokio runtime.
-pub fn run(app: ClientApp, _role: Role, root: PathBuf) -> anyhow::Result<()> {
-    let desktop = tauri::Builder::default()
-        .manage(app)
+pub fn run(loaded: anyhow::Result<ClientApp>, role: Role, root: PathBuf) -> anyhow::Result<()> {
+    let initial_core = loaded.as_ref().ok().cloned();
+    let builder = tauri::Builder::default()
+        .manage(crate::startup::ProfileStartup::new(role, root.clone(), loaded))
         .manage(DesktopLifecycle::default())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
+            client_startup_status,
+            client_startup_retry,
             client_set_desktop_locale,
             client_window_action,
             client_state,
@@ -466,8 +483,9 @@ pub fn run(app: ClientApp, _role: Role, root: PathBuf) -> anyhow::Result<()> {
             client_disconnect,
             client_disconnect_session,
             client_copy_nodes,
-        ])
-        .build(tauri::generate_context!())?;
+        ]);
+    let builder = if let Some(core) = initial_core { builder.manage(core) } else { builder };
+    let desktop = builder.build(tauri::generate_context!())?;
     // Linux does not deliver tray left-click events, so this one-item menu cannot restore a window there.
     let tray_available = if cfg!(target_os = "linux") {
         false
@@ -515,7 +533,7 @@ pub fn run(app: ClientApp, _role: Role, root: PathBuf) -> anyhow::Result<()> {
                 if handle.state::<DesktopLifecycle>().exit_pending.load(Ordering::Acquire) {
                     return;
                 }
-                if tray_available && handle.tray_by_id("main").is_some() {
+                if tray_available && handle.try_state::<ClientApp>().is_some() && handle.tray_by_id("main").is_some() {
                     if let Some(window) = handle.get_webview_window("main") {
                         match window.hide() {
                             Ok(()) => show_tray_notice(handle, &window, &root),

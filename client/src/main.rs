@@ -65,20 +65,22 @@ fn run() -> anyhow::Result<()> {
     let _instance = data_directory::prepare_with_import(args.data_dir, args.import_data_dir, &[executable_dir.to_path_buf(), std::env::current_dir()?])?;
     let root = _instance.root.clone();
     let runtime = tokio::runtime::Runtime::new()?;
-    let app = runtime.block_on(ClientApp::load(role, root.clone()))?;
-    runtime.block_on(app.heartbeat_loop());
+    let loaded = runtime.block_on(ClientApp::load(role, root.clone()));
+    let core = loaded.as_ref().ok().cloned();
+    if let Some(app) = &core { runtime.block_on(app.heartbeat_loop()); }
     let result = if headless {
+        let app = loaded?;
         runtime.block_on(serve(&app, args.listen))
     } else {
         #[cfg(feature = "desktop")]
         {
             tauri::async_runtime::set(runtime.handle().clone());
-            starbridge_client::desktop::run(app.clone(), role, root)
+            starbridge_client::desktop::run(loaded, role, root)
         }
         #[cfg(not(feature = "desktop"))]
         unreachable!()
     };
-    runtime.block_on(app.shutdown());
+    if let Some(app) = core { runtime.block_on(app.shutdown()); }
     result
 }
 
