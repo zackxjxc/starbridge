@@ -130,7 +130,12 @@ macOS ARM64 的清单是 `vendor/manifest.darwin-arm64.toml`：
 - FRP 使用官方 `frp_<版本>_darwin_arm64.tar.gz`，SHA-256 取自同一 Release 的 `frp_sha256_checksums.txt`。
 - OpenSSH 没有官方 macOS 预编译包；系统自带的 `/usr/sbin/sshd` 带 Apple 平台签名，复制到其他目录后启动会被系统终止（退出码 137）。因此清单下载 `openssh-portable` 源码，`build = "openssh-portable"` 让 `tools/fetch_runtime.py` 在构建时用 `--without-openssl` 编译。StarBridge 只用 ed25519 密钥，OpenSSH 内置的加密实现足够，不依赖 macOS 不提供头文件的 OpenSSL。
 - 源码构建的 `sshd` 会把 `sshd-session` 和 `sshd-auth` 的路径编译成安装前缀，端侧生成 `sshd_config` 时用 `SshdSessionPath`、`SshdAuthPath` 指回运行时目录。
+- 构建脚本在未设置 `SDKROOT` 时通过 `xcrun` 选择当前 Xcode 的 SDK，并默认设置 `MACOSX_DEPLOYMENT_TARGET=12.0`，避免 OpenSSH 只能在构建机的系统版本上运行。FRP 的最低系统版本为 macOS 12。
 - OpenSSH 源码包的 SHA-256 是从 `cdn.openbsd.org` 和 `mirrors.aliyun.com` 分别下载、结果一致后锁定的。上游还提供 `.asc` 签名，当前开发机没有 `gpg`，签名尚未校验。
+
+`cargo build --locked --release --workspace` 编译客户端与本地测试中心后，执行 `python3 tools/package_macos.py`，得到 `dist/StarBridge.app` 和 `dist/StarBridge.zip`。打包前核对来源归档与锁定清单、运行时文件 SHA-256 和 ARM64 架构；包中仅保留 `frpc`、五个 OpenSSH 服务组件和许可证，不包含 `frps`、中心程序或用户状态。SSH 客户端使用 macOS 系统提供的 `ssh`。
+
+应用主程序位于 `Contents/MacOS/starbridge`，运行时位于 `Contents/Resources/runtime/`。桌面数据位于用户的 `~/Library/Application Support/net.zackxjxc.starbridge/state/`，不会写入应用包。打包脚本对运行时和应用进行 ad-hoc 签名，签名后重新记录分发文件哈希并验证整个包；这是本地构建包，尚未进行 Developer ID 签名或 Apple 公证。ZIP 保留执行权限，脚本拒绝覆盖已有 `.app`。
 
 ## 待处理项
 

@@ -941,9 +941,15 @@ fn runtime_status(root: &FsPath) -> RuntimeStatus {
 
 fn runtime_directory(root: &FsPath, executable_dir: Option<&FsPath>) -> PathBuf {
     let local_runtime = root.join("runtime");
+    let bundle_runtime = executable_dir
+        .filter(|directory| directory.file_name().is_some_and(|name| name == "MacOS"))
+        .and_then(FsPath::parent)
+        .filter(|directory| directory.file_name().is_some_and(|name| name == "Contents"))
+        .map(|directory| directory.join("Resources/runtime"));
     std::iter::once(local_runtime.clone())
         .chain(root.parent().map(|parent| parent.join("runtime")))
         .chain(executable_dir.map(|directory| directory.join("runtime")))
+        .chain(bundle_runtime)
         .find(|directory| directory.is_dir())
         .unwrap_or(local_runtime)
 }
@@ -1316,6 +1322,21 @@ mod tests {
         std::fs::create_dir_all(&local).unwrap();
         assert_eq!(runtime_directory(&root, Some(&executable_dir)), local);
         std::fs::remove_dir_all(&temporary).unwrap();
+    }
+
+    #[test]
+    fn app_bundle_runtime_is_found_with_external_user_data() {
+        let temporary = std::env::temp_dir()
+            .join(format!("starbridge-bundle-{}", uuid::Uuid::new_v4()));
+        let executable_dir = temporary.join("StarBridge.app/Contents/MacOS");
+        let runtime = temporary.join("StarBridge.app/Contents/Resources/runtime");
+        let root = temporary.join("user-data/node");
+        std::fs::create_dir_all(&runtime).unwrap();
+        assert_eq!(runtime_directory(&root, Some(&executable_dir)), runtime);
+        let override_dir = root.join("runtime");
+        std::fs::create_dir_all(&override_dir).unwrap();
+        assert_eq!(runtime_directory(&root, Some(&executable_dir)), override_dir);
+        std::fs::remove_dir_all(temporary).unwrap();
     }
 
     #[tokio::test]

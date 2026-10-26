@@ -204,7 +204,7 @@ def ssh_result(runtime, command, marker):
   options = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
   try:
     result = subprocess.run([
-      str(runtime / ("ssh" + SUFFIX)), "-T", "-o", "BatchMode=yes",
+      ssh_executable(runtime), "-T", "-o", "BatchMode=yes",
       "-o", "ConnectionAttempts=1", "-o", "ConnectTimeout=4",
       "-o", "ServerAliveInterval=2", "-o", "ServerAliveCountMax=2",
       *argv[1:], f"echo {marker}"],
@@ -558,10 +558,20 @@ class PeerRegression:
       raise RegressionError(f"Process cleanup failed: {failure}")
 
 
+def ssh_executable(runtime):
+  bundled = runtime / ("ssh" + SUFFIX)
+  if bundled.is_file():
+    return str(bundled)
+  system = shutil.which("ssh") if os.name != "nt" else None
+  if system:
+    return system
+  raise SetupError("Missing bundled or system SSH client")
+
+
 def preflight(args):
   required = [args.client, args.server]
   required += [args.runtime / (name + SUFFIX) for name in (
-    "frpc", "frps", "ssh", "ssh-keygen", "sshd", "sshd-session", "sshd-auth", "sftp-server")]
+    "frpc", "frps", "ssh-keygen", "sshd", "sshd-session", "sshd-auth", "sftp-server")]
   if os.name == "nt":
     required += [args.runtime / name for name in ("libcrypto.dll", "ssh-shellhost.exe")]
   missing = [str(path) for path in required if not path.is_file()]
@@ -573,7 +583,7 @@ def preflight(args):
       ("client", [args.client, "--help"]), ("server", [args.server, "--help"]),
       ("frpc", [args.runtime / ("frpc" + SUFFIX), "--version"]),
       ("frps", [args.runtime / ("frps" + SUFFIX), "--version"]),
-      ("ssh", [args.runtime / ("ssh" + SUFFIX), "-V"])):
+      ("ssh", [ssh_executable(args.runtime), "-V"])):
     try:
       result = subprocess.run([str(value) for value in command], capture_output=True,
                               text=True, encoding="utf-8", errors="replace",

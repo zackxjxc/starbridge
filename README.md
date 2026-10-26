@@ -93,4 +93,19 @@ python3 tools/fetch_runtime.py --manifest vendor/manifest.darwin-arm64.toml --ou
 cargo run -p starbridge-server -- --frps-path state/runtime/frps
 ```
 
-如果编译时报 `C compiler cannot create executables`，通常是命令行工具里的 SDK 和编译器版本不匹配，改用 Xcode 自带的 SDK：`SDKROOT=$(xcrun --sdk macosx --show-sdk-path) python3 tools/fetch_runtime.py ...`。
+构建脚本会在未设置 `SDKROOT` 时自动选择当前 Xcode 的 SDK，OpenSSH 默认以 macOS 12 为最低系统版本。生成桌面 Release 和应用包：
+
+```sh
+cargo build --locked --release --workspace
+python3 tools/package_macos.py
+```
+
+输出为 `dist/StarBridge.app` 和 `dist/StarBridge.zip`，适用于 Apple Silicon、macOS 12+。解压后双击应用，或拖到“应用程序”目录；无需 Python、Rust 或独立安装 FRP/OpenSSH。包内包含经过锁定清单与文件哈希校验的客户端运行时及许可证，SSH 客户端使用系统自带的 `/usr/bin/ssh`。打包脚本使用本地 ad-hoc 签名并验证签名，尚未进行 Developer ID 签名或 Apple 公证。已有应用不会被打包脚本覆盖，可使用新的 `--output` 路径重新打包。
+
+macOS 桌面数据保存在 `~/Library/Application Support/net.zackxjxc.starbridge/state/node/`，升级或移动应用时保留；可通过 `--data-dir` 指定其他目录。无界面模式仍默认使用当前目录的 `state/node/`。验证本地三节点真实连接：
+
+```sh
+cargo test --locked --release --workspace
+python3 tools/test-peer-connectivity.py --client target/release/starbridge-client --server target/release/starbridge-server
+python3 -m unittest discover -s tools -p 'test_package_*.py'
+```

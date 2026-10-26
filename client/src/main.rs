@@ -66,11 +66,7 @@ fn run() -> anyhow::Result<()> {
     let root = match args.data_dir {
         Some(path) => std::path::absolute(path)?,
         None if headless => std::env::current_dir()?.join("state").join(directory),
-        None => std::env::current_exe()?
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("无法确定程序目录"))?
-            .join("state")
-            .join(directory),
+        None => desktop_data_dir(directory)?,
     };
     let root = if default_peer_directory { compatible_data_dir(root) } else { root };
     // Keep the lock open for the entire lifetime of this instance.
@@ -91,6 +87,26 @@ fn run() -> anyhow::Result<()> {
     };
     runtime.block_on(app.shutdown());
     result
+}
+
+fn desktop_data_dir(directory: &str) -> anyhow::Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        // App bundles may be read-only; user state must also survive app replacement.
+        let home = std::env::var_os("HOME")
+            .ok_or_else(|| anyhow::anyhow!("无法确定用户主目录"))?;
+        Ok(PathBuf::from(home)
+            .join("Library/Application Support/net.zackxjxc.starbridge/state")
+            .join(directory))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(std::env::current_exe()?
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("无法确定程序目录"))?
+            .join("state")
+            .join(directory))
+    }
 }
 
 /// Reuse an existing portable installation without copying identities or keys.

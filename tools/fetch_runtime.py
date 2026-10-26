@@ -67,6 +67,17 @@ def build_openssh(unpacked: Path) -> None:
     if len(sources) != 1:
         raise SystemExit("OpenSSH 源码包中没有唯一的 configure")
     source = sources[0]
+    environment = os.environ.copy()
+    if sys.platform == "darwin":
+        # FRP requires macOS 12; avoid tying portable SSH to the build machine's OS.
+        environment.setdefault("MACOSX_DEPLOYMENT_TARGET", "12.0")
+    if sys.platform == "darwin" and not environment.get("SDKROOT"):
+        # Use the SDK from the selected Xcode, rather than an unrelated CLT SDK.
+        sdk = subprocess.run(
+            ["xcrun", "--sdk", "macosx", "--show-sdk-path"],
+            capture_output=True, text=True, check=True,
+        )
+        environment["SDKROOT"] = sdk.stdout.strip()
     # StarBridge 只用 ed25519 密钥，内置加密实现足够，不依赖系统没有提供头文件的 OpenSSL。
     steps = (
         ["./configure", "--without-openssl", "--prefix=/opt/starbridge-openssh"],
@@ -74,7 +85,7 @@ def build_openssh(unpacked: Path) -> None:
     )
     for step in steps:
         print(f"构建 OpenSSH: {' '.join(step)}")
-        result = subprocess.run(step, cwd=source, capture_output=True, text=True)
+        result = subprocess.run(step, cwd=source, env=environment, capture_output=True, text=True)
         if result.returncode != 0:
             raise SystemExit(f"OpenSSH 构建失败（{step[0]}）：{(result.stdout + result.stderr)[-2000:]}")
     for name in OPENSSH_TARGETS:
