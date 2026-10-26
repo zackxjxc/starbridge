@@ -214,6 +214,15 @@ pub struct SessionInfo {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SessionReadiness {
+    #[serde(flatten)]
+    pub session: SessionInfo,
+    /// Absent when the center does not observe managed FRPS proxy readiness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver_ready: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SessionHistoryEntry {
     pub session_id: String,
     pub peer_name: String,

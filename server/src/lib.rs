@@ -22,6 +22,7 @@ use std::{
 use tokio::sync::{Mutex, RwLock};
 
 mod diagnostics;
+mod route_ready;
 pub use diagnostics::{DiagnosticIntegration, diagnostic_plugin_app};
 
 const ADMIN_HTML: &str = include_str!("../../admin-ui/index.html");
@@ -233,7 +234,7 @@ pub fn app(state: AppState) -> Router {
         )
         .route(
             "/api/v1/sessions/{id}",
-            get(get_session).delete(delete_session),
+            get(route_ready::get_with_readiness).delete(delete_session),
         )
         .route("/api/v1/sessions/{id}/status", post(update_session))
         .route("/api/v1/diagnostics", post(diagnostics::create))

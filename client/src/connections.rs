@@ -381,9 +381,15 @@ impl ClientApp {
             if target.is_some() { break; }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
-        let target = target.ok_or_else(|| anyhow::anyhow!("设备联系失败：目标未完成 SSH 初始化或未发布主机密钥"))?;
-        if !self.is_current(target_id, generation).await { anyhow::bail!("连接已终止"); }
+        target.ok_or_else(|| anyhow::anyhow!("设备联系失败：目标未完成 SSH 初始化或未发布主机密钥"))?;
         let mut relay = session.policy == ConnectionPolicy::RelayOnly || session.path == SessionPath::Relay;
+        self.wait_for_receiver_ready(target_id, &session, generation, relay).await?;
+        // The receiver publishes its host key before registering the FRP proxy.
+        // Read it again after readiness, rather than pinning a previous session's cached key.
+        let mut target = self.refresh_devices().await?.into_iter()
+            .find(|device| device.node_id == target_id && device.online && !device.ssh_host_key.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("设备联系失败：目标已离线或尚未发布 SSH 主机密钥"))?;
+        if !self.is_current(target_id, generation).await { anyhow::bail!("连接已终止"); }
         self.start_frpc_mode(&session, true, relay).await?;
         if !self.is_current(target_id, generation).await { self.close_session_local(&session.session_id).await; anyhow::bail!("连接已终止"); }
         let started = tokio::time::Instant::now();
@@ -412,6 +418,11 @@ impl ClientApp {
                         || inner.ended_sessions.contains(&session.session_id) {anyhow::bail!("连接已终止");}
                     inner.sessions.insert(session.session_id.clone(),session.clone());
                 }
+                self.wait_for_receiver_ready(target_id, &session, generation, true).await?;
+                target = self.refresh_devices().await?.into_iter()
+                    .find(|device| device.node_id == target_id && device.online && !device.ssh_host_key.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("设备联系失败：目标已离线或尚未发布 SSH 主机密钥"))?;
+                if !self.is_current(target_id, generation).await { anyhow::bail!("连接已终止"); }
                 self.start_frpc_mode(&session, true, true).await?;
                 relay_started = Some(tokio::time::Instant::now());
             }
@@ -449,6 +460,92 @@ impl ClientApp {
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
+    }
+
+    async fn wait_for_receiver_ready(&self, target_id: &str, session: &SessionInfo, generation: u64, relay: bool)
+        -> anyhow::Result<()>
+    {
+        use std::time::Duration;
+        let (url, node_id, auth_generation) = {
+            let inner = self.inner.read().await;
+            (inner.config.server_url.clone(), inner.identity.node_id.clone(), inner.auth_generation)
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let path = if relay { "relay" } else { "direct" };
+        self.progress(target_id, generation, "connecting", "contact", "正在等待目标连接通道就绪").await;
+        loop {
+            let (auth, token) = {
+                let inner = self.inner.read().await;
+                self.check_receiver_wait(&inner, target_id, session, generation, auth_generation, &node_id, relay)?;
+                (inner.auth.clone().expect("checked login"), inner.identity.device_token.clone())
+            };
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() { anyhow::bail!("设备联系失败：目标连接通道尚未就绪，请稍后重试"); }
+            let response = tokio::time::timeout(remaining.min(Duration::from_secs(2)), async {
+                self.http.get(format!("{url}/api/v1/sessions/{}", session.session_id))
+                    .query(&[("ready_path", path)])
+                    .bearer_auth(&auth.access_token)
+                    .header("x-starbridge-node-id", &node_id)
+                    .header("x-starbridge-device-token", token)
+                    .send().await?.error_for_status()?.json::<starbridge_protocol::SessionReadiness>().await
+            }).await;
+            {
+                let inner = self.inner.read().await;
+                self.check_receiver_wait(&inner, target_id, session, generation, auth_generation, &node_id, relay)?;
+            }
+            if let Ok(result) = response {
+                match result {
+                    Ok(result) => {
+                        let current = &result.session;
+                        let same_route = match (&session.route, &current.route) {
+                            (Some(expected), Some(actual)) => expected.server_addr == actual.server_addr
+                                && expected.server_port == actual.server_port && expected.proxy_name == actual.proxy_name
+                                && expected.secret_key == actual.secret_key && expected.auth_token == actual.auth_token
+                                && expected.remote_port == actual.remote_port,
+                            _ => false,
+                        };
+                        if current.session_id != session.session_id || current.initiator_node_id != session.initiator_node_id
+                            || current.target_node_id != session.target_node_id || current.policy != session.policy
+                            || !matches!(current.status, SessionStatus::Negotiating | SessionStatus::Connected)
+                            || (current.path == SessionPath::Relay) != relay || !same_route {
+                            anyhow::bail!("连接已结束或路径已变化，请重新连接");
+                        }
+                        // Legacy centers return the original SessionInfo without this optional field.
+                        // Only their authenticated, still-active session can use the existing behavior.
+                        if result.receiver_ready != Some(false) { return Ok(()); }
+                    }
+                    Err(error) if error.status().is_some_and(|status| status.is_client_error()) => {
+                        if error.status() == Some(StatusCode::UNAUTHORIZED)
+                            && self.inner.read().await.auth.as_ref().is_some_and(|current| current.access_token != auth.access_token) {
+                            // A heartbeat may have rotated this request's token while it was in flight.
+                            continue;
+                        }
+                        anyhow::bail!("设备联系失败：连接会话已失效或验证未通过，请重新连接");
+                    }
+                    Err(_) => {}
+                }
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() { anyhow::bail!("设备联系失败：目标连接通道尚未就绪，请稍后重试"); }
+            tokio::time::sleep(remaining.min(Duration::from_millis(250))).await;
+        }
+    }
+
+    fn check_receiver_wait(&self, inner: &Inner, target_id: &str, session: &SessionInfo,
+        generation: u64, auth_generation: u64, node_id: &str, relay: bool) -> anyhow::Result<()>
+    {
+        if self.shutting_down.load(Ordering::Acquire) || inner.auth.is_none() || inner.closing_account
+            || inner.auth_generation != auth_generation || inner.identity.node_id != node_id
+            || inner.blocked_peers.contains(target_id) || inner.ended_sessions.contains(&session.session_id)
+            || inner.pending_closes.contains(&session.session_id)
+            || inner.connection_generations.get(target_id).copied() != Some(generation)
+            || !inner.sessions.get(&session.session_id).is_some_and(|current|
+                matches!(current.status, SessionStatus::Negotiating | SessionStatus::Connected)
+                    && current.initiator_node_id == node_id && current.target_node_id == target_id
+                    && (current.path == SessionPath::Relay) == relay) {
+            anyhow::bail!("连接已终止或登录状态已变化");
+        }
+        Ok(())
     }
 
     async fn verify_session_ssh(&self, session: &SessionInfo, target: &DeviceInfo) -> anyhow::Result<()> {
@@ -579,6 +676,172 @@ pub(super) async fn export_connections(State(app): State<ClientApp>, Json(form):
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ReadinessFixture {
+        app: ClientApp,
+        root: PathBuf,
+        session: SessionInfo,
+        response: Arc<RwLock<serde_json::Value>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        paths: Arc<RwLock<Vec<String>>>,
+        tokens: Arc<RwLock<Vec<String>>>,
+        authenticated: Arc<AtomicBool>,
+        reject_old: Arc<AtomicBool>,
+        hold: Arc<AtomicBool>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl ReadinessFixture {
+        async fn new(ready: Option<bool>) -> Self {
+            let root = std::env::temp_dir().join(format!("starbridge-route-ready-{}", uuid::Uuid::new_v4()));
+            let app = ClientApp::load(Role::Peer, root.clone()).await.unwrap();
+            let identity = app.inner.read().await.identity.clone();
+            let session = SessionInfo {
+                session_id: "route-ready".into(), initiator_node_id: identity.node_id.clone(), target_node_id: "remote".into(),
+                policy: ConnectionPolicy::DirectPreferred, path: SessionPath::Unknown, status: SessionStatus::Negotiating,
+                created_at: now_unix(), expires_at: now_unix() + 60, failure_reason: None,
+                route: Some(FrpRoute { server_addr: "127.0.0.1".into(), server_port: 17851,
+                    auth_token: "fixture".into(), proxy_name: "fixture-route".into(), secret_key: "fixture-key".into(), remote_port: 0 }),
+            };
+            let mut value = serde_json::to_value(&session).unwrap();
+            if let Some(ready) = ready { value["receiver_ready"] = ready.into(); }
+            let response = Arc::new(RwLock::new(value));
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let paths = Arc::new(RwLock::new(Vec::new()));
+            let tokens = Arc::new(RwLock::new(Vec::new()));
+            let authenticated = Arc::new(AtomicBool::new(false));
+            let reject_old = Arc::new(AtomicBool::new(false));
+            let hold = Arc::new(AtomicBool::new(false));
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let (reply, count, queries, bearers, proof, rejected, paused, started, resume) =
+                (response.clone(), calls.clone(), paths.clone(), tokens.clone(), authenticated.clone(), reject_old.clone(), hold.clone(), entered.clone(), release.clone());
+            let router = Router::new().route("/api/v1/sessions/{id}", get(move |
+                axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>, headers: axum::http::HeaderMap| {
+                let (reply, count, queries, bearers, proof, rejected, paused, started, resume, identity) =
+                    (reply.clone(), count.clone(), queries.clone(), bearers.clone(), proof.clone(), rejected.clone(), paused.clone(), started.clone(), resume.clone(), identity.clone());
+                async move {
+                    let value = reply.read().await.clone();
+                    let bearer = headers.get("authorization").and_then(|value| value.to_str().ok()).unwrap_or("").to_string();
+                    let unauthorized = rejected.load(Ordering::SeqCst) && bearer == "Bearer fixture";
+                    count.fetch_add(1, Ordering::SeqCst);
+                    queries.write().await.push(query.get("ready_path").cloned().unwrap_or_default());
+                    bearers.write().await.push(bearer.clone());
+                    proof.store(matches!(bearer.as_str(), "Bearer fixture" | "Bearer fixture-refreshed")
+                        && headers.get("x-starbridge-node-id").and_then(|value| value.to_str().ok()) == Some(identity.node_id.as_str())
+                        && headers.get("x-starbridge-device-token").and_then(|value| value.to_str().ok()) == Some(identity.device_token.as_str()), Ordering::SeqCst);
+                    started.notify_one();
+                    if paused.load(Ordering::SeqCst) { resume.notified().await; }
+                    if unauthorized { StatusCode::UNAUTHORIZED.into_response() }
+                    else if value.is_null() { StatusCode::NOT_FOUND.into_response() } else { Json(value).into_response() }
+                }
+            }).delete(|| async { StatusCode::NO_CONTENT }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+            {
+                let mut inner = app.inner.write().await;
+                inner.config.server_url = format!("http://{address}");
+                inner.auth = Some(AuthResponse { access_token: "fixture".into(), username: "user".into(),
+                    expires_at: u64::MAX, refresh_token: None, refresh_expires_at: None });
+                inner.connection_generations.insert("remote".into(), 1);
+                inner.sessions.insert(session.session_id.clone(), session.clone());
+            }
+            Self { app, root, session, response, calls, paths, tokens, authenticated, reject_old, hold, entered, release, server }
+        }
+
+        async fn finish(self) {
+            self.app.inner.write().await.auth = None;
+            self.app.shutdown().await;
+            self.server.abort();
+            let _ = self.server.await;
+            std::fs::remove_dir_all(self.root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn receiver_readiness_waits_for_registration_before_admitting_first_probe() {
+        let fixture = ReadinessFixture::new(Some(false)).await;
+        let (app, session) = (fixture.app.clone(), fixture.session.clone());
+        let waiting = tokio::spawn(async move { app.wait_for_receiver_ready("remote", &session, 1, false).await });
+        fixture.entered.notified().await;
+        assert!(!waiting.is_finished(), "An unregistered receiver must not admit SSH or NAT probing");
+        fixture.response.write().await["receiver_ready"] = true.into();
+        tokio::time::timeout(std::time::Duration::from_secs(2), waiting).await.unwrap().unwrap().unwrap();
+        assert!(fixture.calls.load(Ordering::SeqCst) >= 2);
+        assert!(fixture.authenticated.load(Ordering::SeqCst));
+        assert!(fixture.paths.read().await.iter().all(|path| path == "direct"));
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    async fn late_receiver_ready_cannot_resume_a_cancelled_or_changed_account() {
+        for change_account in [false, true] {
+            let fixture = ReadinessFixture::new(Some(true)).await;
+            fixture.hold.store(true, Ordering::SeqCst);
+            let (app, session) = (fixture.app.clone(), fixture.session.clone());
+            let waiting = tokio::spawn(async move { app.wait_for_receiver_ready("remote", &session, 1, false).await });
+            fixture.entered.notified().await;
+            if change_account { fixture.app.inner.write().await.auth_generation += 1; }
+            else { fixture.app.terminate_targets(Some("remote"), false).await; }
+            fixture.release.notify_one();
+            assert!(tokio::time::timeout(std::time::Duration::from_secs(2), waiting).await.unwrap().unwrap().is_err());
+            fixture.finish().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn receiver_readiness_retries_a_token_rotated_while_the_request_was_in_flight() {
+        let fixture = ReadinessFixture::new(Some(true)).await;
+        fixture.hold.store(true, Ordering::SeqCst);
+        fixture.reject_old.store(true, Ordering::SeqCst);
+        let (app, session) = (fixture.app.clone(), fixture.session.clone());
+        let waiting = tokio::spawn(async move { app.wait_for_receiver_ready("remote", &session, 1, false).await });
+        fixture.entered.notified().await;
+        fixture.app.inner.write().await.auth.as_mut().unwrap().access_token = "fixture-refreshed".into();
+        fixture.hold.store(false, Ordering::SeqCst);
+        fixture.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), waiting).await.unwrap().unwrap().unwrap();
+        assert_eq!(&*fixture.tokens.read().await, &["Bearer fixture", "Bearer fixture-refreshed"]);
+        assert!(fixture.authenticated.load(Ordering::SeqCst));
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_readiness_requires_a_valid_active_session_and_matching_route() {
+        for invalid in ["none", "closed", "missing", "participant", "route", "path"] {
+            let fixture = ReadinessFixture::new(None).await;
+            {
+                let mut response = fixture.response.write().await;
+                match invalid {
+                    "closed" => response["status"] = "closed".into(),
+                    "missing" => *response = serde_json::Value::Null,
+                    "participant" => response["target_node_id"] = "other-device".into(),
+                    "route" => response["route"]["proxy_name"] = "old-route".into(),
+                    "path" => response["path"] = "relay".into(),
+                    _ => {}
+                }
+            }
+            let result = fixture.app.wait_for_receiver_ready("remote", &fixture.session, 1, false).await;
+            assert_eq!(result.is_ok(), invalid == "none", "{invalid}");
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+            fixture.finish().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_readiness_queries_the_new_mode_and_rejects_old_direct_evidence() {
+        let mut fixture = ReadinessFixture::new(Some(true)).await;
+        fixture.session.path = SessionPath::Relay;
+        fixture.app.inner.write().await.sessions.get_mut(&fixture.session.session_id).unwrap().path = SessionPath::Relay;
+        assert!(fixture.app.wait_for_receiver_ready("remote", &fixture.session, 1, true).await.is_err());
+        fixture.response.write().await["path"] = "relay".into();
+        fixture.app.wait_for_receiver_ready("remote", &fixture.session, 1, true).await.unwrap();
+        assert_eq!(&*fixture.paths.read().await, &["relay", "relay"]);
+        fixture.finish().await;
+    }
 
     #[tokio::test]
     async fn cached_occupancy_is_rechecked_before_reconnect_admission() {
