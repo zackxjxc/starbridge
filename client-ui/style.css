@@ -50,6 +50,24 @@ svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width:
 .window-button:focus-visible { outline-offset: -3px; }
 .window-close:hover { background: #c42b1c; color: #fff; }
 .account-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px; }
+.language-trigger { display: inline-flex; align-items: center; gap: 5px; min-height: 28px; padding: 3px 7px; border: 1px solid transparent; border-radius: 5px; background: transparent; color: var(--dim); font-size: 11px; white-space: nowrap; }
+.language-trigger:hover, .language-trigger[aria-expanded="true"] { background: var(--paper); border-color: var(--line); color: var(--ink); }
+.language-trigger svg { width: 14px; height: 14px; }
+.language-current { color: var(--ink); font-weight: 600; }
+.language-divider { color: var(--dim); }
+.language-menu { position: fixed; z-index: 15; width: 224px; max-width: calc(100vw - 12px); padding: 6px; border: 1px solid var(--line); border-radius: 7px; background: var(--paper); color: var(--ink); box-shadow: 0 7px 24px var(--shadow); }
+.language-menu-title { padding: 6px 9px 8px; color: var(--dim); font-size: 11px; }
+.language-option { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; min-height: 36px; padding: 8px 9px; border: 0; border-radius: 5px; background: transparent; text-align: left; font-size: 12px; }
+.language-option:hover, .language-option:focus-visible { background: var(--hover); }
+.language-option[aria-checked="true"] { background: var(--picked); }
+.language-check { display: grid; place-items: center; width: 16px; height: 16px; }
+.language-menu-foot { margin-top: 5px; padding: 10px 9px 6px; border-top: 1px solid var(--line); font-size: 11px; color: var(--dim); }
+html[lang="en"] .account-name { max-width: 140px; }
+html[lang="en"] .local-detail .device-name-support { font-size: 11px; }
+html[lang="en"] .meta { grid-template-columns: 76px minmax(0, 1fr); }
+html[lang="en"] .history-status { white-space: normal; }
+html[lang="en"] .history-table th:nth-child(6) { width: 108px; }
+html[lang="en"] .history-table .history-action { width: 90px; }
 .workspace { flex: 1; min-height: 0; display: grid; grid-template-columns: 350px minmax(0, 1fr); }
 .list-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; border-right: 1px solid var(--line); }
 .list-head { padding: 17px 16px 13px; }

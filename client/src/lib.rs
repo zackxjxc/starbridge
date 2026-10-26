@@ -43,6 +43,7 @@ pub mod desktop;
 
 const CLIENT_HTML: &str = include_str!("../../client-ui/index.html");
 const CLIENT_JS: &str = include_str!("../../client-ui/app.js");
+const CLIENT_I18N: &str = include_str!("../../client-ui/i18n.js");
 const CLIENT_CSS: &str = include_str!("../../client-ui/style.css");
 pub const DEFAULT_SERVER_URL: &str = "https://starbridge.zackxjxc.de5.net";
 
@@ -406,6 +407,7 @@ impl ClientApp {
         Router::new()
             .route("/", get(index))
             .route("/app.js", get(|| async { ([("content-type", "text/javascript; charset=utf-8")], CLIENT_JS) }))
+            .route("/i18n.js", get(|| async { ([("content-type", "text/javascript; charset=utf-8")], CLIENT_I18N) }))
             .route("/style.css", get(|| async { ([("content-type", "text/css; charset=utf-8")], CLIENT_CSS) }))
             .route("/api/health", get(health))
             .route("/api/v1/state", get(state))
