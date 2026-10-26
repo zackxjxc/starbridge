@@ -401,7 +401,12 @@ impl ClientApp {
 
 fn spawn_test_process(path: &FsPath, args: &[String], log: &FsPath) -> anyhow::Result<tokio::process::Child> {
     let output = std::fs::OpenOptions::new().create(true).append(true).open(log)?;
-    Ok(async_command(path).args(args).stdin(Stdio::null()).stdout(Stdio::from(output.try_clone()?))
+    let mut command = if path.file_stem().is_some_and(|name| name == "sshd") {
+        sshd_command(path)?
+    } else {
+        async_command(path)
+    };
+    Ok(command.args(args).stdin(Stdio::null()).stdout(Stdio::from(output.try_clone()?))
         .stderr(Stdio::from(output)).spawn()?)
 }
 

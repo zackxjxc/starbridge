@@ -641,6 +641,7 @@ def preflight(args):
     "frpc", "frps", "ssh-keygen", "sshd", "sshd-session", "sshd-auth", "sftp-server")]
   if os.name == "nt":
     required += [args.runtime / name for name in ("libcrypto.dll", "ssh-shellhost.exe")]
+    required += [args.client.with_name("starbridge-ssh-session.exe")]
   missing = [str(path) for path in required if not path.is_file()]
   if missing:
     raise SetupError("Missing binaries/runtime files:\n  " + "\n  ".join(missing)

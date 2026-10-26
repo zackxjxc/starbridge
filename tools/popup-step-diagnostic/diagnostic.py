@@ -161,12 +161,13 @@ class Session:
   def prepare(self):
     if self.ready:
       return
-    required = [REPO / "target/release" / name for name in ("starbridge-client.exe", "starbridge-server.exe")]
+    required = [REPO / "target/release" / name for name in ("starbridge-client.exe", "starbridge-server.exe", "starbridge-ssh-session.exe")]
     required += [REPO / "state/runtime" / name for name in ("frpc.exe", "frps.exe", "ssh.exe", "sshd.exe")]
     if any(not path.is_file() for path in required):
       raise RuntimeError("缺少 release 客户端/服务端或 state/runtime 组件；请先完成构建。")
     shutil.copytree(REPO / "state/runtime", self.private / "runtime")
-    for source, dest in ((required[0], "starbridge.exe"), (required[1], "starbridge-server.exe")):
+    for source, dest in ((required[0], "starbridge.exe"), (required[1], "starbridge-server.exe"),
+                         (required[2], "starbridge-ssh-session.exe")):
       shutil.copy2(source, self.private / dest)
     for source in required:
       self.record("component_identity", name=source.name,

@@ -365,7 +365,7 @@ impl ClientApp {
             .create(true)
             .append(true)
             .open(&log_path)?;
-        let mut child = async_command(&sshd)
+        let mut child = sshd_command(&sshd)?
             .arg("-D")
             .arg("-e")
             .arg("-f")
@@ -1041,6 +1041,25 @@ fn async_command(program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Comman
     command
 }
 
+fn sshd_command(program: &FsPath) -> anyhow::Result<tokio::process::Command> {
+    let command = async_command(program);
+    #[cfg(windows)]
+    let command = {
+        let mut command = command;
+        let launcher = sshd_session_launcher()?;
+        anyhow::ensure!(launcher.is_file(), "缺少 SSH 会话启动器 {}，请完整构建或解压客户端", launcher.display());
+        command.env("STARBRIDGE_SSHD_SESSION_PATH",
+            std::path::absolute(program.with_file_name("sshd-session.exe"))?);
+        command
+    };
+    Ok(command)
+}
+
+#[cfg(windows)]
+fn sshd_session_launcher() -> anyhow::Result<PathBuf> {
+    Ok(std::env::current_exe()?.with_file_name("starbridge-ssh-session.exe"))
+}
+
 fn pick_port(start: u16, end: u16) -> anyhow::Result<u16> {
     for port in start..=end {
         if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
@@ -1147,6 +1166,10 @@ fn sshd_config(dir: &FsPath, sftp_server: &FsPath, port: u16) -> String {
         ssh_path(&dir.join("authorized_keys")),
         ssh_path(sftp_server),
     );
+    #[cfg(windows)]
+    if let Ok(launcher) = sshd_session_launcher() {
+        config.push_str(&format!("SshdSessionPath {}\n", ssh_path(&launcher)));
+    }
     // 源码构建的 sshd 把 sshd-session/sshd-auth 的路径编译成安装前缀，需要改指运行时目录。
     if !cfg!(windows) {
         let runtime = sftp_server.parent().unwrap_or(FsPath::new(""));

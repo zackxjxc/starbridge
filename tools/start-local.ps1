@@ -8,6 +8,9 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
+& cargo build --locked --offline -p starbridge-client --bins
+if ($LASTEXITCODE -ne 0) { throw 'Client build failed' }
+
 function Start-StarBridgeProcess([string]$package, [string[]]$arguments) {
   $argumentText = @('run', '-p', $package, '--offline', '--') + $arguments
   $process = Start-Process -FilePath 'cargo' -ArgumentList ($argumentText -join ' ') -WindowStyle Hidden -WorkingDirectory $root -PassThru

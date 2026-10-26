@@ -5,6 +5,9 @@ cd /d "%~dp0"
 
 if not exist "state\runtime\frpc.exe" echo [警告] 缺少 state\runtime\frpc.exe，只能测试控制面。
 
+cargo build --locked -p starbridge-client --bins
+if errorlevel 1 exit /b 1
+
 cargo run -p starbridge-client -- --data-dir "state\executor"
 if errorlevel 1 (
   echo.

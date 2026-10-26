@@ -9,6 +9,9 @@ if not exist "state\runtime\frpc.exe" echo [警告] 缺少 state\runtime\frpc.ex
 
 set "STARBRIDGE_NODE_DIR=state\node"
 if not exist "state\node" if exist "state\controller\identity.json" set "STARBRIDGE_NODE_DIR=state\controller"
+cargo build --locked -p starbridge-client --bins
+if errorlevel 1 exit /b 1
+
 cargo run -p starbridge-client -- --data-dir "%STARBRIDGE_NODE_DIR%"
 if errorlevel 1 (
   echo.

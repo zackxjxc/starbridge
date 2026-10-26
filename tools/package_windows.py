@@ -59,6 +59,9 @@ def main() -> int:
 
     if not args.binary.is_file():
         raise SystemExit(f"缺少 {args.binary}，请先运行 cargo build --release -p starbridge-client")
+    session_launcher = args.binary.with_name("starbridge-ssh-session.exe")
+    if not session_launcher.is_file():
+        raise SystemExit(f"缺少 SSH 会话启动器 {session_launcher}，请完整构建客户端")
     missing = [name for name in CLIENT_RUNTIME if not (args.runtime / name).is_file()]
     if missing:
         raise SystemExit(f"运行时缺少文件: {', '.join(missing)}，请先运行 tools/fetch_runtime.py")
@@ -98,6 +101,7 @@ def main() -> int:
     runtime = args.output / "runtime"
     runtime.mkdir(parents=True)
     shutil.copy2(args.binary, args.output / "starbridge.exe")
+    shutil.copy2(session_launcher, args.output / session_launcher.name)
     for name in CLIENT_RUNTIME:
         shutil.copy2(args.runtime / name, runtime / name)
     # Publish only runtime metadata, never unrelated fields from a used directory.

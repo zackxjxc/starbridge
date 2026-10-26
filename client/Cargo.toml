@@ -1,5 +1,6 @@
 [package]
 name = "starbridge-client"
+default-run = "starbridge-client"
 version.workspace = true
 edition.workspace = true
 rust-version = "1.90"
