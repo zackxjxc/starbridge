@@ -24,4 +24,4 @@ node tools/generate_brand_assets.cjs --check
 
 脚本从 `logo.svg` 读取同一份几何路径，生成应用图标、ICO、ICNS、顶栏与管理台的 CSS 遮罩及两端 favicon。它仅更新带 `starbridge-brand`、`starbridge-favicon` 标记的品牌块，保留其他页面代码；`--check` 只检查资源是否同步。
 
-Windows 在下一次编译时嵌入 ICO；macOS 打包时复制 ICNS。现有编译产物不会因源图标更新而自动改变。
+Windows 编译时嵌入 ICO；构建脚本显式追踪 ICO 和 PNG，更新源图标会触发资源重新编译。macOS 打包时复制 ICNS。现有编译产物不会因源图标更新而自动改变；Windows 出包时应核对 exe 内嵌的全部尺寸图标与当前 ICO 一致，避免把增量构建缓存误判为系统图标缓存。
