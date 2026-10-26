@@ -122,8 +122,18 @@ def main() -> int:
         "完整解压 ZIP 后，双击 starbridge.exe 打开设备中心；同账户设备可以互相连接。\n"
         "无需安装程序；请保留 runtime 和 licenses 目录。Windows 需要已安装 Microsoft Edge WebView2 Runtime。\n"
         "使用账号密码登录或注册，连接服务已内置。关闭窗口会退出客户端并停止其连接组件。\n\n"
+        "右上角「中 / EN」可切换简体中文、English 或跟随系统，选择会在这台电脑上保留。\n\n"
         "账户和设备数据默认保存在当前用户的 %LOCALAPPDATA%\\StarBridge，与程序解压位置无关。\n"
-        "重新解压或移动程序可继续使用原有设备；请勿复制、删除或转发用户数据目录。分享时使用原始 ZIP。\n",
+        "重新解压或移动程序可继续使用原有设备；请勿复制、删除或转发用户数据目录。分享时使用原始 ZIP。\n\n"
+        "StarBridge Portable Client\n\n"
+        "Extract the entire ZIP, then double-click starbridge.exe. Keep the runtime and licenses folders.\n"
+        "No installer is needed. Windows requires Microsoft Edge WebView2 Runtime.\n"
+        "Sign in or create an account. The connection service is built in.\n"
+        "Use the top-right globe / 中 / EN menu to choose English, 简体中文, or the system language.\n"
+        "Your language choice is remembered on this computer. Closing the window stops the client and its connection components.\n"
+        "Account and device data stay in %LOCALAPPDATA%\\StarBridge, independently of the extracted program folder.\n"
+        "Moving or extracting the program again preserves the device identity. Do not share or delete the user data folder.\n"
+        "Share the original ZIP, without your account data.\n",
         encoding="utf-8",
         newline="\n",
     )
