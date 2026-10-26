@@ -507,7 +507,7 @@ impl ClientApp {
                         if current.session_id != session.session_id || current.initiator_node_id != session.initiator_node_id
                             || current.target_node_id != session.target_node_id || current.policy != session.policy
                             || !matches!(current.status, SessionStatus::Negotiating | SessionStatus::Connected)
-                            || (current.path == SessionPath::Relay) != relay || !same_route {
+                            || (current.policy == ConnectionPolicy::RelayOnly || current.path == SessionPath::Relay) != relay || !same_route {
                             anyhow::bail!("连接已结束或路径已变化，请重新连接");
                         }
                         // Legacy centers return the original SessionInfo without this optional field.
@@ -542,7 +542,7 @@ impl ClientApp {
             || !inner.sessions.get(&session.session_id).is_some_and(|current|
                 matches!(current.status, SessionStatus::Negotiating | SessionStatus::Connected)
                     && current.initiator_node_id == node_id && current.target_node_id == target_id
-                    && (current.path == SessionPath::Relay) == relay) {
+                    && (current.policy == ConnectionPolicy::RelayOnly || current.path == SessionPath::Relay) == relay) {
             anyhow::bail!("连接已终止或登录状态已变化");
         }
         Ok(())
@@ -840,6 +840,17 @@ mod tests {
         fixture.response.write().await["path"] = "relay".into();
         fixture.app.wait_for_receiver_ready("remote", &fixture.session, 1, true).await.unwrap();
         assert_eq!(&*fixture.paths.read().await, &["relay", "relay"]);
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    async fn relay_only_negotiating_session_accepts_unknown_path_until_verified() {
+        let mut fixture = ReadinessFixture::new(Some(true)).await;
+        fixture.session.policy = ConnectionPolicy::RelayOnly;
+        fixture.app.inner.write().await.sessions.get_mut(&fixture.session.session_id).unwrap().policy = ConnectionPolicy::RelayOnly;
+        fixture.response.write().await["policy"] = "relay_only".into();
+        fixture.app.wait_for_receiver_ready("remote", &fixture.session, 1, true).await.unwrap();
+        assert_eq!(&*fixture.paths.read().await, &["relay"]);
         fixture.finish().await;
     }
 
