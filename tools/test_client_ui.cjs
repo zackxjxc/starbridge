@@ -30,6 +30,7 @@ const assets = path.join(__dirname, '../client-ui');
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
     let authFailure = false;
+    const enrollmentRequests = [];
     const calls = [];
     const state = {
       logged_in: false, username: null, last_username: '', node_id: 'local', display_name: 'Dev-PC',
@@ -49,7 +50,15 @@ const assets = path.join(__dirname, '../client-ui');
         else if (command === 'client_state') value = state;
         else if (command === 'client_login' || command === 'client_register') {
           if (authFailure) return route.fulfill({ status: 401, json: { error: '账户不存在或密码不正确，请检查后登录或注册' } });
-          state.logged_in = true; state.username = 'tester'; state.devices = [local, peer]; value = state;
+          state.logged_in = true; state.username = 'tester'; state.devices = [local, peer];
+          state.device_rebind_required = false; state.enrollment_candidates = []; value = state;
+        } else if (command === 'client_resolve_enrollment') {
+          const form = route.request().postDataJSON().form;
+          assert.deepEqual(Object.keys(form).sort(), ['choice', 'target_node_id']);
+          enrollmentRequests.push(form);
+          state.device_rebind_required = false; state.enrollment_candidates = [];
+          state.node_id = form.choice === 'add' ? 'another-device' : form.target_node_id;
+          state.devices = [{ ...local, node_id: state.node_id }, peer]; value = state;
         } else if (command === 'client_connection_history') value = { total: 1, items: [{ session_id: 'history', peer_name: 'Build-PC', direction: 'outgoing', created_at: 1792980000, path: 'direct', status: 'failed', failure_reason: '连接协商已过期' }] };
         else if (command === 'client_components') value = { version: '0.1.0', files: [{ name: 'frpc.exe', verification: 'verified', message: '与发布清单中的文件 SHA-256 一致' }] };
         else if (command === 'client_export') value = exportData;
@@ -205,6 +214,37 @@ const assets = path.join(__dirname, '../client-ui');
     assert.equal(await page.evaluate(() => window.__desktopLocales.at(-1)), 'zh-CN');
     assert.equal(await page.locator('[data-action="window-close"]').getAttribute('title'), '关闭到托盘');
     await choose('en');
+
+    // A verified account resolves a live-instance choice without a second password.
+    Object.assign(state, { logged_in: true, username: 'tester', node_id: 'local', devices: [local, peer],
+      device_rebind_required: true, enrollment_candidates: [{ node_id: 'local', display_name: 'Dev-PC',
+        online: true, active_connections: 2, test_running: true }] });
+    await page.reload();
+    await page.locator('[data-action="rebind-device"]').click();
+    assert.equal(await page.locator('#modal input[type="password"]').count(), 0);
+    assert.match(await page.locator('#modal').innerText(), /Active connections: 2/);
+    await noChineseUI();
+    await page.screenshot({ path: path.join(__dirname, '../.cache/device-enrollment-review/enrollment-choice.png') });
+    await page.locator('[data-action="add-instance"]').click();
+    await page.waitForFunction(() => !document.querySelector('#modal').open);
+    assert.deepEqual(enrollmentRequests.at(-1), { choice: 'add', target_node_id: null });
+
+    Object.assign(state, { node_id: 'local', device_rebind_required: true,
+      enrollment_candidates: [{ node_id: 'local', display_name: 'Dev-PC', online: true, active_connections: 2, test_running: true }] });
+    await page.reload();
+    await page.locator('[data-action="rebind-device"]').click();
+    await page.locator('[data-action="replace-instance"]').click();
+    assert.equal(await page.locator('#modal input[type="password"]').count(), 0);
+    assert.match(await page.locator('#modal').innerText(), /2 active connections/);
+    await page.locator('[data-action="confirm-replace-instance"]').click();
+    await page.waitForFunction(() => !document.querySelector('#modal').open);
+    assert.deepEqual(enrollmentRequests.at(-1), { choice: 'replace', target_node_id: 'local' });
+
+    Object.assign(state, { device_rebind_required: true, enrollment_candidates: [] });
+    await page.reload();
+    await page.locator('[data-form="auth"]').waitFor();
+    assert.equal(await page.locator('input[type="password"]').count(), 1);
+    assert.match(await page.locator('body').innerText(), /automatically restore this computer/);
 
     const notice = await context.newPage();
     await notice.setViewportSize({ width: 360, height: 138 });

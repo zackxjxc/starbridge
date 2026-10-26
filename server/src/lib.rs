@@ -23,6 +23,7 @@ use tokio::sync::{Mutex, RwLock};
 
 mod diagnostics;
 mod route_ready;
+mod enrollment;
 pub use diagnostics::{DiagnosticIntegration, diagnostic_plugin_app};
 
 const ADMIN_HTML: &str = include_str!("../../admin-ui/index.html");
@@ -77,6 +78,8 @@ struct Inner {
     deleted_devices: HashMap<String, DeletedDevice>,
     sessions: HashMap<String, SessionInfo>,
     diagnostics: HashMap<String, diagnostics::DiagnosticRecord>,
+    instance_leases: HashMap<String, enrollment::InstanceLease>,
+    enrollment_grants: HashMap<String, enrollment::EnrollmentGrant>,
     frp_server_addr: String,
     frp_server_port: u16,
     frp_auth_token: String,
@@ -221,6 +224,7 @@ pub fn app(state: AppState) -> Router {
         .route("/api/v1/auth/logout", post(logout_auth))
         .route("/api/v1/devices/register", post(register_device))
         .route("/api/v1/devices/identify", post(identify_device))
+        .route("/api/v1/devices/enroll", post(enrollment::enroll))
         .route("/api/v1/devices/rebind", post(rebind_device))
         .route("/api/v1/devices/heartbeat", post(heartbeat))
         .route("/api/v1/devices", get(devices))
@@ -383,6 +387,7 @@ async fn register_identified(
     let account = authenticate(&state, &headers).await?;
     validate_registration(&registration)?;
     let mut inner = state.inner.write().await;
+    enrollment::check_legacy_registration(&inner, &account, &registration, headers)?;
     if let Some(auth) = &rebind_auth {
         if auth.username.trim() != account || !inner.accounts.get(&account)
             .is_some_and(|stored| stored.password == password_digest(&auth.password)) {
@@ -393,6 +398,7 @@ async fn register_identified(
     let previous_devices = inner.devices.clone();
     let previous_deleted = inner.deleted_devices.clone();
     let node_id = store_registration(&mut inner, &account, registration, allow_canonical_id, rebind_auth.is_some())?;
+    enrollment::record_activity(&mut inner, &node_id, headers);
     if let Err(error) = persist_inner(&state.data_path, &inner) {
         inner.devices = previous_devices;
         inner.deleted_devices = previous_deleted;
@@ -536,7 +542,7 @@ async fn delete_device(
     let requester = headers.get("x-starbridge-node-id")
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| ApiError::forbidden("缺少发起设备身份"))?;
-    authenticate_device(&inner, &account, requester, device_token_header(&headers)?)?;
+    authenticate_instance_device(&inner, &account, requester, device_token_header(&headers)?, &headers)?;
     let device = inner.devices.get(&id).cloned()
         .ok_or_else(|| ApiError::not_found("设备不存在"))?;
     if device.account != account { return Err(ApiError::forbidden("不能删除其他账户的设备")); }
@@ -573,6 +579,7 @@ async fn heartbeat(
     let account = authenticate(&state, &headers).await?;
     let mut inner = state.inner.write().await;
     ensure_device_not_deleted(&inner, &account, &request.node_id, &request.device_token)?;
+    enrollment::check_instance(&inner, &request.node_id, &headers)?;
     let device = inner
         .devices
         .get_mut(&request.node_id)
@@ -582,6 +589,7 @@ async fn heartbeat(
     }
     device.last_heartbeat = now_unix();
     device.status = request.status;
+    enrollment::record_activity(&mut inner, &request.node_id, &headers);
     expire_sessions(&mut inner, now_unix());
     diagnostics::expire(&mut inner, now_unix());
     Ok(Json(list_devices(&inner, Some(&account))))
@@ -642,11 +650,12 @@ async fn create_session(
     let mut inner = state.inner.write().await;
     expire_sessions(&mut inner, now_unix());
     diagnostics::expire(&mut inner, now_unix());
-    let initiator = authenticate_device(
+    let initiator = authenticate_instance_device(
         &inner,
         &account,
         &request.initiator_node_id,
         &request.device_token,
+        &headers,
     )?;
     if !is_online(initiator) {
         return Err(ApiError::conflict("发起节点当前离线"));
@@ -727,7 +736,7 @@ async fn session_history(
 ) -> Result<Json<SessionHistoryPage>, ApiError> {
     let account = authenticate(&state, &headers).await?;
     let mut inner = state.inner.write().await;
-    authenticate_device(&inner, &account, &node_id, device_token_header(&headers)?)?;
+    authenticate_instance_device(&inner, &account, &node_id, device_token_header(&headers)?, &headers)?;
     let changed = expire_sessions(&mut inner, now_unix());
     let mut sessions: Vec<_> = inner.sessions.values().filter(|session| {
         session.initiator_node_id == node_id || session.target_node_id == node_id
@@ -764,7 +773,7 @@ async fn assigned_sessions(
 ) -> Result<Json<Vec<SessionInfo>>, ApiError> {
     let account = authenticate(&state, &headers).await?;
     let mut inner = state.inner.write().await;
-    authenticate_device(&inner, &account, &node_id, device_token_header(&headers)?)?;
+    authenticate_instance_device(&inner, &account, &node_id, device_token_header(&headers)?, &headers)?;
     let changed = expire_sessions(&mut inner, now_unix());
     let mut sessions: Vec<_> = inner
         .sessions
@@ -1005,6 +1014,14 @@ fn authenticate_device<'a>(
     Ok(device)
 }
 
+fn authenticate_instance_device<'a>(
+    inner: &'a Inner, account: &str, node: &str, token: &str, headers: &HeaderMap,
+) -> Result<&'a StoredDevice, ApiError> {
+    let device = authenticate_device(inner, account, node, token)?;
+    enrollment::check_instance(inner, node, headers)?;
+    Ok(device)
+}
+
 fn device_token_header(headers: &HeaderMap) -> Result<&str, ApiError> {
     headers.get("x-starbridge-device-token")
         .and_then(|value| value.to_str().ok())
@@ -1044,7 +1061,7 @@ fn ensure_session_device(
     let node_id = headers.get("x-starbridge-node-id")
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| ApiError::forbidden("缺少发起设备身份"))?;
-    authenticate_device(inner, account, node_id, device_token_header(headers)?)?;
+    authenticate_instance_device(inner, account, node_id, device_token_header(headers)?, headers)?;
     if node_id != session.initiator_node_id && node_id != session.target_node_id {
         return Err(ApiError::forbidden("本机不是这个会话的参与节点"));
     }

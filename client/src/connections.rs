@@ -858,10 +858,13 @@ mod tests {
             let mut cached = current.clone();
             cached.occupancy = "incoming".into();
             let local_id = app.inner.read().await.identity.node_id.clone();
-            let registry = Router::new().route("/api/v1/devices/identify", post(move || {
+            let registry = Router::new().route("/api/v1/devices/enroll", post(move |Json(request): Json<starbridge_protocol::DeviceEnrollmentRequest>| {
                 let current = current.clone();
                 let node_id = local_id.clone();
-                async move { Json(DeviceRegistrationResponse { node_id, devices: vec![current] }) }
+                async move { Json(starbridge_protocol::DeviceEnrollmentResponse {
+                    registration: Some(DeviceRegistrationResponse { node_id, devices: vec![current] }),
+                    device_token: Some(request.registration.device_token), grant: None, candidates: vec![],
+                }) }
             }));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();

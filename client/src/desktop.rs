@@ -284,6 +284,14 @@ async fn client_rebind_device(
 }
 
 #[tauri::command]
+async fn client_resolve_enrollment(
+    app: tauri::State<'_, ClientApp>, form: enrollment::ResolveEnrollmentForm,
+) -> Result<ClientSnapshot, String> {
+    enrollment::resolve_enrollment(State(app.inner().clone()), Json(form)).await
+        .map(|value| value.0).map_err(|error| error.message)
+}
+
+#[tauri::command]
 async fn client_register(
     app: tauri::State<'_, ClientApp>,
     form: RegisterForm,
@@ -443,6 +451,7 @@ pub fn run(app: ClientApp, _role: Role, root: PathBuf) -> anyhow::Result<()> {
             client_login,
             client_register,
             client_rebind_device,
+            client_resolve_enrollment,
             client_update_device,
             client_delete_device,
             client_connect_all,

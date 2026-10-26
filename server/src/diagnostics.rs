@@ -53,6 +53,16 @@ pub(super) fn occupied(inner: &Inner, node: &str) -> bool {
         && matches!(record.info.status.as_str(), "running" | "cleaning"))
 }
 
+pub(super) fn cancel_for_replacement(inner: &mut Inner, node: &str) {
+    for record in inner.diagnostics.values_mut().filter(|record| record.info.node_id == node
+        && matches!(record.info.status.as_str(), "running" | "cleaning")) {
+        record.info.status = "cleaning".into();
+        record.info.phase = "cleanup".into();
+        record.outcome = Some("cancelled".into());
+        record.info.failure_reason = Some("设备已由用户选择的实例接管".into());
+    }
+}
+
 pub(super) fn expire(inner: &mut Inner, now: u64) {
     for record in inner.diagnostics.values_mut() {
         if record.info.status == "running" && (record.info.expires_at <= now
@@ -90,7 +100,7 @@ pub(super) async fn create(
     let mut inner = state.inner.write().await;
     expire_sessions(&mut inner, now_unix());
     expire(&mut inner, now_unix());
-    let device = authenticate_device(&inner, &account, &request.node_id, &request.device_token)?;
+    let device = authenticate_instance_device(&inner, &account, &request.node_id, &request.device_token, &headers)?;
     if !is_online(device) { return Err(ApiError::conflict("本机当前离线，不能进行连接测试")); }
     if device.registration.direct_only || !device.registration.allow_relay {
         return Err(ApiError::conflict("当前策略不允许中转测试，尚未验证"));
@@ -120,7 +130,7 @@ async fn authorize(state: &AppState, headers: &HeaderMap, id: &str) -> Result<()
     let inner = state.inner.read().await;
     let record = inner.diagnostics.get(id).ok_or_else(|| ApiError::not_found("连接测试不存在或服务已重启"))?;
     let node = headers.get("x-starbridge-node-id").and_then(|value| value.to_str().ok()).unwrap_or("");
-    authenticate_device(&inner, &account, node, device_token_header(headers)?)?;
+    authenticate_instance_device(&inner, &account, node, device_token_header(headers)?, headers)?;
     if account != record.account || node != record.info.node_id { return Err(ApiError::forbidden("只能操作本机发起的连接测试")); }
     Ok(())
 }
@@ -130,7 +140,7 @@ async fn current_id(state: &AppState, headers: &HeaderMap, node_id: &str) -> Res
     let header_node = headers.get("x-starbridge-node-id").and_then(|value| value.to_str().ok()).unwrap_or("");
     if header_node != node_id { return Err(ApiError::forbidden("只能查询本机的连接测试")); }
     let inner = state.inner.read().await;
-    authenticate_device(&inner, &account, node_id, device_token_header(headers)?)?;
+    authenticate_instance_device(&inner, &account, node_id, device_token_header(headers)?, headers)?;
     Ok(inner.diagnostics.values().find(|record| record.info.node_id == node_id && record.account == account
         && matches!(record.info.status.as_str(), "running" | "cleaning")).map(|record| record.info.test_id.clone()))
 }

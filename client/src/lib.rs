@@ -32,6 +32,7 @@ pub use identity::Identity;
 mod connections;
 mod diagnostics;
 mod history;
+mod enrollment;
 mod process;
 use account::*;
 use connections::*;
@@ -122,6 +123,7 @@ pub struct ClientSnapshot {
     pub stage: String,
     pub last_error: Option<String>,
     pub device_rebind_required: bool,
+    pub enrollment_candidates: Vec<starbridge_protocol::EnrollmentCandidate>,
     pub runtime: RuntimeStatus,
     pub ssh: SshStatus,
     pub ssh_command: Option<String>,
@@ -198,6 +200,9 @@ struct Inner {
     auth_generation: u64,
     closing_account: bool,
     device_rebind_required: bool,
+    instance_id: String,
+    pending_enrollment: Option<starbridge_protocol::DeviceEnrollmentRequest>,
+    enrollment_candidates: Vec<starbridge_protocol::EnrollmentCandidate>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -240,6 +245,9 @@ impl ClientApp {
         let pending_closes = load_json(&root.join("pending-closes.json"), HashSet::new()).await?;
         let restoring = auth.is_some();
         let runtime = runtime_status(&root).await;
+        let instance_id = new_token();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-starbridge-instance-id", instance_id.parse()?);
         let app = Self {
             inner: Arc::new(RwLock::new(Inner {
                 role: Role::Peer,
@@ -260,8 +268,9 @@ impl ClientApp {
                 connection_generations: HashMap::new(), blocked_peers: HashSet::new(),
                 batch: None, self_test, auth_generation: 0, closing_account: false,
                 device_rebind_required: false,
+                instance_id, pending_enrollment: None, enrollment_candidates: Vec::new(),
             })),
-            http: reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(15)).build()?,
+            http: reqwest::Client::builder().no_proxy().default_headers(headers).timeout(std::time::Duration::from_secs(15)).build()?,
             frpc_processes: Arc::new(Mutex::new(HashMap::new())),
             session_operations: Arc::new(Mutex::new(())),
             sshd_process: Arc::new(Mutex::new(None)),
@@ -421,6 +430,7 @@ impl ClientApp {
             .route("/api/v1/devices", axum::routing::put(update_device))
             .route("/api/v1/devices/delete", post(delete_device))
             .route("/api/v1/devices/rebind", post(rebind_device))
+            .route("/api/v1/devices/enroll", post(enrollment::resolve_enrollment))
             .route("/api/v1/connect", post(connect))
             .route("/api/v1/connect/all", post(connect_all))
             .route("/api/v1/terminate", post(terminate))
@@ -450,8 +460,8 @@ impl ClientApp {
                     let status = registration_status(&error);
                     let unauthorized = status == Some(StatusCode::UNAUTHORIZED);
                     if app.inner.read().await.auth_generation != attempted { continue; }
-                    if status == Some(StatusCode::GONE) {
-                        let _ = logout_removed_device(&app, attempted).await;
+                    if matches!(status, Some(StatusCode::GONE | StatusCode::FORBIDDEN | StatusCode::CONFLICT)) {
+                        let _ = logout_account(&app, Some(attempted), Some("登录已失效，请重新登录以恢复这台电脑。")).await;
                         continue;
                     }
                     if unauthorized {
@@ -897,6 +907,7 @@ fn snapshot(inner: &Inner) -> ClientSnapshot {
         stage: inner.stage.clone(),
         last_error: inner.last_error.clone(),
         device_rebind_required: inner.device_rebind_required,
+        enrollment_candidates: inner.enrollment_candidates.clone(),
         runtime: inner.runtime.clone(),
         ssh: inner.ssh.clone(),
         updated_at: now_unix(),

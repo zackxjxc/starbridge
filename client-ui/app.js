@@ -20,7 +20,7 @@
   const ui = {
     snapshot: null, config: null, view: 'device', selected: null, query: '',
     authMode: 'login', auth: { username: '', password: '', confirm_password: '', remember: true },
-    authError: '', loadError: '', syncError: '', busy: new Set(), drafts: new Map(),
+    authError: '', loadError: '', syncError: '', busy: new Set(), drafts: new Map(), reauthenticate: false,
     policy: 'direct_preferred', rebuild: false, allConfig: true, failureGroup: null,
     components: null, exportData: null, exportIds: [], exportFingerprint: '', exportBack: 'device',
     historyItems: [], historyTotal: 0, historyOffset: 0, historyLoaded: false, historyError: '', historyRequest: 0,
@@ -35,6 +35,7 @@
     client_update_device: ['PUT', '/api/v1/devices'], client_connect: ['POST', '/api/v1/connect'],
     client_delete_device: ['POST', '/api/v1/devices/delete'],
     client_rebind_device: ['POST', '/api/v1/devices/rebind'],
+    client_resolve_enrollment: ['POST', '/api/v1/devices/enroll'],
     client_connect_all: ['POST', '/api/v1/connect/all'], client_terminate: ['POST', '/api/v1/terminate'],
     client_export: ['POST', '/api/v1/export'], client_start_test: ['POST', '/api/v1/test/start'],
     client_connection_history: ['POST', '/api/v1/history'],
@@ -598,11 +599,11 @@
       h('p', { 'data-copyable': s()?.last_error ? '' : undefined }, s()?.last_error ? displayMessage(s().last_error) : t("正在登记本机，完成后才能修改设备信息和建立连接。")));
   }
   function rebindNotice() {
-    if (!s()?.device_rebind_required) return null;
+    if (!s()?.device_rebind_required || !s()?.enrollment_candidates?.length) return null;
     return h('div', { class: 'banner warn', 'data-key': 'device-rebind-notice' },
-      h('p', { class: 'banner-title' }, t("这台电脑需要确认重新绑定")),
-      h('p', {}, t("现有设备凭据无法复用。确认账号后，可替换原凭据；旧客户端将失去访问权限。")),
-      button(t("重新绑定这台电脑"), 'rebind-device', { class: 'button', disabled: ui.busy.has('rebind-device') }));
+      h('p', { class: 'banner-title' }, t("请选择这台电脑的使用方式")),
+      h('p', {}, t("账号已验证。你可以新增一台设备，或替换已有实例，无需再次输入密码。")),
+      button(t("选择设备使用方式"), 'rebind-device', { class: 'button', disabled: ui.busy.has('enrollment') }));
   }
   function header(loggedIn) {
     return h('header', { class: 'app-header', 'data-key': 'app-header' }, h('span', { class: 'brand-mark', 'aria-hidden': 'true' }, 'S'), h('span', {}, 'StarBridge'),
@@ -620,14 +621,15 @@
     const registering = ui.authMode === 'register';
     return h('div', { class: 'shell', 'data-key': 'auth-shell' }, header(false), h('main', { class: 'auth' },
       h('form', { class: 'auth-form', 'data-form': 'auth' }, h('h1', {}, registering ? t("创建账号") : t("登录账号")), h('p', { class: 'intro' }, t("登录后，在你的电脑之间建立连接。")),
-        field(t("用户名"), 'auth-username', ui.auth.username, { name: 'username', autocomplete: 'username', required: true, maxlength: 80 }),
+        field(t("用户名"), 'auth-username', ui.auth.username, { name: 'username', autocomplete: 'username', required: true, maxlength: 80, readOnly: !!s()?.logged_in }),
         field(t("密码"), 'auth-password', ui.auth.password, { name: 'password', type: 'password', autocomplete: registering ? 'new-password' : 'current-password', required: true, minlength: 4 }),
         registering ? field(t("确认密码"), 'auth-confirm', ui.auth.confirm_password, { name: 'confirm_password', type: 'password', autocomplete: 'new-password', required: true, minlength: 4 }) : null,
         h('label', { class: 'remember', 'data-key': 'remember' }, h('input', { id: 'auth-remember', type: 'checkbox', name: 'remember', checked: ui.auth.remember }), t("记住登录状态")),
         ui.authError ? h('p', { class: 'auth-error', role: 'alert', 'data-key': 'auth-error', 'data-copyable': '' }, displayMessage(ui.authError)) : null,
-        rebindNotice(),
+        s()?.device_rebind_required || ui.reauthenticate ? h('p', { class: 'auth-error', role: 'status' }, t("请重新登录，软件会自动恢复这台电脑，无需另行绑定。")) : null,
         button(ui.busy.has('auth') ? t("正在处理…") : registering ? t("注册并登录") : t("登录"), '', { type: 'submit', class: 'button primary wide', disabled: ui.busy.has('auth') }),
-        h('div', { class: 'auth-switch' }, button(registering ? t("已有账号，返回登录") : t("没有账号？注册"), 'auth-switch', { class: 'link', disabled: ui.busy.has('auth') })))));
+        h('div', { class: 'auth-switch' }, s()?.logged_in ? button(t("退出登录"), 'logout', { class: 'link', disabled: ui.busy.has('auth') })
+          : button(registering ? t("已有账号，返回登录") : t("没有账号？注册"), 'auth-switch', { class: 'link', disabled: ui.busy.has('auth') })))));
   }
   function render() {
     renderLanguageMenu();
@@ -637,7 +639,7 @@
       return;
     }
     root.setAttribute('aria-busy', 'false');
-    if (!s().logged_in) { patchChildren(root, [authPage()]); return; }
+    if (!s().logged_in || ui.reauthenticate || s().device_rebind_required && !s().enrollment_candidates?.length) { patchChildren(root, [authPage()]); return; }
     const content = h('div', { class: 'shell', 'data-key': 'main-shell' }, header(true), ui.view === 'history' ? historyPage() : h('div', { class: 'workspace', 'data-key': 'device-workspace' }, sidebar(),
       h('main', { class: `detail${ui.view === 'device' && ui.selected === localId() ? ' local-detail' : ''}`, 'data-key': `detail-${ui.view}-${ui.selected || ''}`, 'aria-label': t("设备详情与操作") }, renderDetail())),
       h('footer', { class: 'footbar' }, h('span', { class: !localRegistered() || ui.syncError || s().stage === 'heartbeat_failed' ? 'bad' : '', title: s().stage === 'heartbeat_failed' ? t("暂时无法更新账号设备状态，请检查网络连接。") : undefined },
@@ -760,14 +762,16 @@
       h('div', { class: 'actions' }, button(t("取消"), 'close-modal'), button(t("删除设备"), 'confirm-delete-device', { class: 'button danger', 'data-id': id, disabled: ui.busy.has('delete-device') }))]);
   }
   function rebindDialog() {
-    if (!s()?.device_rebind_required) return;
-    showModal('rebind-device', () => [h('h2', { id: 'modal-title' }, t("确认重新绑定这台电脑")),
-      h('p', { class: 'modal-copy' }, t("请先终止旧设备的活动连接。此操作会替换账号下这台设备的旧凭据并吊销旧凭据，旧客户端将无法继续访问。请仅在确认这是自己的设备时继续。")),
-      h('form', { 'data-form': 'rebind-device' },
-        field(t("账号密码"), 'rebind-password', '', { name: 'password', type: 'password', autocomplete: 'current-password', required: true, minlength: 4 }),
-        h('p', { class: 'auth-error', role: 'alert', 'data-rebind-error': '', 'data-copyable': '' }),
-        h('div', { class: 'actions' }, button(t("取消"), 'close-modal'), button(t("确认替换旧凭据并重新绑定"), '', { type: 'submit', class: 'button danger' })))]);
-    document.getElementById('rebind-password')?.focus();
+    if (!s()?.enrollment_candidates?.length) return;
+    showModal('device-enrollment', () => [h('h2', { id: 'modal-title' }, t("选择设备使用方式")),
+      h('p', { class: 'modal-copy' }, t("账号已验证。新增设备会保留双方；替换实例会让旧实例退出，并结束它的连接。")),
+      ...s().enrollment_candidates.map(item => h('section', { class: 'banner', 'data-key': `enrollment-${item.node_id}` },
+        h('p', { class: 'banner-title' }, item.display_name),
+        h('p', {}, item.online ? t("另一个实例仍在运行") : t("找到已有设备记录")),
+        h('p', {}, t("活动连接：{0}；连接测试：{1}", item.active_connections, item.test_running ? t("运行中") : t("未运行"))),
+        button(t("替换这个实例"), 'replace-instance', { class: 'button danger', 'data-id': item.node_id, disabled: ui.busy.has('enrollment') }))),
+      h('div', { class: 'actions' }, button(t("取消"), 'close-modal'), button(t("重新登录"), 'enrollment-login'),
+        button(t("作为另一台设备添加"), 'add-instance', { class: 'button primary', disabled: ui.busy.has('enrollment') }))]);
   }
   function showWindowsHelp() {
     if (!isWindows()) return;
@@ -836,6 +840,21 @@
       case 'history-sort': ui.historyAscending = !ui.historyAscending; render(); break;
       case 'history-details': ui.historyExpanded = ui.historyExpanded === target.dataset.session ? null : target.dataset.session; render(); break;
       case 'rebind-device': rebindDialog(); break;
+      case 'enrollment-login':
+        modal.close(); ui.reauthenticate = true; ui.auth.password = ''; ui.authMode = 'login'; render(); break;
+      case 'add-instance':
+        await mutate('enrollment', 'client_resolve_enrollment', { form: { choice: 'add', target_node_id: null } });
+        modal.close(); toast(t("设备已添加")); break;
+      case 'replace-instance': {
+        const item = s()?.enrollment_candidates?.find(item => item.node_id === id); if (!item) break;
+        showModal('replace-instance', () => [h('h2', { id: 'modal-title' }, t("替换原实例？")),
+          h('p', { class: 'modal-copy' }, t("将接管「{0}」，结束其 {1} 个活动连接，并停止连接测试。旧实例将退出。", item.display_name, item.active_connections)),
+          h('div', { class: 'actions' }, button(t("取消"), 'rebind-device'), button(t("确认替换"), 'confirm-replace-instance', { class: 'button danger', 'data-id': id, disabled: ui.busy.has('enrollment') }))]);
+        break;
+      }
+      case 'confirm-replace-instance':
+        await mutate('enrollment', 'client_resolve_enrollment', { form: { choice: 'replace', target_node_id: id } });
+        modal.close(); toast(t("已切换到当前实例")); break;
       case 'select-device': ui.failureGroup = null; navigate('device', id, false); break;
       case 'device': navigate('device'); break;
       case 'configure': navigate('configure', id || ui.selected); break;
@@ -969,20 +988,8 @@
         if (!ui.auth.username) { ui.authError = t("请输入用户名。"); render(); return; }
         if (ui.authMode === 'register' && ui.auth.password !== ui.auth.confirm_password) { ui.authError = t("两次输入的密码不一致。"); render(); document.getElementById('auth-confirm')?.focus(); return; }
         ui.authError = '';
-        try { await mutate('auth', ui.authMode === 'register' ? 'client_register' : 'client_login', { form: { ...ui.auth } }); ui.auth.password = ''; ui.auth.confirm_password = ''; ui.view = 'device'; ui.selected = localId(); render(); }
+        try { await mutate('auth', ui.authMode === 'register' ? 'client_register' : 'client_login', { form: { ...ui.auth } }); ui.reauthenticate = false; ui.auth.password = ''; ui.auth.confirm_password = ''; ui.view = 'device'; ui.selected = localId(); render(); if (s()?.enrollment_candidates?.length) rebindDialog(); }
         catch (error) { ui.authError = message(error); render(); }
-      } else if (form.dataset.form === 'rebind-device') {
-        if (ui.busy.has('rebind-device') || !s()?.device_rebind_required) return;
-        const password = String(new FormData(form).get('password') || '');
-        form.reset();
-        const submit = form.querySelector('button[type="submit"]'); submit.disabled = true;
-        try {
-          await mutate('rebind-device', 'client_rebind_device', { form: { password } });
-          modal.close(); toast(t("设备已重新绑定，旧凭据已吊销"));
-        } catch (error) {
-          const alert = form.querySelector('[data-rebind-error]'); if (alert) { alert.dataset.errorSource = message(error); alert.textContent = displayMessage(error); }
-          document.getElementById('rebind-password')?.focus();
-        } finally { if (submit.isConnected) submit.disabled = false; }
       } else if (form.dataset.form === 'metadata' || form.dataset.form === 'rename') {
         const item = device(form.dataset.id); if (!item || ui.busy.has('metadata')) return;
         const rename = form.dataset.form === 'rename'; const values = new FormData(form);

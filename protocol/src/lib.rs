@@ -145,6 +145,50 @@ pub struct DeviceRebindRequest {
     pub auth: AuthRequest,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnrollmentChoice {
+    #[default]
+    Automatic,
+    Add,
+    Replace,
+}
+
+/// Passwords and recovery grants are transient and must never enter saved login state.
+#[derive(Clone, Deserialize, Serialize)]
+pub struct DeviceEnrollmentRequest {
+    pub registration: DeviceRegistration,
+    pub instance_id: String,
+    #[serde(default)]
+    pub replacement_token: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub grant: Option<String>,
+    #[serde(default)]
+    pub choice: EnrollmentChoice,
+    #[serde(default)]
+    pub target_node_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct EnrollmentCandidate {
+    pub node_id: String,
+    pub display_name: String,
+    pub online: bool,
+    pub active_connections: usize,
+    pub test_running: bool,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct DeviceEnrollmentResponse {
+    pub registration: Option<DeviceRegistrationResponse>,
+    pub device_token: Option<String>,
+    pub grant: Option<String>,
+    #[serde(default)]
+    pub candidates: Vec<EnrollmentCandidate>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DeviceInfo {
     pub node_id: String,

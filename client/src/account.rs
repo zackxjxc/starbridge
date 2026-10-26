@@ -46,16 +46,16 @@ pub(super) fn registration_status(error: &anyhow::Error) -> Option<StatusCode> {
         .or_else(|| error.downcast_ref::<reqwest::Error>().and_then(reqwest::Error::status))
 }
 
-async fn registration_response(response: reqwest::Response) -> anyhow::Result<DeviceRegistrationResponse> {
+pub(super) async fn registration_response<T: serde::de::DeserializeOwned>(response: reqwest::Response) -> anyhow::Result<T> {
     let status = response.status();
     if !status.is_success() {
         // Never display response bodies or request identifiers in a device-authentication error.
         let message = match status {
             StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED => "连接服务版本过旧，尚不支持当前客户端的设备登记。请先升级连接服务，再重新登录。",
-            StatusCode::CONFLICT => "设备身份存在冲突。请确认是否为本机的旧记录，再选择重新绑定；克隆电脑或独立测试请使用独立数据目录。",
-            StatusCode::GONE => "此设备已被删除。请登录账号后明确重新绑定；后台不会重新添加。",
-            StatusCode::UNAUTHORIZED => "账号或设备验证失败，请重新登录；重新绑定需要再次验证账号密码。",
-            StatusCode::FORBIDDEN => "此设备凭据已失效，请登录账号后明确重新绑定。",
+            StatusCode::CONFLICT => "设备状态已变化，请重新登录后选择处理方式。",
+            StatusCode::GONE => "登录已失效，请重新登录以添加这台电脑。",
+            StatusCode::UNAUTHORIZED => "登录确认已过期，请重新登录。",
+            StatusCode::FORBIDDEN => "登录已失效，请重新登录以恢复这台电脑。",
             _ => "设备登记失败，请稍后重试或检查服务状态。",
         };
         return Err(RegistrationError { status, message: message.into() }.into());
@@ -115,7 +115,7 @@ async fn authenticate_account(app: &ClientApp, form: LoginForm, registering: boo
     };
     let endpoint = if registering { "register" } else { "login" };
     let response = app.http.post(format!("{url}/api/v1/auth/{endpoint}"))
-        .json(&AuthRequest { username: form.username.trim().into(), password: form.password })
+        .json(&AuthRequest { username: form.username.trim().into(), password: form.password.clone() })
         .send().await.map_err(ApiError::network)?;
     let auth: AuthResponse = response_json(response).await?;
     // Resolve ownership of an unclaimed portable identity using the authenticated
@@ -134,17 +134,19 @@ async fn authenticate_account(app: &ClientApp, form: LoginForm, registering: boo
         identity::save_identity(&inner.root, &selected).await.map_err(ApiError::internal)?;
         inner.identity = selected;
         inner.auth = Some(auth.clone());
+        inner.pending_enrollment = None;
+        inner.enrollment_candidates.clear();
         inner.device_rebind_required = false;
         inner.stage = "registering".into();
         inner.last_error = None;
         if form.remember { save_auth(&inner.root, &auth).await.map_err(ApiError::internal)?; }
     }
     drop(_gate);
-    if let Err(error) = app.refresh_devices().await {
+    if let Err(error) = app.enroll_device(Some(form.password)).await {
         let mut inner = app.inner.write().await;
         if inner.auth_generation != generation { return Err(ApiError::bad_request("登录已取消")); }
         inner.device_rebind_required = matches!(registration_status(&error),
-            Some(StatusCode::CONFLICT | StatusCode::GONE | StatusCode::FORBIDDEN));
+            Some(StatusCode::CONFLICT | StatusCode::GONE | StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED));
         inner.stage = if inner.device_rebind_required { "device_verification_required" } else { "device_registration_failed" }.into();
         inner.last_error = Some(error.to_string());
     }
@@ -193,7 +195,7 @@ pub(super) async fn logout_removed_device(app: &ClientApp, generation: u64) -> R
     logout_account(app, Some(generation), Some("此设备已从账号删除，请重新登录并明确重新绑定后添加。")).await
 }
 
-async fn logout_account(app: &ClientApp, expected_generation: Option<u64>, reason: Option<&str>) -> Result<Json<ClientSnapshot>, ApiError> {
+pub(super) async fn logout_account(app: &ClientApp, expected_generation: Option<u64>, reason: Option<&str>) -> Result<Json<ClientSnapshot>, ApiError> {
     let _gate=app.session_operations.lock().await;
     {
         let mut inner=app.inner.write().await;
@@ -219,6 +221,8 @@ async fn logout_account(app: &ClientApp, expected_generation: Option<u64>, reaso
         let auth = inner.auth.take();
         inner.closing_account=false;
         inner.devices.clear();
+        inner.pending_enrollment = None;
+        inner.enrollment_candidates.clear();
         inner.device_rebind_required = false;
         inner.stage = "ready".into();
         inner.last_error = reason.map(str::to_owned);
@@ -357,20 +361,10 @@ impl ClientApp {
     }
 
     pub(super) async fn refresh_devices(&self) -> anyhow::Result<Vec<DeviceInfo>> {
-        let _updates = self.device_updates.lock().await;
-        let (auth, url, generation, registration) = {
-            let inner = self.inner.read().await;
-            if inner.closing_account { anyhow::bail!("正在退出登录"); }
-            (inner.auth.clone().ok_or_else(|| anyhow::anyhow!("未登录"))?,
-                inner.config.server_url.clone(), inner.auth_generation, device_registration(&inner))
-        };
-        let response = self.http.post(format!("{url}/api/v1/devices/identify"))
-            .bearer_auth(auth.access_token).json(&registration).send().await?;
-        let result = registration_response(response).await?;
-        self.accept_registration(result, generation).await
+        self.enroll_device(None).await
     }
 
-    async fn accept_registration(&self, result: DeviceRegistrationResponse, generation: u64) -> anyhow::Result<Vec<DeviceInfo>> {
+    pub(super) async fn accept_registration(&self, result: DeviceRegistrationResponse, generation: u64) -> anyhow::Result<Vec<DeviceInfo>> {
         let devices = result.devices;
         if self.inner.read().await.auth_generation != generation { anyhow::bail!("登录状态已更改"); }
         let mut inner = self.inner.write().await;
@@ -383,6 +377,8 @@ impl ClientApp {
         }
         inner.identity = canonical;
         inner.device_rebind_required = false;
+        inner.pending_enrollment = None;
+        inner.enrollment_candidates.clear();
         inner.last_error = None;
         inner.stage = "online".into();
         if let Some(local) = devices.iter().find(|device| device.node_id == inner.identity.node_id) {
@@ -613,85 +609,133 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn credential_conflict_needs_explicit_password_rebind_and_revokes_previous_credential() {
+    async fn password_login_recovers_offline_device_without_a_second_password() {
         let fixture = Fixture::new().await;
         let original = fixture.client("original").await;
         let first = sign_in(&original, "alice").await;
         let replacement = fixture.client("reextracted-without-credentials").await;
         same_machine(&original, &replacement).await;
-        let conflict = sign_in(&replacement, "alice").await;
-        assert!(conflict.device_rebind_required);
-        assert_eq!(original.refresh_devices().await.unwrap().len(), 1);
-        for _ in 0..2 { assert!(replacement.heartbeat_once().await.is_err()); }
-        assert_eq!(original.refresh_devices().await.unwrap().len(), 1);
-        let wrong = rebind_device(State(replacement.clone()), Json(DeviceRebindForm { password: "wrong".into() })).await;
-        assert!(wrong.is_err());
+        assert!(login(State(replacement.clone()), Json(LoginForm {
+            username: "alice".into(), password: "wrong".into(), remember: true,
+        })).await.is_err());
         assert!(original.refresh_devices().await.is_ok());
-        let rebound = rebind_device(State(replacement.clone()), Json(DeviceRebindForm { password: "test-password".into() })).await.unwrap().0;
-        assert_eq!(rebound.node_id, first.node_id);
-        assert_eq!(rebound.devices.len(), 1);
-        assert!(!rebound.device_rebind_required);
+        let recovered = sign_in(&replacement, "alice").await;
+        assert!(!recovered.device_rebind_required);
+        assert_eq!(recovered.node_id, first.node_id);
+        assert_eq!(recovered.devices.len(), 1);
         assert!(original.refresh_devices().await.is_err());
         assert_eq!(replacement.refresh_devices().await.unwrap().len(), 1);
         fixture.cleanup(vec![original, replacement]).await;
     }
 
     #[tokio::test]
-    async fn deletion_stays_deleted_through_login_and_background_retry_until_explicit_rebind() {
+    async fn deleted_device_cannot_resume_but_one_password_login_restores_it() {
         let fixture = Fixture::new().await;
         let app = fixture.client("deleted-client").await;
         let first = sign_in(&app, "alice").await;
-        let _ = delete_device(State(app.clone()), Json(DeviceDeleteForm { node_id: first.node_id.clone() })).await.unwrap();
-        assert!(app.heartbeat_once().await.is_err());
-        let signed_in = sign_in(&app, "alice").await;
-        assert!(signed_in.device_rebind_required);
-        for _ in 0..2 {
-            let error = app.heartbeat_once().await.unwrap_err();
-            assert_eq!(registration_status(&error), Some(StatusCode::GONE));
+        let restored = fixture.client("snapshot-client").await;
+        same_machine(&app, &restored).await;
+        {
+            let source = app.inner.read().await;
+            let mut target = restored.inner.write().await;
+            target.identity = source.identity.clone(); target.auth = source.auth.clone();
         }
-        let rebound = rebind_device(State(app.clone()), Json(DeviceRebindForm { password: "test-password".into() })).await.unwrap().0;
-        assert_eq!(rebound.node_id, first.node_id);
-        assert_eq!(rebound.devices.len(), 1);
-        fixture.cleanup(vec![app]).await;
+        let _ = delete_device(State(app.clone()), Json(DeviceDeleteForm { node_id: first.node_id.clone() })).await.unwrap();
+        for _ in 0..2 { assert!(restored.refresh_devices().await.is_err()); }
+        let recovered = sign_in(&restored, "alice").await;
+        assert!(!recovered.device_rebind_required);
+        assert_eq!(recovered.node_id, first.node_id);
+        assert_eq!(recovered.devices.len(), 1);
+        fixture.cleanup(vec![app, restored]).await;
     }
 
     #[tokio::test]
-    async fn parallel_registration_cannot_replace_another_instance_and_distinct_machines_register() {
+    async fn live_clones_choose_add_without_a_second_password_and_remain_independent() {
         let fixture = Fixture::new().await;
         let first = fixture.client("first").await;
         let second = fixture.client("second").await;
         same_machine(&first, &second).await;
+        first.heartbeat_loop().await;
+        second.heartbeat_loop().await;
         let (a, b) = tokio::join!(sign_in(&first, "alice"), sign_in(&second, "alice"));
         assert_ne!(a.device_rebind_required, b.device_rebind_required);
-        let winner = if a.device_rebind_required { &second } else { &first };
-        assert_eq!(winner.refresh_devices().await.unwrap().len(), 1);
+        let pending = if a.device_rebind_required { &first } else { &second };
+        {
+            let inner = pending.inner.read().await;
+            assert!(inner.pending_enrollment.as_ref().unwrap().password.is_none());
+            let public = serde_json::to_string(&snapshot(&inner)).unwrap();
+            assert!(!public.contains(inner.pending_enrollment.as_ref().unwrap().grant.as_ref().unwrap()));
+            assert!(!public.contains("test-password"));
+        }
+        let added = enrollment::resolve_enrollment(State(pending.clone()), Json(enrollment::ResolveEnrollmentForm {
+            choice: starbridge_protocol::EnrollmentChoice::Add, target_node_id: None,
+        })).await.unwrap().0;
+        assert!(!added.device_rebind_required);
+        assert_eq!(added.devices.len(), 2);
+        assert_ne!(first.inner.read().await.identity.node_id, second.inner.read().await.identity.node_id);
+        assert_eq!(first.refresh_devices().await.unwrap().len(), 2);
+        assert_eq!(second.refresh_devices().await.unwrap().len(), 2);
         let different = fixture.client("another-machine").await;
-        different.inner.write().await.identity.machine_key = "c".repeat(64);
         let result = sign_in(&different, "alice").await;
         assert!(!result.device_rebind_required);
-        assert_eq!(result.devices.len(), 2);
+        assert_eq!(result.devices.len(), 3);
         fixture.cleanup(vec![first, second, different]).await;
     }
 
     #[tokio::test]
-    async fn lost_rebind_response_recovers_pending_credential_after_restart_without_another_rebind() {
+    async fn replacing_a_live_instance_signs_out_the_old_client() {
+        let fixture = Fixture::new().await;
+        let original = fixture.client("live-original").await;
+        original.heartbeat_loop().await;
+        let first = sign_in(&original, "alice").await;
+        let replacement = fixture.client("live-replacement").await;
+        same_machine(&original, &replacement).await;
+        let pending = sign_in(&replacement, "alice").await;
+        assert!(pending.device_rebind_required);
+        let ready = enrollment::resolve_enrollment(State(replacement.clone()), Json(enrollment::ResolveEnrollmentForm {
+            choice: starbridge_protocol::EnrollmentChoice::Replace, target_node_id: Some(first.node_id.clone()),
+        })).await.unwrap().0;
+        assert_eq!(ready.node_id, first.node_id);
+        assert!(!ready.device_rebind_required);
+        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            loop {
+                if original.inner.read().await.auth.is_none() { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }).await.unwrap();
+        assert!(original.inner.read().await.devices.is_empty());
+        assert!(replacement.refresh_devices().await.is_ok());
+        fixture.cleanup(vec![original, replacement]).await;
+    }
+
+    #[tokio::test]
+    async fn lost_recovery_response_resumes_pending_credential_after_restart() {
         let fixture = Fixture::new().await;
         let original = fixture.client("old-install").await;
         let first = sign_in(&original, "alice").await;
         let replacement = fixture.client("new-install").await;
         same_machine(&original, &replacement).await;
-        assert!(sign_in(&replacement, "alice").await.device_rebind_required);
-        let (registration, auth, root) = {
+        let auth: AuthResponse = replacement.http.post(format!("{}/api/v1/auth/login", fixture.url))
+            .json(&AuthRequest { username: "alice".into(), password: "test-password".into() })
+            .send().await.unwrap().json().await.unwrap();
+        let (request, root) = {
             let mut inner = replacement.inner.write().await;
+            inner.identity.select_account(&account_scope(&fixture.url, "alice"));
             inner.identity.pending_rebind_token = Some(new_token());
             identity::save_identity(&inner.root, &inner.identity).await.unwrap();
-            (device_registration(&inner), inner.auth.clone().unwrap(), inner.root.clone())
+            save_auth(&inner.root, &auth).await.unwrap();
+            inner.auth = Some(auth.clone());
+            let mut registration = device_registration(&inner);
+            registration.device_token = inner.identity.device_token.clone();
+            (starbridge_protocol::DeviceEnrollmentRequest {
+                registration, instance_id: inner.instance_id.clone(),
+                replacement_token: inner.identity.pending_rebind_token.clone(), password: Some("test-password".into()),
+                grant: None, choice: starbridge_protocol::EnrollmentChoice::Automatic, target_node_id: None,
+            }, inner.root.clone())
         };
-        // The server commits, but the client never consumes the canonical response.
-        fixture.client("unused").await.http.post(format!("{}/api/v1/devices/rebind", fixture.url))
-            .bearer_auth(auth.access_token)
-            .json(&DeviceRebindRequest { registration, auth: AuthRequest { username: "alice".into(), password: "test-password".into() } })
-            .send().await.unwrap().error_for_status().unwrap();
+        // The server commits, but this client never consumes the canonical response.
+        replacement.http.post(format!("{}/api/v1/devices/enroll", fixture.url)).bearer_auth(auth.access_token)
+            .json(&request).send().await.unwrap().error_for_status().unwrap();
         replacement.shutdown().await;
         let restarted = ClientApp::load(Role::Peer, root.clone()).await.unwrap();
         assert_eq!(restarted.refresh_devices().await.unwrap().len(), 1);
@@ -699,9 +743,9 @@ mod tests {
             let inner = restarted.inner.read().await;
             assert_eq!(inner.identity.node_id, first.node_id);
             assert!(inner.identity.pending_rebind_token.is_none());
-            let snapshot = serde_json::to_string(&snapshot(&inner)).unwrap();
-            assert!(!snapshot.contains(&inner.identity.machine_key));
-            assert!(!snapshot.contains(&inner.identity.device_token));
+            let public = serde_json::to_string(&snapshot(&inner)).unwrap();
+            assert!(!public.contains(&inner.identity.machine_key));
+            assert!(!public.contains(&inner.identity.device_token));
         }
         restarted.shutdown().await;
         let recovered = ClientApp::load(Role::Peer, root).await.unwrap();
