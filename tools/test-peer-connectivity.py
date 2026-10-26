@@ -200,10 +200,12 @@ class ManagedProcess:
     self.log.close()
 
 
-def api(url, path, method="GET", body=None, token=None):
+def api(url, path, method="GET", body=None, token=None, instance=None):
   headers = {"Content-Type": "application/json"}
   if token:
     headers["Authorization"] = f"Bearer {token}"
+  if instance:
+    headers["x-starbridge-instance-id"] = instance
   payload = json.dumps(body).encode("utf-8") if body is not None else None
   request = urllib.request.Request(url + path, data=payload, headers=headers, method=method)
   try:
@@ -415,10 +417,11 @@ class PeerRegression:
 
   def assert_occupied(self, index, target):
     identity = read_test_identity(self.work, "node-" + "abc"[index])
+    instance = api(self.urls[index], "/api/v1/state")["instance_id"]
     try:
       api(self.center, "/api/v1/sessions", "POST", {
         "initiator_node_id": identity["node_id"], "device_token": identity["device_token"],
-        "target_node_id": target, "policy": self.args.policy}, token=self.token)
+        "target_node_id": target, "policy": self.args.policy}, token=self.token, instance=instance)
     except RegressionError as error:
       if not any(word in str(error).lower() for word in ("占用", "连接", "控制", "busy", "occupied", "incoming")):
         raise RegressionError(f"Expected an occupancy rejection, received: {error}") from None
