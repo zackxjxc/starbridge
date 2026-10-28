@@ -1,16 +1,23 @@
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use futures::StreamExt;
+use libp2p::{
+    Multiaddr, PeerId, SwarmBuilder, identify, identity,
+    mdns::{self, Event as MdnsEvent},
+    noise, ping,
+    swarm::{NetworkBehaviour, SwarmEvent},
+    tcp, yamux,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, RwLock},
-    thread::JoinHandle,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-const SERVICE_TYPE: &str = "_starbridge._tcp.local.";
-const LAN_PROTOCOL_VERSION: &str = "1";
+const LAN_PROTOCOL_VERSION: &str = "/starbridge/lan/1";
 const PRESENCE_TIMEOUT_SECS: u64 = 15;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -20,6 +27,9 @@ pub(crate) struct LanProfile {
     pub invite_secret: String,
     pub node_id: String,
     pub nickname: String,
+    /// A persistent libp2p identity. It is kept inside the existing secure store.
+    #[serde(default)]
+    pub control_key: Vec<u8>,
 }
 
 impl LanProfile {
@@ -30,6 +40,7 @@ impl LanProfile {
             invite_secret: Uuid::new_v4().simple().to_string(),
             node_id,
             nickname,
+            control_key: new_control_key(),
         }
     }
 
@@ -42,13 +53,7 @@ impl LanProfile {
     }
 
     pub(crate) fn proof_for(&self, node_id: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(self.invite_secret.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(self.group_id.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(node_id.as_bytes());
-        format!("{:x}", hasher.finalize())
+        proof_for(&self.invite_secret, &self.group_id, node_id)
     }
 
     pub(crate) fn parse_invite(code: &str) -> anyhow::Result<(String, String)> {
@@ -81,8 +86,39 @@ impl LanProfile {
             invite_secret,
             node_id,
             nickname,
+            control_key: new_control_key(),
         })
     }
+
+    fn control_keypair(&self) -> identity::Keypair {
+        identity::Keypair::from_protobuf_encoding(&self.control_key)
+            .unwrap_or_else(|_| identity::Keypair::generate_ed25519())
+    }
+
+    pub(crate) fn ensure_control_key(&mut self) -> bool {
+        if self.control_key.is_empty() {
+            self.control_key = new_control_key();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn new_control_key() -> Vec<u8> {
+    identity::Keypair::generate_ed25519()
+        .to_protobuf_encoding()
+        .expect("ed25519 keypair encoding must succeed")
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LanAnnouncement {
+    version: u8,
+    group_id: String,
+    node_id: String,
+    nickname: String,
+    group_name: String,
+    proof: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -92,6 +128,7 @@ pub(crate) struct LanPeer {
     pub group_name: String,
     pub address: String,
     pub port: u16,
+    pub control_address: String,
     pub online: bool,
     pub last_seen: u64,
 }
@@ -110,14 +147,47 @@ pub(crate) struct LanSnapshot {
 #[derive(Clone)]
 struct PeerRecord {
     peer: LanPeer,
-    service_name: String,
+    control_peer_id: PeerId,
+}
+
+#[derive(NetworkBehaviour)]
+#[behaviour(to_swarm = "ControlEvent")]
+struct ControlBehaviour {
+    mdns: mdns::tokio::Behaviour,
+    identify: identify::Behaviour,
+    ping: ping::Behaviour,
+}
+
+#[derive(Debug)]
+enum ControlEvent {
+    Mdns(MdnsEvent),
+    Identify(identify::Event),
+    Ping(ping::Event),
+}
+
+impl From<MdnsEvent> for ControlEvent {
+    fn from(event: MdnsEvent) -> Self {
+        Self::Mdns(event)
+    }
+}
+
+impl From<identify::Event> for ControlEvent {
+    fn from(event: identify::Event) -> Self {
+        Self::Identify(event)
+    }
+}
+
+impl From<ping::Event> for ControlEvent {
+    fn from(event: ping::Event) -> Self {
+        Self::Ping(event)
+    }
 }
 
 pub(crate) struct LanRuntime {
     profile: RwLock<Option<LanProfile>>,
     peers: Arc<RwLock<HashMap<String, PeerRecord>>>,
-    daemon: Mutex<Option<ServiceDaemon>>,
     listener: Mutex<Option<JoinHandle<()>>>,
+    dialer: Mutex<Option<UnboundedSender<Multiaddr>>>,
 }
 
 impl LanRuntime {
@@ -125,8 +195,8 @@ impl LanRuntime {
         Self {
             profile: RwLock::new(None),
             peers: Arc::new(RwLock::new(HashMap::new())),
-            daemon: Mutex::new(None),
             listener: Mutex::new(None),
+            dialer: Mutex::new(None),
         }
     }
 
@@ -165,91 +235,160 @@ impl LanRuntime {
 
     pub(crate) fn start(&self, profile: LanProfile) -> anyhow::Result<()> {
         self.stop_discovery();
-        let daemon =
-            ServiceDaemon::new().map_err(|error| anyhow::anyhow!("无法启动局域网发现：{error}"))?;
-        let instance = format!("starbridge-{}", profile.node_id.replace('-', ""));
-        let host = format!("starbridge-{}.local.", profile.node_id.replace('-', ""));
-        let mut properties = HashMap::new();
-        properties.insert("v".to_string(), LAN_PROTOCOL_VERSION.to_string());
-        properties.insert("group".to_string(), profile.group_id.clone());
-        properties.insert("node".to_string(), profile.node_id.clone());
-        properties.insert("name".to_string(), profile.nickname.clone());
-        properties.insert("group_name".to_string(), profile.group_name.clone());
-        properties.insert("proof".to_string(), profile.proof_for(&profile.node_id));
-        let info = ServiceInfo::new(SERVICE_TYPE, &instance, &host, "", 0, Some(properties))
-            .map_err(|error| anyhow::anyhow!("无法发布局域网设备：{error}"))?;
-        daemon
-            .register(info)
-            .map_err(|error| anyhow::anyhow!("无法发布局域网设备：{error}"))?;
-        let receiver = daemon
-            .browse(SERVICE_TYPE)
-            .map_err(|error| anyhow::anyhow!("无法监听局域网设备：{error}"))?;
-        let peers = Arc::clone(&self.peers);
-        let own_node_id = profile.node_id.clone();
         let own_group_id = profile.group_id.clone();
+        let own_node_id = profile.node_id.clone();
         let invite_secret = profile.invite_secret.clone();
-        let listener = std::thread::spawn(move || {
-            while let Ok(event) = receiver.recv() {
+        let own_profile = profile.clone();
+        let keypair = profile.control_keypair();
+        let peer_id = PeerId::from(keypair.public());
+        let announcement = serde_json::to_string(&LanAnnouncement {
+            version: 1,
+            group_id: profile.group_id.clone(),
+            node_id: profile.node_id.clone(),
+            nickname: profile.nickname.clone(),
+            group_name: profile.group_name.clone(),
+            proof: profile.proof_for(&profile.node_id),
+        })?;
+        let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
+            .map_err(|error| anyhow::anyhow!("无法启动局域网 mDNS：{error}"))?;
+        let identify_config =
+            identify::Config::new(LAN_PROTOCOL_VERSION.to_string(), keypair.public())
+                .with_agent_version(format!("starbridge-lan {announcement}"));
+        let mut swarm = SwarmBuilder::with_existing_identity(keypair)
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                noise::Config::new,
+                yamux::Config::default,
+            )?
+            .with_behaviour(|_| ControlBehaviour {
+                mdns,
+                identify: identify::Behaviour::new(identify_config),
+                ping: ping::Behaviour::new(
+                    ping::Config::new()
+                        .with_interval(Duration::from_secs(5))
+                        .with_timeout(Duration::from_secs(10)),
+                ),
+            })?
+            .with_swarm_config(|config| {
+                config.with_idle_connection_timeout(Duration::from_secs(PRESENCE_TIMEOUT_SECS))
+            })
+            .build();
+        swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+
+        let peers = Arc::clone(&self.peers);
+        let (dial_tx, mut dial_rx) = mpsc::unbounded_channel();
+        let listener = tokio::spawn(async move {
+            let mut discovered = HashMap::<PeerId, Multiaddr>::new();
+            loop {
+                let event = tokio::select! {
+                    Some(address) = dial_rx.recv() => {
+                        let _ = swarm.dial(address);
+                        continue;
+                    }
+                    event = swarm.next() => event,
+                };
+                let Some(event) = event else {
+                    break;
+                };
                 match event {
-                    ServiceEvent::ServiceResolved(info) => {
-                        let Some(group_id) = info.get_property_val_str("group") else {
+                    SwarmEvent::Behaviour(ControlEvent::Mdns(MdnsEvent::Discovered(items))) => {
+                        tracing::debug!(count = items.len(), "LAN mDNS discovered peers");
+                        for (peer, address) in items {
+                            discovered.insert(peer, address.clone());
+                            let _ = swarm.dial(address);
+                        }
+                    }
+                    SwarmEvent::Behaviour(ControlEvent::Mdns(MdnsEvent::Expired(items))) => {
+                        let mut records = peers.write().unwrap_or_else(|error| error.into_inner());
+                        for (peer, address) in items {
+                            if discovered.get(&peer) == Some(&address) {
+                                discovered.remove(&peer);
+                            }
+                            records.retain(|_, record| record.control_peer_id != peer);
+                        }
+                    }
+                    SwarmEvent::Behaviour(ControlEvent::Identify(identify::Event::Received {
+                        peer_id,
+                        info,
+                        ..
+                    })) => {
+                        tracing::debug!(%peer_id, agent = %info.agent_version, "LAN identify received");
+                        let Some(announcement) = parse_announcement(&info.agent_version) else {
+                            let _ = swarm.disconnect_peer_id(peer_id);
                             continue;
                         };
-                        let Some(node_id) = info.get_property_val_str("node") else {
-                            continue;
-                        };
-                        let Some(proof) = info.get_property_val_str("proof") else {
-                            continue;
-                        };
-                        if group_id != own_group_id || node_id == own_node_id || proof.is_empty() {
+                        let expected = proof_for(
+                            &invite_secret,
+                            &announcement.group_id,
+                            &announcement.node_id,
+                        );
+                        if announcement.version != 1
+                            || announcement.group_id != own_group_id
+                            || announcement.node_id == own_node_id
+                            || announcement.proof != expected
+                        {
+                            let _ = swarm.disconnect_peer_id(peer_id);
                             continue;
                         }
-                        let expected = proof_for(&invite_secret, group_id, node_id);
-                        if proof != expected {
-                            continue;
-                        }
-                        let address = info
-                            .get_addresses_v4()
-                            .into_iter()
-                            .next()
-                            .map(|ip| ip.to_string())
-                            .or_else(|| {
-                                info.get_addresses().iter().next().map(|ip| ip.to_string())
-                            });
-                        let Some(address) = address else {
+                        let Some(control_address) = discovered
+                            .get(&peer_id)
+                            .cloned()
+                            .or_else(|| info.listen_addrs.first().cloned())
+                        else {
                             continue;
                         };
-                        let peer = LanPeer {
-                            node_id: node_id.to_string(),
-                            nickname: info
-                                .get_property_val_str("name")
-                                .unwrap_or(node_id)
-                                .to_string(),
-                            group_name: info
-                                .get_property_val_str("group_name")
-                                .unwrap_or_default()
-                                .to_string(),
-                            address,
-                            port: info.get_port(),
-                            online: true,
-                            last_seen: unix_now(),
+                        let Some((address, port)) = socket_address(&control_address) else {
+                            continue;
                         };
                         peers
                             .write()
                             .unwrap_or_else(|error| error.into_inner())
                             .insert(
-                                node_id.to_string(),
+                                announcement.node_id.clone(),
                                 PeerRecord {
-                                    peer,
-                                    service_name: info.get_fullname().to_string(),
+                                    peer: LanPeer {
+                                        node_id: announcement.node_id,
+                                        nickname: announcement.nickname,
+                                        group_name: announcement.group_name,
+                                        address,
+                                        port,
+                                        control_address: control_address.to_string(),
+                                        online: true,
+                                        last_seen: unix_now(),
+                                    },
+                                    control_peer_id: peer_id,
                                 },
                             );
                     }
-                    ServiceEvent::ServiceRemoved(_, fullname) => {
+                    SwarmEvent::Behaviour(ControlEvent::Ping(ping::Event {
+                        peer,
+                        result: Ok(_),
+                        ..
+                    })) => {
+                        let now = unix_now();
+                        for record in peers
+                            .write()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .values_mut()
+                        {
+                            if record.control_peer_id == peer {
+                                record.peer.last_seen = now;
+                                record.peer.online = true;
+                            }
+                        }
+                    }
+                    SwarmEvent::ConnectionClosed { peer_id, .. } => {
                         peers
                             .write()
                             .unwrap_or_else(|error| error.into_inner())
-                            .retain(|_, record| record.service_name != fullname);
+                            .retain(|_, record| record.control_peer_id != peer_id);
+                    }
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        tracing::debug!(%address, "LAN control listener ready");
+                    }
+                    SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                        tracing::debug!(?peer_id, %error, "LAN control dial failed");
                     }
                     _ => {}
                 }
@@ -258,15 +397,15 @@ impl LanRuntime {
         *self
             .profile
             .write()
-            .unwrap_or_else(|error| error.into_inner()) = Some(profile);
-        *self
-            .daemon
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(daemon);
+            .unwrap_or_else(|error| error.into_inner()) = Some(own_profile);
         *self
             .listener
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(listener);
+        *self
+            .dialer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(dial_tx);
         Ok(())
     }
 
@@ -279,21 +418,17 @@ impl LanRuntime {
     }
 
     pub(crate) fn stop_discovery(&self) {
-        if let Some(daemon) = self
-            .daemon
+        self.dialer
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .take()
-        {
-            let _ = daemon.shutdown();
-        }
+            .take();
         if let Some(listener) = self
             .listener
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take()
         {
-            let _ = listener.join();
+            listener.abort();
         }
         self.peers
             .write()
@@ -301,14 +436,51 @@ impl LanRuntime {
             .clear();
     }
 
+    pub(crate) fn dial_address(&self, address: &str) -> anyhow::Result<()> {
+        let address: Multiaddr = address
+            .parse()
+            .map_err(|error| anyhow::anyhow!("手动设备地址无效：{error}"))?;
+        let sender = self
+            .dialer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("局域网发现尚未启动"))?;
+        sender
+            .send(address)
+            .map_err(|_| anyhow::anyhow!("局域网控制通道已停止"))
+    }
+
     pub(crate) fn replace_profile(&self, profile: LanProfile) -> anyhow::Result<()> {
         self.start(profile)
     }
 
     pub(crate) fn resume(&self) -> anyhow::Result<()> {
-        let Some(profile) = self.profile() else { return Ok(()); };
+        let Some(profile) = self.profile() else {
+            return Ok(());
+        };
         self.start(profile)
     }
+}
+
+fn parse_announcement(value: &str) -> Option<LanAnnouncement> {
+    value
+        .strip_prefix("starbridge-lan ")
+        .and_then(|value| serde_json::from_str(value).ok())
+}
+
+fn socket_address(address: &Multiaddr) -> Option<(String, u16)> {
+    let mut host = None;
+    let mut port = None;
+    for protocol in address {
+        match protocol {
+            libp2p::multiaddr::Protocol::Ip4(value) => host = Some(value.to_string()),
+            libp2p::multiaddr::Protocol::Ip6(value) => host = Some(value.to_string()),
+            libp2p::multiaddr::Protocol::Tcp(value) => port = Some(value),
+            _ => {}
+        }
+    }
+    Some((host?, port?))
 }
 
 fn proof_for(invite_secret: &str, group_id: &str, node_id: &str) -> String {
@@ -340,10 +512,28 @@ mod tests {
         assert_eq!(joined.group_id, profile.group_id);
         assert_eq!(joined.invite_secret, profile.invite_secret);
         assert_ne!(profile.proof_for("node-a"), profile.invite_secret);
+        assert!(!profile.control_key.is_empty());
     }
 
     #[test]
     fn malformed_invite_is_rejected() {
         assert!(LanProfile::from_invite("SB1-NOT-A-CODE", "node".into(), "name".into()).is_err());
+    }
+
+    #[test]
+    fn announcement_requires_group_proof() {
+        let profile = LanProfile::new("group".into(), "node-a".into(), "a".into());
+        let value = serde_json::to_string(&LanAnnouncement {
+            version: 1,
+            group_id: profile.group_id.clone(),
+            node_id: profile.node_id.clone(),
+            nickname: profile.nickname.clone(),
+            group_name: profile.group_name.clone(),
+            proof: profile.proof_for(&profile.node_id),
+        })
+        .unwrap();
+        let parsed = parse_announcement(&format!("starbridge-lan {value}")).unwrap();
+        assert_eq!(parsed.group_id, profile.group_id);
+        assert_eq!(parsed.proof, profile.proof_for(&profile.node_id));
     }
 }

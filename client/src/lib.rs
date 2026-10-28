@@ -232,6 +232,11 @@ pub struct LanJoinForm {
     pub nickname: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct LanAddPeerForm {
+    pub address: String,
+}
+
 fn default_true() -> bool { true }
 
 #[derive(Debug, Deserialize)]
@@ -272,7 +277,10 @@ impl ClientApp {
         let runtime = runtime_status(&root).await;
         let lan = Arc::new(LanRuntime::new());
         if let Some(bytes) = secure_store::read_secret_with_interaction(&root, "lan-profile", interaction).await? {
-            let profile: LanProfile = serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("局域网组凭据损坏，请重新加入局域网组"))?;
+            let mut profile: LanProfile = serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("局域网组凭据损坏，请重新加入局域网组"))?;
+            if profile.ensure_control_key() {
+                secure_store::write_secret_with_interaction(&root, "lan-profile", &serde_json::to_vec(&profile)?, secure_store::Interaction::Silent).await?;
+            }
             lan.start(profile)?;
         }
         let instance_id = new_token();
@@ -358,6 +366,14 @@ impl ClientApp {
 
     pub(crate) async fn resume_lan_discovery(&self) -> anyhow::Result<LanSnapshot> {
         self.lan.resume()?;
+        Ok(self.lan.snapshot())
+    }
+
+    pub(crate) async fn add_lan_peer(&self, form: LanAddPeerForm) -> anyhow::Result<LanSnapshot> {
+        if self.lan.profile().is_none() {
+            anyhow::bail!("请先加入局域网组");
+        }
+        self.lan.dial_address(form.address.trim())?;
         Ok(self.lan.snapshot())
     }
 
@@ -501,6 +517,7 @@ impl ClientApp {
             .route("/api/v1/lan/leave", post(lan_leave))
             .route("/api/v1/lan/pause", post(lan_pause))
             .route("/api/v1/lan/resume", post(lan_resume))
+            .route("/api/v1/lan/peers", post(lan_add_peer))
             .route("/api/v1/config", get(get_config).put(update_config))
             .route("/api/v1/login", post(login))
             .route("/api/v1/register", post(register))
@@ -893,6 +910,10 @@ async fn lan_pause(State(app): State<ClientApp>) -> Json<LanSnapshot> { Json(app
 
 async fn lan_resume(State(app): State<ClientApp>) -> Result<Json<LanSnapshot>, ApiError> {
     app.resume_lan_discovery().await.map(Json).map_err(ApiError::internal)
+}
+
+async fn lan_add_peer(State(app): State<ClientApp>, Json(form): Json<LanAddPeerForm>) -> Result<Json<LanSnapshot>, ApiError> {
+    app.add_lan_peer(form).await.map(Json).map_err(ApiError::internal)
 }
 
 async fn get_config(State(app): State<ClientApp>) -> Json<ClientConfig> {

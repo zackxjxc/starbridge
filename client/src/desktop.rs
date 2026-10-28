@@ -249,6 +249,11 @@ async fn client_lan_resume(app: tauri::State<'_, ClientApp>) -> Result<crate::la
 }
 
 #[tauri::command]
+async fn client_lan_add_peer(app: tauri::State<'_, ClientApp>, form: LanAddPeerForm) -> Result<crate::lan::LanSnapshot, String> {
+    app.inner().add_lan_peer(form).await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn client_save_config(
     app: tauri::State<'_, ClientApp>,
     config: ClientConfig,
@@ -456,6 +461,7 @@ pub fn run(loaded: anyhow::Result<ClientApp>, role: Role, root: PathBuf) -> anyh
             client_lan_leave,
             client_lan_pause,
             client_lan_resume,
+            client_lan_add_peer,
             client_save_config,
             client_login,
             client_register,

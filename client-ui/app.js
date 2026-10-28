@@ -30,7 +30,7 @@
     snapshot: null, config: null, version: '', view: 'device', selected: null, query: '',
     authMode: 'login', auth: { username: '', password: '', confirm_password: '', remember: true },
     workMode: readWorkMode(), modeEntry: false, modeMenu: false, lanSnapshot: null,
-    lanGroupName: '', lanInvite: '', lanNickname: '', lanNotice: '',
+    lanGroupName: '', lanInvite: '', lanNickname: '', lanManualAddress: '', lanNotice: '',
     authError: '', loadError: '', startupError: null, recoveryError: '', syncError: '', busy: new Set(), drafts: new Map(), reauthenticate: false,
     policy: 'direct_preferred', rebuild: false, allConfig: true, failureGroup: null,
     components: null, exportData: null, exportIds: [], exportFingerprint: '', exportBack: 'device',
@@ -42,7 +42,7 @@
   const routes = {
     client_version: ['GET', '/api/health'],
     client_state: ['GET', '/api/v1/state'], client_lan_state: ['GET', '/api/v1/lan/state'], client_config: ['GET', '/api/v1/config'],
-    client_lan_create: ['POST', '/api/v1/lan/create'], client_lan_join: ['POST', '/api/v1/lan/join'], client_lan_leave: ['POST', '/api/v1/lan/leave'], client_lan_pause: ['POST', '/api/v1/lan/pause'], client_lan_resume: ['POST', '/api/v1/lan/resume'],
+    client_lan_create: ['POST', '/api/v1/lan/create'], client_lan_join: ['POST', '/api/v1/lan/join'], client_lan_leave: ['POST', '/api/v1/lan/leave'], client_lan_pause: ['POST', '/api/v1/lan/pause'], client_lan_resume: ['POST', '/api/v1/lan/resume'], client_lan_add_peer: ['POST', '/api/v1/lan/peers'],
     client_save_config: ['PUT', '/api/v1/config'], client_login: ['POST', '/api/v1/login'],
     client_register: ['POST', '/api/v1/register'], client_logout: ['POST', '/api/v1/logout'],
     client_update_device: ['PUT', '/api/v1/devices'], client_connect: ['POST', '/api/v1/connect'],
@@ -626,12 +626,12 @@
         h('div', { class: 'list-head' }, h('div', { class: 'list-title' }, h('h2', {}, t("局域网设备")), h('span', { class: 'muted' }, t("在线 {0}", peers.length))),
           h('label', { class: 'search' }, icon('search'), h('input', { type: 'search', placeholder: t("搜索设备"), 'aria-label': t("搜索设备"), disabled: true }))),
         h('div', { class: 'local-block' }, h('div', { class: 'device-row active' }, h('span', { class: 'glyph' }, icon('monitor')), h('span', { class: 'identity' }, h('span', { class: 'device-name' }, `${lan.nickname || t("本机")}${t("（本机）")}`), h('span', { class: 'device-sub' }, t("在线 · 等待连接"))), h('span', { class: 'row-status good' }, t("在线")))),
-        h('div', { class: 'device-list' }, peers.length ? peers.map(peer => h('div', { class: 'device-row', 'data-key': peer.node_id }, h('span', { class: 'glyph' }, icon('monitor')), h('span', { class: 'identity' }, h('span', { class: 'device-name' }, peer.nickname), h('span', { class: 'device-sub' }, t("在线 · 可连接"))), h('span', { class: 'row-status good' }, t("在线")))) : h('div', { class: 'empty' }, t("未检测到其他用户"))),
+        h('div', { class: 'device-list' }, peers.length ? peers.map(peer => h('div', { class: 'device-row', 'data-key': peer.node_id, title: peer.control_address || '' }, h('span', { class: 'glyph' }, icon('monitor')), h('span', { class: 'identity' }, h('span', { class: 'device-name' }, peer.nickname), h('span', { class: 'device-sub' }, t("在线 · 可连接"))), h('span', { class: 'row-status good' }, t("在线")))) : h('div', { class: 'empty' }, t("未检测到其他用户"))),
         button(t("手动添加设备"), 'lan-manual-add', { class: 'local-test' })),
       h('main', { class: 'detail lan-detail', 'aria-label': t("局域网组信息") },
         heading(groupName, t("已加入局域网组")),
         banner(t("局域网模式"), peers.length ? t("设备上线后会自动出现在列表中。") : t("当前只有本机在线，正在发现其他设备。"), peers.length ? 'good' : 'warn'),
-        h('div', { class: 'section' }, h('div', { class: 'section-title' }, h('span', {}, t("永久邀请码")), button(t("复制邀请码"), 'lan-copy-invite', { class: 'link', disabled: !lan.invite_code }, 'copy')),
+      h('div', { class: 'section' }, h('div', { class: 'section-title' }, h('span', {}, t("永久邀请码")), button(t("复制邀请码"), 'lan-copy-invite', { class: 'link', disabled: !lan.invite_code }, 'copy')),
           h('pre', { class: 'command', 'data-copyable': '' }, lan.invite_code || t("邀请码不可用")),
           h('p', { class: 'muted' }, t("组内设备输入正确的邀请码后即可加入，无需批准。"))),
         h('div', { class: 'actions bottom' }, button(t("刷新设备"), 'lan-refresh'), button(t("退出局域网"), 'lan-leave', { class: 'button danger' })) )),
@@ -923,7 +923,12 @@
         modal.close(); await mutate('terminate', 'client_terminate', { form: { target_node_id: null } }); ui.workMode = target.dataset.mode; saveWorkMode(ui.workMode); ui.modeMenu = false; ui.modeEntry = ui.workMode === 'internet'; render(); break;
       case 'lan-copy-invite': if (ui.lanSnapshot?.invite_code) await writeClipboard(ui.lanSnapshot.invite_code); break;
       case 'lan-refresh': await refresh(); break;
-      case 'lan-manual-add': toast(t("手动添加设备将在局域网控制通道接入后开放。")); break;
+      case 'lan-manual-add':
+        showModal('lan-manual-add', () => [h('h2', { id: 'modal-title' }, t("手动添加设备")),
+          h('p', { class: 'modal-copy' }, t("输入设备公布的 libp2p 地址，例如 /ip4/192.168.1.20/tcp/34567/p2p/12D3KooW...。")),
+          h('form', { 'data-form': 'lan-manual-add' }, field(t("设备地址"), 'lan-manual-address', ui.lanManualAddress, { name: 'address', maxlength: 240, required: true, placeholder: '/ip4/…/tcp/…/p2p/…' }),
+            h('div', { class: 'actions' }, button(t("取消"), 'close-modal'), button(t("添加设备"), '', { type: 'submit', class: 'button primary' })))]);
+        document.getElementById('lan-manual-address')?.focus(); break;
       case 'lan-leave': {
         const result = await api('client_lan_leave'); ui.lanSnapshot = result; ui.workMode = 'internet'; saveWorkMode('internet'); ui.modeEntry = true; render(); break;
       }
@@ -1092,6 +1097,7 @@
       if (input.name === 'nickname') ui.lanNickname = input.value;
       ui.lanNotice = '';
     }
+    else if (input.closest('[data-form="lan-manual-add"]') && input.name === 'address') ui.lanManualAddress = input.value;
     else if (input.dataset.draft) {
       const item = device(input.dataset.draft); if (!item) return;
       const draft = { ...draftFor(item), [input.name]: input.value }; ui.drafts.set(item.node_id, draft); render();
@@ -1119,6 +1125,14 @@
           if (s()?.enrollment_candidates?.length) rebindDialog();
         } catch (error) { ui.recoveryError = message(error); ui.startupError = await api('client_startup_status'); }
         finally { submitted.password = ''; ui.busy.delete('startup-recover'); render(); }
+      } else if (form.dataset.form === 'lan-manual-add') {
+        const values = new FormData(form);
+        ui.lanManualAddress = String(values.get('address') || '').trim();
+        if (!ui.lanManualAddress) return;
+        ui.busy.add('lan-manual-add'); render();
+        try { ui.lanSnapshot = await api('client_lan_add_peer', { form: { address: ui.lanManualAddress } }); modal.close(); ui.lanNotice = ''; toast(t("已开始连接设备")); }
+        catch (error) { ui.lanNotice = message(error); }
+        finally { ui.busy.delete('lan-manual-add'); render(); }
       } else if (form.dataset.form === 'lan-create' || form.dataset.form === 'lan-join') {
         const values = new FormData(form);
         ui.lanGroupName = String(values.get('group_name') || ui.lanGroupName).trim();

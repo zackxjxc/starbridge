@@ -19,9 +19,10 @@ tauri-winres.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
+futures = "0.3"
 fs2 = "0.4"
+libp2p = { version = "0.56", default-features = false, features = ["macros", "identify", "mdns", "noise", "ping", "tcp", "tokio", "yamux"] }
 machine-uid = "=0.6.0"
-mdns-sd = "0.21.6"
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
