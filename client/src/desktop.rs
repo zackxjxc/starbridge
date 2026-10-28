@@ -219,6 +219,36 @@ async fn client_config(app: tauri::State<'_, ClientApp>) -> Result<ClientConfig,
 }
 
 #[tauri::command]
+async fn client_lan_state(app: tauri::State<'_, ClientApp>) -> Result<crate::lan::LanSnapshot, String> {
+    Ok(app.inner().lan_snapshot().await)
+}
+
+#[tauri::command]
+async fn client_lan_create(app: tauri::State<'_, ClientApp>, form: LanCreateForm) -> Result<crate::lan::LanSnapshot, String> {
+    app.inner().create_lan_group(form).await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn client_lan_join(app: tauri::State<'_, ClientApp>, form: LanJoinForm) -> Result<crate::lan::LanSnapshot, String> {
+    app.inner().join_lan_group(form).await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn client_lan_leave(app: tauri::State<'_, ClientApp>) -> Result<crate::lan::LanSnapshot, String> {
+    app.inner().leave_lan_group().await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn client_lan_pause(app: tauri::State<'_, ClientApp>) -> Result<crate::lan::LanSnapshot, String> {
+    Ok(app.inner().pause_lan_discovery().await)
+}
+
+#[tauri::command]
+async fn client_lan_resume(app: tauri::State<'_, ClientApp>) -> Result<crate::lan::LanSnapshot, String> {
+    app.inner().resume_lan_discovery().await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn client_save_config(
     app: tauri::State<'_, ClientApp>,
     config: ClientConfig,
@@ -420,6 +450,12 @@ pub fn run(loaded: anyhow::Result<ClientApp>, role: Role, root: PathBuf) -> anyh
             client_window_action,
             client_state,
             client_config,
+            client_lan_state,
+            client_lan_create,
+            client_lan_join,
+            client_lan_leave,
+            client_lan_pause,
+            client_lan_resume,
             client_save_config,
             client_login,
             client_register,

@@ -264,6 +264,10 @@ progress::-webkit-progress-value { background: var(--main); }
 .lan-entry-card .button { margin-top: 2px; }
 .lan-entry .banner { margin-top: 13px; }
 .lan-entry-hint { margin-top: 13px; text-align: center; }
+.lan-workspace .list-pane { min-width: 0; }
+.lan-detail { padding: 20px 24px 18px; }
+.lan-detail .command { letter-spacing: .04em; }
+.lan-detail .bottom { justify-content: flex-start; }
 .auth-form h1 { font-size: 22px; margin-bottom: 6px; }
 .auth-form .intro { margin-bottom: 24px; color: var(--dim); font-size: 12px; }
 .auth-form .field { margin-bottom: 13px; }

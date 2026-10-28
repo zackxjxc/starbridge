@@ -27,6 +27,7 @@ use tokio::sync::{Mutex, RwLock};
 mod account;
 mod identity;
 mod secure_store;
+mod lan;
 mod profile;
 #[cfg(feature = "desktop")]
 mod startup;
@@ -41,6 +42,7 @@ use account::*;
 use connections::*;
 use diagnostics::*;
 use history::*;
+use lan::{LanProfile, LanRuntime, LanSnapshot};
 
 #[cfg(feature = "desktop")]
 pub mod desktop;
@@ -162,6 +164,7 @@ pub struct SessionView {
 #[derive(Clone)]
 pub struct ClientApp {
     inner: Arc<RwLock<Inner>>,
+    lan: Arc<LanRuntime>,
     http: reqwest::Client,
     frpc_processes: Arc<Mutex<HashMap<String, tokio::process::Child>>>,
     session_operations: Arc<Mutex<()>>,
@@ -217,6 +220,18 @@ pub struct LoginForm {
     pub remember: bool,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct LanCreateForm {
+    pub group_name: String,
+    pub nickname: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LanJoinForm {
+    pub invite: String,
+    pub nickname: String,
+}
+
 fn default_true() -> bool { true }
 
 #[derive(Debug, Deserialize)]
@@ -255,6 +270,11 @@ impl ClientApp {
         let pending_closes = load_json(&root.join("pending-closes.json"), HashSet::new()).await?;
         let restoring = auth.is_some();
         let runtime = runtime_status(&root).await;
+        let lan = Arc::new(LanRuntime::new());
+        if let Some(bytes) = secure_store::read_secret_with_interaction(&root, "lan-profile", interaction).await? {
+            let profile: LanProfile = serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("局域网组凭据损坏，请重新加入局域网组"))?;
+            lan.start(profile)?;
+        }
         let instance_id = new_token();
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("x-starbridge-instance-id", instance_id.parse()?);
@@ -280,6 +300,7 @@ impl ClientApp {
                 device_rebind_required: false,
                 instance_id, pending_enrollment: None, enrollment_candidates: Vec::new(),
             })),
+            lan,
             http: reqwest::Client::builder().no_proxy().default_headers(headers).timeout(std::time::Duration::from_secs(15)).build()?,
             frpc_processes: Arc::new(Mutex::new(HashMap::new())),
             session_operations: Arc::new(Mutex::new(())),
@@ -296,6 +317,48 @@ impl ClientApp {
             process_job: Arc::new(process::ProcessJob::new()?),
         };
         Ok(app)
+    }
+
+    pub(crate) async fn lan_snapshot(&self) -> LanSnapshot { self.lan.snapshot() }
+
+    pub(crate) async fn create_lan_group(&self, form: LanCreateForm) -> anyhow::Result<LanSnapshot> {
+        let group_name = form.group_name.trim().to_string();
+        let nickname = form.nickname.trim().to_string();
+        if group_name.is_empty() || nickname.is_empty() { anyhow::bail!("组名称和本机昵称不能为空"); }
+        if self.lan.profile().is_some() { anyhow::bail!("本机已经加入局域网组，请先退出当前组"); }
+        let (root, node_id) = { let inner = self.inner.read().await; (inner.root.clone(), inner.identity.node_id.clone()) };
+        let profile = LanProfile::new(group_name, node_id, nickname);
+        secure_store::write_secret_with_interaction(&root, "lan-profile", &serde_json::to_vec(&profile)?, secure_store::Interaction::Silent).await?;
+        self.lan.replace_profile(profile)?;
+        Ok(self.lan.snapshot())
+    }
+
+    pub(crate) async fn join_lan_group(&self, form: LanJoinForm) -> anyhow::Result<LanSnapshot> {
+        let nickname = form.nickname.trim().to_string();
+        if nickname.is_empty() { anyhow::bail!("本机昵称不能为空"); }
+        if self.lan.profile().is_some() { anyhow::bail!("本机已经加入局域网组，请先退出当前组"); }
+        let (root, node_id) = { let inner = self.inner.read().await; (inner.root.clone(), inner.identity.node_id.clone()) };
+        let profile = LanProfile::from_invite(&form.invite, node_id, nickname)?;
+        secure_store::write_secret_with_interaction(&root, "lan-profile", &serde_json::to_vec(&profile)?, secure_store::Interaction::Silent).await?;
+        self.lan.replace_profile(profile)?;
+        Ok(self.lan.snapshot())
+    }
+
+    pub(crate) async fn leave_lan_group(&self) -> anyhow::Result<LanSnapshot> {
+        let root = self.inner.read().await.root.clone();
+        self.lan.stop();
+        secure_store::remove_secret(&root, "lan-profile").await?;
+        Ok(self.lan.snapshot())
+    }
+
+    pub(crate) async fn pause_lan_discovery(&self) -> LanSnapshot {
+        self.lan.stop_discovery();
+        self.lan.snapshot()
+    }
+
+    pub(crate) async fn resume_lan_discovery(&self) -> anyhow::Result<LanSnapshot> {
+        self.lan.resume()?;
+        Ok(self.lan.snapshot())
     }
 
     async fn ensure_ssh_ready(&self) -> anyhow::Result<()> {
@@ -432,6 +495,12 @@ impl ClientApp {
             .route("/style.css", get(|| async { ([("content-type", "text/css; charset=utf-8")], CLIENT_CSS) }))
             .route("/api/health", get(health))
             .route("/api/v1/state", get(state))
+            .route("/api/v1/lan/state", get(lan_state))
+            .route("/api/v1/lan/create", post(lan_create))
+            .route("/api/v1/lan/join", post(lan_join))
+            .route("/api/v1/lan/leave", post(lan_leave))
+            .route("/api/v1/lan/pause", post(lan_pause))
+            .route("/api/v1/lan/resume", post(lan_resume))
             .route("/api/v1/config", get(get_config).put(update_config))
             .route("/api/v1/login", post(login))
             .route("/api/v1/register", post(register))
@@ -537,6 +606,7 @@ impl ClientApp {
             self.close_sessions(None).await;
             self.mark_offline().await;
         }).await;
+        self.lan.stop();
     }
 
     async fn start_frpc_mode(
@@ -803,6 +873,26 @@ async fn health() -> Json<HealthResponse> {
 async fn state(State(app): State<ClientApp>) -> Json<ClientSnapshot> {
     let inner = app.inner.read().await;
     Json(snapshot(&inner))
+}
+
+async fn lan_state(State(app): State<ClientApp>) -> Json<LanSnapshot> { Json(app.lan_snapshot().await) }
+
+async fn lan_create(State(app): State<ClientApp>, Json(form): Json<LanCreateForm>) -> Result<Json<LanSnapshot>, ApiError> {
+    app.create_lan_group(form).await.map(Json).map_err(ApiError::internal)
+}
+
+async fn lan_join(State(app): State<ClientApp>, Json(form): Json<LanJoinForm>) -> Result<Json<LanSnapshot>, ApiError> {
+    app.join_lan_group(form).await.map(Json).map_err(ApiError::internal)
+}
+
+async fn lan_leave(State(app): State<ClientApp>) -> Result<Json<LanSnapshot>, ApiError> {
+    app.leave_lan_group().await.map(Json).map_err(ApiError::internal)
+}
+
+async fn lan_pause(State(app): State<ClientApp>) -> Json<LanSnapshot> { Json(app.pause_lan_discovery().await) }
+
+async fn lan_resume(State(app): State<ClientApp>) -> Result<Json<LanSnapshot>, ApiError> {
+    app.resume_lan_discovery().await.map(Json).map_err(ApiError::internal)
 }
 
 async fn get_config(State(app): State<ClientApp>) -> Json<ClientConfig> {

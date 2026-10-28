@@ -29,7 +29,7 @@
   const ui = {
     snapshot: null, config: null, version: '', view: 'device', selected: null, query: '',
     authMode: 'login', auth: { username: '', password: '', confirm_password: '', remember: true },
-    workMode: readWorkMode(), modeEntry: false, modeMenu: false,
+    workMode: readWorkMode(), modeEntry: false, modeMenu: false, lanSnapshot: null,
     lanGroupName: '', lanInvite: '', lanNickname: '', lanNotice: '',
     authError: '', loadError: '', startupError: null, recoveryError: '', syncError: '', busy: new Set(), drafts: new Map(), reauthenticate: false,
     policy: 'direct_preferred', rebuild: false, allConfig: true, failureGroup: null,
@@ -41,7 +41,8 @@
   };
   const routes = {
     client_version: ['GET', '/api/health'],
-    client_state: ['GET', '/api/v1/state'], client_config: ['GET', '/api/v1/config'],
+    client_state: ['GET', '/api/v1/state'], client_lan_state: ['GET', '/api/v1/lan/state'], client_config: ['GET', '/api/v1/config'],
+    client_lan_create: ['POST', '/api/v1/lan/create'], client_lan_join: ['POST', '/api/v1/lan/join'], client_lan_leave: ['POST', '/api/v1/lan/leave'], client_lan_pause: ['POST', '/api/v1/lan/pause'], client_lan_resume: ['POST', '/api/v1/lan/resume'],
     client_save_config: ['PUT', '/api/v1/config'], client_login: ['POST', '/api/v1/login'],
     client_register: ['POST', '/api/v1/register'], client_logout: ['POST', '/api/v1/logout'],
     client_update_device: ['PUT', '/api/v1/devices'], client_connect: ['POST', '/api/v1/connect'],
@@ -618,6 +619,24 @@
     return h('div', { class: 'work-mode-menu', role: 'menu', 'aria-label': t("切换工作模式"), 'data-key': 'work-mode-menu' },
       ['internet', 'lan'].map(mode => { const info = workModeInfo(mode); const current = ui.workMode === mode; return button([h('span', { class: 'work-mode-menu-icon', 'aria-hidden': 'true' }, info.icon), h('span', { class: 'work-mode-menu-copy' }, h('strong', {}, info.label), h('span', {}, info.description)), current ? h('span', { class: 'work-mode-check', 'aria-hidden': 'true' }, icon('check')) : null], 'select-work-mode', { class: `work-mode-menu-item${current ? ' current' : ''}`, 'data-mode': mode, 'data-context': 'header', role: 'menuitemradio', 'aria-checked': current }); }));
   }
+  function lanMainPage() {
+    const lan = ui.lanSnapshot || {}; const peers = lan.peers || []; const groupName = lan.group_name || peers.find(peer => peer.group_name)?.group_name || t("局域网组");
+    return h('div', { class: 'shell', 'data-key': 'lan-shell' }, header(false), h('div', { class: 'workspace lan-workspace', 'data-key': 'lan-workspace' },
+      h('aside', { class: 'list-pane', 'aria-label': t("局域网设备") },
+        h('div', { class: 'list-head' }, h('div', { class: 'list-title' }, h('h2', {}, t("局域网设备")), h('span', { class: 'muted' }, t("在线 {0}", peers.length))),
+          h('label', { class: 'search' }, icon('search'), h('input', { type: 'search', placeholder: t("搜索设备"), 'aria-label': t("搜索设备"), disabled: true }))),
+        h('div', { class: 'local-block' }, h('div', { class: 'device-row active' }, h('span', { class: 'glyph' }, icon('monitor')), h('span', { class: 'identity' }, h('span', { class: 'device-name' }, `${lan.nickname || t("本机")}${t("（本机）")}`), h('span', { class: 'device-sub' }, t("在线 · 等待连接"))), h('span', { class: 'row-status good' }, t("在线")))),
+        h('div', { class: 'device-list' }, peers.length ? peers.map(peer => h('div', { class: 'device-row', 'data-key': peer.node_id }, h('span', { class: 'glyph' }, icon('monitor')), h('span', { class: 'identity' }, h('span', { class: 'device-name' }, peer.nickname), h('span', { class: 'device-sub' }, t("在线 · 可连接"))), h('span', { class: 'row-status good' }, t("在线")))) : h('div', { class: 'empty' }, t("未检测到其他用户"))),
+        button(t("手动添加设备"), 'lan-manual-add', { class: 'local-test' })),
+      h('main', { class: 'detail lan-detail', 'aria-label': t("局域网组信息") },
+        heading(groupName, t("已加入局域网组")),
+        banner(t("局域网模式"), peers.length ? t("设备上线后会自动出现在列表中。") : t("当前只有本机在线，正在发现其他设备。"), peers.length ? 'good' : 'warn'),
+        h('div', { class: 'section' }, h('div', { class: 'section-title' }, h('span', {}, t("永久邀请码")), button(t("复制邀请码"), 'lan-copy-invite', { class: 'link', disabled: !lan.invite_code }, 'copy')),
+          h('pre', { class: 'command', 'data-copyable': '' }, lan.invite_code || t("邀请码不可用")),
+          h('p', { class: 'muted' }, t("组内设备输入正确的邀请码后即可加入，无需批准。"))),
+        h('div', { class: 'actions bottom' }, button(t("刷新设备"), 'lan-refresh'), button(t("退出局域网"), 'lan-leave', { class: 'button danger' })) )),
+      h('footer', { class: 'footbar' }, h('span', {}, peers.length ? t("正在发现局域网设备") : t("未检测到其他用户")), h('span', {}, t("组：{0}", groupName))));
+  }
   function lanEntryPage() {
     return h('div', { class: 'lan-entry', 'data-key': 'lan-entry' },
       h('h1', {}, t("进入局域网模式")), h('p', { class: 'intro' }, t("无需云账号，在同一局域网内发现并连接设备。")), workModeCards(),
@@ -625,11 +644,11 @@
         h('form', { class: 'lan-entry-card', 'data-form': 'lan-create' }, h('h2', {}, t("创建新组")), h('p', {}, t("创建后会生成一个永久邀请码，组内设备可以自由连接。")),
           field(t("组名称"), 'lan-group-name', ui.lanGroupName, { name: 'group_name', maxlength: 80, required: true }),
           field(t("本机昵称"), 'lan-create-nickname', ui.lanNickname, { name: 'nickname', maxlength: 80, required: true }),
-          button(t("创建组"), '', { type: 'submit', class: 'button primary wide' })),
+          button(t("创建组"), '', { type: 'submit', class: 'button primary wide', disabled: ui.busy.has('lan') })),
         h('form', { class: 'lan-entry-card', 'data-form': 'lan-join' }, h('h2', {}, t("加入已有组")), h('p', {}, t("输入组内任意设备提供的永久邀请码即可加入。")),
           field(t("永久邀请码"), 'lan-invite', ui.lanInvite, { name: 'invite', maxlength: 120, required: true }),
           field(t("本机昵称"), 'lan-join-nickname', ui.lanNickname, { name: 'nickname', maxlength: 80, required: true }),
-          button(t("加入组"), '', { type: 'submit', class: 'button primary wide' }))),
+          button(t("加入组"), '', { type: 'submit', class: 'button primary wide', disabled: ui.busy.has('lan') }))),
       ui.lanNotice ? banner(t("局域网入口正在准备"), ui.lanNotice, 'warn') : null,
       h('p', { class: 'muted lan-entry-hint' }, t("找不到其他设备时，进入组后可以手动添加设备地址。")));
   }
@@ -649,7 +668,7 @@
   function header(loggedIn) {
     const currentMode = workModeInfo(ui.workMode);
     return h('header', { class: 'app-header', 'data-key': 'app-header' }, h('span', { class: 'brand-mark', 'aria-hidden': 'true' }, 'S'), h('span', {}, 'StarBridge'),
-      loggedIn ? h('div', { class: 'work-mode-switch' }, button([h('span', { class: 'work-mode-trigger-icon', 'aria-hidden': 'true' }, currentMode.icon), currentMode.label, icon('down')], 'work-mode-menu', { class: 'work-mode-trigger', 'aria-expanded': String(ui.modeMenu), 'aria-haspopup': 'menu' }), ui.modeMenu ? workModeMenu() : null) : null,
+      (loggedIn || ui.workMode === 'lan') ? h('div', { class: 'work-mode-switch' }, button([h('span', { class: 'work-mode-trigger-icon', 'aria-hidden': 'true' }, currentMode.icon), currentMode.label, icon('down')], 'work-mode-menu', { class: 'work-mode-trigger', 'aria-expanded': String(ui.modeMenu), 'aria-haspopup': 'menu' }), ui.modeMenu ? workModeMenu() : null) : null,
       ui.version ? h('span', { class: 'muted app-version', 'data-copyable': '' }, `v${ui.version}`) : null,
       h('div', { class: 'account' }, button([h('span', { class: i18n.locale() === 'zh-CN' ? 'language-current' : '' }, '中'),
         h('span', { class: 'language-divider' }, '/'), h('span', { class: i18n.locale() === 'en' ? 'language-current' : '' }, 'EN'), icon('down')], 'language-menu',
@@ -663,6 +682,7 @@
   }
   function authPage() {
     const registering = ui.authMode === 'register';
+    if (ui.workMode === 'lan' && ui.lanSnapshot?.active) return lanMainPage();
     return h('div', { class: 'shell', 'data-key': 'auth-shell' }, header(false), h('main', { class: 'auth' }, ui.workMode === 'lan' ? lanEntryPage() : h('div', { class: 'auth-form' },
       workModeCards(), h('form', { 'data-form': 'auth' }, h('h1', {}, registering ? t("创建账号") : t("登录账号")), h('p', { class: 'intro' }, t("登录后，在你的电脑之间建立连接。")),
         field(t("用户名"), 'auth-username', ui.auth.username, { name: 'username', autocomplete: 'username', required: true, maxlength: 80, readOnly: !!s()?.logged_in }),
@@ -742,7 +762,9 @@
     try {
       const snapshot = await api('client_state');
       if (epoch !== ui.epoch || request < ui.applied || ui.mutating) return;
-      ui.applied = request; applySnapshot(snapshot); render();
+      ui.applied = request; applySnapshot(snapshot);
+      if (ui.workMode === 'lan') ui.lanSnapshot = await api('client_lan_state');
+      render();
     } catch (error) { if (epoch === ui.epoch) { if (s()) ui.syncError = message(error); else ui.loadError = message(error); render(); } }
   }
   async function polling() {
@@ -893,10 +915,18 @@
             h('div', { class: 'actions' }, button(t("取消"), 'close-modal'), button(t("结束连接并切换"), 'confirm-work-mode', { class: 'button danger', 'data-mode': mode }))]);
           break;
         }
+        if (mode === 'internet' && ui.workMode === 'lan' && ui.lanSnapshot?.active) ui.lanSnapshot = await api('client_lan_pause');
+        if (mode === 'lan' && ui.workMode !== 'lan' && ui.lanSnapshot?.active) ui.lanSnapshot = await api('client_lan_resume');
         ui.workMode = mode; saveWorkMode(mode); ui.modeMenu = false; ui.lanNotice = ''; ui.authError = ''; ui.modeEntry = mode === 'internet'; render(); break;
       }
       case 'confirm-work-mode':
         modal.close(); await mutate('terminate', 'client_terminate', { form: { target_node_id: null } }); ui.workMode = target.dataset.mode; saveWorkMode(ui.workMode); ui.modeMenu = false; ui.modeEntry = ui.workMode === 'internet'; render(); break;
+      case 'lan-copy-invite': if (ui.lanSnapshot?.invite_code) await writeClipboard(ui.lanSnapshot.invite_code); break;
+      case 'lan-refresh': await refresh(); break;
+      case 'lan-manual-add': toast(t("手动添加设备将在局域网控制通道接入后开放。")); break;
+      case 'lan-leave': {
+        const result = await api('client_lan_leave'); ui.lanSnapshot = result; ui.workMode = 'internet'; saveWorkMode('internet'); ui.modeEntry = true; render(); break;
+      }
       case 'language-menu':
         ui.languageOpen = !ui.languageOpen; render();
         if (ui.languageOpen) languageMenu.querySelector('[aria-checked="true"]')?.focus();
@@ -1094,7 +1124,12 @@
         ui.lanGroupName = String(values.get('group_name') || ui.lanGroupName).trim();
         ui.lanInvite = String(values.get('invite') || ui.lanInvite).trim();
         ui.lanNickname = String(values.get('nickname') || ui.lanNickname).trim();
-        ui.lanNotice = t("局域网组发现和认证服务正在接入；当前先完成界面入口。"); render();
+        const command = form.dataset.form === 'lan-create' ? 'client_lan_create' : 'client_lan_join';
+        const formData = form.dataset.form === 'lan-create' ? { group_name: ui.lanGroupName, nickname: ui.lanNickname } : { invite: ui.lanInvite, nickname: ui.lanNickname };
+        ui.busy.add('lan'); ui.lanNotice = ''; render();
+        try { ui.lanSnapshot = await api(command, { form: formData }); }
+        catch (error) { ui.lanNotice = message(error); }
+        finally { ui.busy.delete('lan'); render(); }
       } else if (form.dataset.form === 'auth') {
         if (ui.busy.has('auth')) return;
         ui.auth.username = ui.auth.username.trim();
@@ -1172,9 +1207,10 @@
       ui.version = (await api('client_version')).version;
       ui.startupError = desktop ? await api('client_startup_status') : null;
       if (ui.startupError) { render(); return; }
-      const [snapshot, config] = await Promise.all([api('client_state'), api('client_config')]);
+      const [snapshot, config, lanSnapshot] = await Promise.all([api('client_state'), api('client_config'), api('client_lan_state')]);
       ui.config = config; ui.policy = ['direct_preferred', 'direct_only'].includes(config.connection_policy) ? config.connection_policy : config.direct_only ? 'direct_only' : 'direct_preferred';
       ui.rebuild = config.rebuild_relay === true; applySnapshot(snapshot);
+      ui.lanSnapshot = lanSnapshot;
       ui.auth.username = snapshot.last_username || snapshot.username || '';
       ui.auth.remember = snapshot.remember_login !== false;
       ui.authError = !snapshot.logged_in && snapshot.last_error ? message(snapshot.last_error) : '';
