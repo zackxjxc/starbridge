@@ -254,6 +254,16 @@ async fn client_lan_add_peer(app: tauri::State<'_, ClientApp>, form: LanAddPeerF
 }
 
 #[tauri::command]
+async fn client_lan_connect(app: tauri::State<'_, ClientApp>, form: LanConnectForm) -> Result<crate::lan::LanSnapshot, String> {
+    app.inner().connect_lan_peer(form).await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn client_lan_disconnect(app: tauri::State<'_, ClientApp>, form: LanDisconnectForm) -> Result<crate::lan::LanSnapshot, String> {
+    app.inner().disconnect_lan_peer(form).await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn client_save_config(
     app: tauri::State<'_, ClientApp>,
     config: ClientConfig,
@@ -462,6 +472,8 @@ pub fn run(loaded: anyhow::Result<ClientApp>, role: Role, root: PathBuf) -> anyh
             client_lan_pause,
             client_lan_resume,
             client_lan_add_peer,
+            client_lan_connect,
+            client_lan_disconnect,
             client_save_config,
             client_login,
             client_register,

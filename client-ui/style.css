@@ -88,6 +88,7 @@ html[lang="en"] .history-table .history-action { width: 90px; }
 .device-row:hover { background: var(--soft); }
 .device-row.active { background: var(--picked); }
 .local-block .device-row { border-bottom: 0; height: 58px; }
+.row-actions { display: inline-flex; align-items: center; gap: 9px; margin-left: auto; flex-shrink: 0; }
 .glyph { width: 28px; height: 28px; display: grid; place-items: center; flex-shrink: 0; border: 1px solid var(--line); border-radius: 5px; color: var(--dim); background: var(--soft); }
 .identity { flex: 1; min-width: 0; }
 .device-name, .device-sub { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }

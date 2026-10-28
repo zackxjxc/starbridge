@@ -42,7 +42,7 @@ use account::*;
 use connections::*;
 use diagnostics::*;
 use history::*;
-use lan::{LanProfile, LanRuntime, LanSnapshot};
+use lan::{LanConnection, LanProfile, LanRuntime, LanSnapshot};
 
 #[cfg(feature = "desktop")]
 pub mod desktop;
@@ -165,6 +165,7 @@ pub struct SessionView {
 pub struct ClientApp {
     inner: Arc<RwLock<Inner>>,
     lan: Arc<LanRuntime>,
+    lan_connections: Arc<Mutex<HashMap<String, LanConnectionRecord>>>,
     http: reqwest::Client,
     frpc_processes: Arc<Mutex<HashMap<String, tokio::process::Child>>>,
     session_operations: Arc<Mutex<()>>,
@@ -180,6 +181,11 @@ pub struct ClientApp {
     connection_slots: Arc<tokio::sync::Semaphore>,
     diagnostic_cancel: Arc<AtomicBool>,
     process_job: Arc<process::ProcessJob>,
+}
+
+struct LanConnectionRecord {
+    view: LanConnection,
+    config_path: PathBuf,
 }
 
 struct Inner {
@@ -233,6 +239,16 @@ pub struct LanJoinForm {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct LanConnectForm {
+    pub node_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LanDisconnectForm {
+    pub node_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct LanAddPeerForm {
     pub address: String,
 }
@@ -281,7 +297,11 @@ impl ClientApp {
             if profile.ensure_control_key() {
                 secure_store::write_secret_with_interaction(&root, "lan-profile", &serde_json::to_vec(&profile)?, secure_store::Interaction::Silent).await?;
             }
-            lan.start(profile)?;
+            if profile.discovery_paused {
+                lan.set_profile(profile);
+            } else {
+                lan.start(profile)?;
+            }
         }
         let instance_id = new_token();
         let mut headers = reqwest::header::HeaderMap::new();
@@ -309,6 +329,7 @@ impl ClientApp {
                 instance_id, pending_enrollment: None, enrollment_candidates: Vec::new(),
             })),
             lan,
+            lan_connections: Arc::new(Mutex::new(HashMap::new())),
             http: reqwest::Client::builder().no_proxy().default_headers(headers).timeout(std::time::Duration::from_secs(15)).build()?,
             frpc_processes: Arc::new(Mutex::new(HashMap::new())),
             session_operations: Arc::new(Mutex::new(())),
@@ -327,7 +348,39 @@ impl ClientApp {
         Ok(app)
     }
 
-    pub(crate) async fn lan_snapshot(&self) -> LanSnapshot { self.lan.snapshot() }
+    pub(crate) async fn lan_snapshot(&self) -> LanSnapshot {
+        if self.lan.discovery_running() {
+            if let Err(error) = self.ensure_lan_runtime().await {
+                tracing::warn!(%error, "局域网业务服务尚未就绪");
+            }
+        }
+        let mut snapshot = self.lan.snapshot();
+        let online_nodes = snapshot
+            .peers
+            .iter()
+            .map(|peer| peer.node_id.as_str())
+            .collect::<HashSet<_>>();
+        let stale_paths = {
+            let mut connections = self.lan_connections.lock().await;
+            let mut stale = Vec::new();
+            connections.retain(|node_id, record| {
+                let keep = online_nodes.contains(node_id.as_str());
+                if !keep {
+                    stale.push(record.config_path.clone());
+                }
+                keep
+            });
+            snapshot.connections = connections
+                .values()
+                .map(|record| record.view.clone())
+                .collect();
+            stale
+        };
+        for path in stale_paths {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+        snapshot
+    }
 
     pub(crate) async fn create_lan_group(&self, form: LanCreateForm) -> anyhow::Result<LanSnapshot> {
         let group_name = form.group_name.trim().to_string();
@@ -335,10 +388,11 @@ impl ClientApp {
         if group_name.is_empty() || nickname.is_empty() { anyhow::bail!("组名称和本机昵称不能为空"); }
         if self.lan.profile().is_some() { anyhow::bail!("本机已经加入局域网组，请先退出当前组"); }
         let (root, node_id) = { let inner = self.inner.read().await; (inner.root.clone(), inner.identity.node_id.clone()) };
-        let profile = LanProfile::new(group_name, node_id, nickname);
+        let mut profile = LanProfile::new(group_name, node_id, nickname);
+        self.prepare_lan_profile(&mut profile).await?;
         secure_store::write_secret_with_interaction(&root, "lan-profile", &serde_json::to_vec(&profile)?, secure_store::Interaction::Silent).await?;
         self.lan.replace_profile(profile)?;
-        Ok(self.lan.snapshot())
+        Ok(self.lan_snapshot().await)
     }
 
     pub(crate) async fn join_lan_group(&self, form: LanJoinForm) -> anyhow::Result<LanSnapshot> {
@@ -346,35 +400,242 @@ impl ClientApp {
         if nickname.is_empty() { anyhow::bail!("本机昵称不能为空"); }
         if self.lan.profile().is_some() { anyhow::bail!("本机已经加入局域网组，请先退出当前组"); }
         let (root, node_id) = { let inner = self.inner.read().await; (inner.root.clone(), inner.identity.node_id.clone()) };
-        let profile = LanProfile::from_invite(&form.invite, node_id, nickname)?;
+        let mut profile = LanProfile::from_invite(&form.invite, node_id, nickname)?;
+        self.prepare_lan_profile(&mut profile).await?;
         secure_store::write_secret_with_interaction(&root, "lan-profile", &serde_json::to_vec(&profile)?, secure_store::Interaction::Silent).await?;
         self.lan.replace_profile(profile)?;
-        Ok(self.lan.snapshot())
+        Ok(self.lan_snapshot().await)
     }
 
     pub(crate) async fn leave_lan_group(&self) -> anyhow::Result<LanSnapshot> {
         let root = self.inner.read().await.root.clone();
         self.lan.stop();
+        self.stop_sshd().await;
         secure_store::remove_secret(&root, "lan-profile").await?;
-        Ok(self.lan.snapshot())
+        let _ = tokio::fs::remove_file(root.join("ssh/lan-id_ed25519")).await;
+        let _ = tokio::fs::remove_file(root.join("ssh/lan-id_ed25519.pub")).await;
+        let _ = tokio::fs::remove_file(root.join("ssh/lan-authorized_keys")).await;
+        let _ = tokio::fs::remove_file(root.join("ssh/lan-sshd_config")).await;
+        let _ = tokio::fs::remove_dir_all(root.join("ssh/lan")).await;
+        self.lan_connections.lock().await.clear();
+        Ok(self.lan_snapshot().await)
     }
 
     pub(crate) async fn pause_lan_discovery(&self) -> LanSnapshot {
         self.lan.stop_discovery();
-        self.lan.snapshot()
+        self.stop_sshd().await;
+        if let Some(mut profile) = self.lan.profile() {
+            profile.discovery_paused = true;
+            self.persist_lan_profile(&profile).await;
+            self.lan.set_profile(profile);
+        }
+        self.lan_snapshot().await
     }
 
     pub(crate) async fn resume_lan_discovery(&self) -> anyhow::Result<LanSnapshot> {
+        if let Some(mut profile) = self.lan.profile() {
+            profile.discovery_paused = false;
+            self.lan.set_profile(profile);
+        }
+        self.ensure_lan_runtime().await?;
         self.lan.resume()?;
-        Ok(self.lan.snapshot())
+        if let Some(profile) = self.lan.profile() {
+            self.persist_lan_profile(&profile).await;
+        }
+        Ok(self.lan_snapshot().await)
     }
 
     pub(crate) async fn add_lan_peer(&self, form: LanAddPeerForm) -> anyhow::Result<LanSnapshot> {
         if self.lan.profile().is_none() {
             anyhow::bail!("请先加入局域网组");
         }
+        self.ensure_lan_runtime().await?;
         self.lan.dial_address(form.address.trim())?;
-        Ok(self.lan.snapshot())
+        Ok(self.lan_snapshot().await)
+    }
+
+    pub(crate) async fn connect_lan_peer(&self, form: LanConnectForm) -> anyhow::Result<LanSnapshot> {
+        self.ensure_lan_runtime().await?;
+        let node_id = form.node_id.trim().to_string();
+        let peer = self
+            .lan
+            .snapshot()
+            .peers
+            .into_iter()
+            .find(|peer| peer.node_id == node_id)
+            .ok_or_else(|| anyhow::anyhow!("设备当前离线，已从列表移除"))?;
+        if peer.ssh_port == 0
+            || peer.ssh_user.is_empty()
+            || peer.ssh_public_key.is_empty()
+            || peer.ssh_host_key.is_empty()
+        {
+            anyhow::bail!("设备尚未公布可用的 SSH 服务");
+        }
+        let (root, runtime) = {
+            let inner = self.inner.read().await;
+            (inner.root.clone(), inner.runtime.clone())
+        };
+        let alias = format!("lan-{}", node_id.replace('-', ""));
+        let config_dir = root.join("ssh/lan");
+        tokio::fs::create_dir_all(&config_dir).await?;
+        let config_path = config_dir.join(format!("{alias}.config"));
+        let known_hosts = config_dir.join("known_hosts");
+        if let Some(line) = known_host_line(&alias, &peer.ssh_host_key) {
+            let current = tokio::fs::read_to_string(&known_hosts).await.unwrap_or_default();
+            if !current.lines().any(|value| value.starts_with(&format!("{alias} "))) {
+                let mut content = current;
+                content.push_str(&line);
+                content.push('\n');
+                tokio::fs::write(&known_hosts, content).await?;
+            }
+        }
+        tokio::fs::write(
+            &config_path,
+            lan_ssh_client_config(&root, &config_dir, &alias, &peer),
+        )
+        .await?;
+        {
+            let mut connections = self.lan_connections.lock().await;
+            if connections.contains_key(&node_id) {
+                anyhow::bail!("该设备已经存在局域网连接");
+            }
+            connections.insert(
+                node_id.clone(),
+                LanConnectionRecord {
+                    view: LanConnection {
+                        node_id: node_id.clone(),
+                        nickname: peer.nickname.clone(),
+                        ssh_command: String::new(),
+                        state: "connecting".into(),
+                        connected_at: now_unix(),
+                    },
+                    config_path: config_path.clone(),
+                },
+            );
+        }
+        let marker = format!("STARBRIDGE_LAN_{}", uuid::Uuid::new_v4().simple());
+        let verify = verify_ssh_command(&runtime, &config_path, &alias, &marker).await;
+        if let Err(error) = verify {
+            self.lan_connections.lock().await.remove(&node_id);
+            anyhow::bail!("局域网 SSH 连接失败：{error}");
+        }
+        let ssh_command = format!(
+            "{} -F {} {}",
+            ssh_path(FsPath::new(&runtime.ssh_path)),
+            ssh_path(&config_path),
+            alias
+        );
+        if let Some(connection) = self.lan_connections.lock().await.get_mut(&node_id) {
+            connection.view.ssh_command = ssh_command;
+            connection.view.state = "connected".into();
+        }
+        Ok(self.lan_snapshot().await)
+    }
+
+    pub(crate) async fn disconnect_lan_peer(&self, form: LanDisconnectForm) -> anyhow::Result<LanSnapshot> {
+        let node_id = form.node_id.trim().to_string();
+        if let Some(connection) = self.lan_connections.lock().await.remove(&node_id) {
+            let _ = tokio::fs::remove_file(connection.config_path).await;
+        }
+        Ok(self.lan_snapshot().await)
+    }
+
+    async fn ensure_lan_runtime(&self) -> anyhow::Result<()> {
+        let Some(mut profile) = self.lan.profile() else {
+            return Ok(());
+        };
+        let running = self.sshd_process.lock().await.is_some();
+        let needs_restart = !running
+            || profile.ssh_port == 0
+            || profile.ssh_user.is_empty()
+            || profile.ssh_public_key.is_empty()
+            || profile.ssh_host_key.is_empty();
+        if needs_restart {
+            self.prepare_lan_profile(&mut profile).await?;
+            let root = self.inner.read().await.root.clone();
+            secure_store::write_secret_with_interaction(
+                &root,
+                "lan-profile",
+                &serde_json::to_vec(&profile)?,
+                secure_store::Interaction::Silent,
+            )
+            .await?;
+            if self.lan.discovery_running() {
+                self.lan.replace_profile(profile)?;
+            } else {
+                self.lan.set_profile(profile);
+            }
+        }
+        self.sync_lan_authorized_keys().await;
+        Ok(())
+    }
+
+    async fn persist_lan_profile(&self, profile: &LanProfile) {
+        let root = self.inner.read().await.root.clone();
+        let Ok(bytes) = serde_json::to_vec(profile) else {
+            tracing::warn!("序列化局域网组状态失败");
+            return;
+        };
+        if let Err(error) = secure_store::write_secret_with_interaction(
+            &root,
+            "lan-profile",
+            &bytes,
+            secure_store::Interaction::Silent,
+        )
+        .await
+        {
+            tracing::warn!(%error, "保存局域网组状态失败");
+        }
+    }
+
+    async fn prepare_lan_profile(&self, profile: &mut LanProfile) -> anyhow::Result<()> {
+        let (root, runtime) = {
+            let inner = self.inner.read().await;
+            (inner.root.clone(), inner.runtime.clone())
+        };
+        let ssh_dir = root.join("ssh");
+        let public_key = ensure_key(
+            &runtime_file(&runtime, "ssh-keygen"),
+            &ssh_dir.join("lan-id_ed25519"),
+        )
+        .await?;
+        if self.sshd_process.lock().await.is_some() {
+            self.stop_sshd().await;
+        }
+        let status = self
+            .start_lan_sshd(&runtime, &ssh_dir, profile.ssh_port)
+            .await?;
+        profile.ssh_port = status.port.unwrap_or_default();
+        profile.ssh_user = status.login_user.clone();
+        profile.ssh_public_key = public_key;
+        profile.ssh_host_key = status.host_key.clone();
+        self.inner.write().await.ssh = SshStatus {
+            public_key: profile.ssh_public_key.clone(),
+            ..status
+        };
+        Ok(())
+    }
+
+    async fn sync_lan_authorized_keys(&self) {
+        let (root, peers) = {
+            let inner = self.inner.read().await;
+            (inner.root.clone(), self.lan.snapshot().peers)
+        };
+        let mut keys = peers
+            .into_iter()
+            .filter_map(|peer| {
+                (!peer.ssh_public_key.trim().is_empty()).then_some(peer.ssh_public_key)
+            })
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys.dedup();
+        let content = keys.into_iter().map(|key| format!("{key}\n")).collect::<String>();
+        let path = root.join("ssh/lan-authorized_keys");
+        if tokio::fs::read_to_string(&path).await.ok().as_deref() != Some(content.as_str()) {
+            if let Err(error) = tokio::fs::write(path, content).await {
+                tracing::warn!(%error, "更新局域网 SSH 授权密钥失败");
+            }
+        }
     }
 
     async fn ensure_ssh_ready(&self) -> anyhow::Result<()> {
@@ -477,6 +738,85 @@ impl ClientApp {
         })
     }
 
+    /// LAN mode uses a separate SSH identity and listener. The control plane has
+    /// already authenticated the group, so the SSH key exchange remains internal
+    /// and is never shown to the user.
+    async fn start_lan_sshd(
+        &self,
+        runtime: &RuntimeStatus,
+        dir: &FsPath,
+        requested_port: u16,
+    ) -> anyhow::Result<SshStatus> {
+        let sshd = std::path::absolute(runtime_file(runtime, "sshd"))?;
+        if !sshd.is_file() {
+            anyhow::bail!("缺少 {}", sshd.display());
+        }
+        let dir = std::path::absolute(dir)?;
+        tokio::fs::create_dir_all(&dir).await?;
+        let host_key = ensure_key(
+            &runtime_file(runtime, "ssh-keygen"),
+            &dir.join("lan-host_ed25519"),
+        )
+        .await?;
+        let authorized_keys = dir.join("lan-authorized_keys");
+        if !authorized_keys.is_file() {
+            tokio::fs::write(&authorized_keys, "").await?;
+        }
+        let port = if requested_port != 0
+            && std::net::TcpListener::bind(("0.0.0.0", requested_port)).is_ok()
+        {
+            requested_port
+        } else {
+            pick_port_on("0.0.0.0", 24000, 24999)?
+        };
+        let config_path = dir.join("lan-sshd_config");
+        let sftp_server = std::path::absolute(runtime_file(runtime, "sftp-server"))?;
+        tokio::fs::write(
+            &config_path,
+            sshd_config_for(
+                &dir,
+                &sftp_server,
+                port,
+                "0.0.0.0",
+                "lan-host_ed25519",
+                "lan-authorized_keys",
+                "lan-sshd.pid",
+            ),
+        )
+        .await?;
+        let log_path = dir.join("lan-sshd.log");
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+        let mut child = sshd_command(&sshd)?
+            .arg("-D")
+            .arg("-e")
+            .arg("-f")
+            .arg(&config_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log.try_clone()?))
+            .stderr(Stdio::from(log))
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| anyhow::anyhow!("启动局域网 sshd 失败: {error}"))?;
+        self.process_job.attach(&child)?;
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("局域网 sshd 启动后退出: {status}，日志见 {}", log_path.display());
+        }
+        *self.sshd_process.lock().await = Some(child);
+        Ok(SshStatus {
+            initialization: "ready".into(),
+            privilege: detect_privilege(),
+            port: Some(port),
+            host_key,
+            public_key: String::new(),
+            login_user: current_user(),
+            message: format!("局域网 SSH 服务已启动：0.0.0.0:{port}"),
+        })
+    }
+
     async fn sync_authorized_keys(&self, devices: &[DeviceInfo]) {
         let path = {
             let inner = self.inner.read().await;
@@ -518,6 +858,8 @@ impl ClientApp {
             .route("/api/v1/lan/pause", post(lan_pause))
             .route("/api/v1/lan/resume", post(lan_resume))
             .route("/api/v1/lan/peers", post(lan_add_peer))
+            .route("/api/v1/lan/connect", post(lan_connect))
+            .route("/api/v1/lan/disconnect", post(lan_disconnect))
             .route("/api/v1/config", get(get_config).put(update_config))
             .route("/api/v1/login", post(login))
             .route("/api/v1/register", post(register))
@@ -916,6 +1258,14 @@ async fn lan_add_peer(State(app): State<ClientApp>, Json(form): Json<LanAddPeerF
     app.add_lan_peer(form).await.map(Json).map_err(ApiError::internal)
 }
 
+async fn lan_connect(State(app): State<ClientApp>, Json(form): Json<LanConnectForm>) -> Result<Json<LanSnapshot>, ApiError> {
+    app.connect_lan_peer(form).await.map(Json).map_err(ApiError::internal)
+}
+
+async fn lan_disconnect(State(app): State<ClientApp>, Json(form): Json<LanDisconnectForm>) -> Result<Json<LanSnapshot>, ApiError> {
+    app.disconnect_lan_peer(form).await.map(Json).map_err(ApiError::internal)
+}
+
 async fn get_config(State(app): State<ClientApp>) -> Json<ClientConfig> {
     Json(app.inner.read().await.config.clone())
 }
@@ -1173,8 +1523,12 @@ fn sshd_session_launcher() -> anyhow::Result<PathBuf> {
 }
 
 fn pick_port(start: u16, end: u16) -> anyhow::Result<u16> {
+    pick_port_on("127.0.0.1", start, end)
+}
+
+fn pick_port_on(address: &str, start: u16, end: u16) -> anyhow::Result<u16> {
     for port in start..=end {
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+        if std::net::TcpListener::bind((address, port)).is_ok() {
             return Ok(port);
         }
     }
@@ -1271,11 +1625,31 @@ fn ssh_path(path: &FsPath) -> String {
 }
 
 fn sshd_config(dir: &FsPath, sftp_server: &FsPath, port: u16) -> String {
+    sshd_config_for(
+        dir,
+        sftp_server,
+        port,
+        "127.0.0.1",
+        "host_ed25519",
+        "authorized_keys",
+        "sshd.pid",
+    )
+}
+
+fn sshd_config_for(
+    dir: &FsPath,
+    sftp_server: &FsPath,
+    port: u16,
+    listen_address: &str,
+    host_key_name: &str,
+    authorized_keys_name: &str,
+    pid_name: &str,
+) -> String {
     let mut config = format!(
-        "Port {port}\nListenAddress 127.0.0.1\nHostKey {}\nPidFile {}\nAuthorizedKeysFile {}\nPubkeyAuthentication yes\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nStrictModes no\nSubsystem sftp {}\n",
-        ssh_path(&dir.join("host_ed25519")),
-        ssh_path(&dir.join("sshd.pid")),
-        ssh_path(&dir.join("authorized_keys")),
+        "Port {port}\nListenAddress {listen_address}\nHostKey {}\nPidFile {}\nAuthorizedKeysFile {}\nPubkeyAuthentication yes\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nStrictModes no\nSubsystem sftp {}\n",
+        ssh_path(&dir.join(host_key_name)),
+        ssh_path(&dir.join(pid_name)),
+        ssh_path(&dir.join(authorized_keys_name)),
         ssh_path(sftp_server),
     );
     #[cfg(windows)]
@@ -1320,6 +1694,24 @@ fn ssh_client_config(root: &FsPath, dir: &FsPath, target: &DeviceInfo, port: u16
             "yes"
         },
     )
+}
+
+fn lan_ssh_client_config(root: &FsPath, dir: &FsPath, alias: &str, peer: &crate::lan::LanPeer) -> String {
+    format!(
+        "Host {alias}\n  HostName {}\n  Port {}\n  User {}\n  IdentityFile {}\n  IdentitiesOnly yes\n  HostKeyAlias {alias}\n  UserKnownHostsFile {}\n  StrictHostKeyChecking yes\n",
+        peer.address,
+        peer.ssh_port,
+        peer.ssh_user,
+        ssh_path(&root.join("ssh/lan-id_ed25519")),
+        ssh_path(&dir.join("known_hosts")),
+    )
+}
+
+fn known_host_line(alias: &str, host_key: &str) -> Option<String> {
+    let mut fields = host_key.split_whitespace();
+    let key_type = fields.next()?;
+    let key = fields.next()?;
+    Some(format!("{alias} {key_type} {key}"))
 }
 
 async fn write_session_ssh_files(

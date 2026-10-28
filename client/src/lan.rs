@@ -1,10 +1,10 @@
 use futures::StreamExt;
 use libp2p::{
-    Multiaddr, PeerId, SwarmBuilder, identify, identity,
+    identify, identity,
     mdns::{self, Event as MdnsEvent},
     noise, ping,
-    swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, yamux,
+    swarm::{behaviour::toggle::Toggle, NetworkBehaviour, SwarmEvent},
+    tcp, yamux, Multiaddr, PeerId, SwarmBuilder,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -30,6 +30,16 @@ pub(crate) struct LanProfile {
     /// A persistent libp2p identity. It is kept inside the existing secure store.
     #[serde(default)]
     pub control_key: Vec<u8>,
+    #[serde(default)]
+    pub ssh_port: u16,
+    #[serde(default)]
+    pub ssh_user: String,
+    #[serde(default)]
+    pub ssh_public_key: String,
+    #[serde(default)]
+    pub ssh_host_key: String,
+    #[serde(default)]
+    pub discovery_paused: bool,
 }
 
 impl LanProfile {
@@ -41,6 +51,11 @@ impl LanProfile {
             node_id,
             nickname,
             control_key: new_control_key(),
+            ssh_port: 0,
+            ssh_user: String::new(),
+            ssh_public_key: String::new(),
+            ssh_host_key: String::new(),
+            discovery_paused: false,
         }
     }
 
@@ -87,6 +102,11 @@ impl LanProfile {
             node_id,
             nickname,
             control_key: new_control_key(),
+            ssh_port: 0,
+            ssh_user: String::new(),
+            ssh_public_key: String::new(),
+            ssh_host_key: String::new(),
+            discovery_paused: false,
         })
     }
 
@@ -119,6 +139,10 @@ struct LanAnnouncement {
     nickname: String,
     group_name: String,
     proof: String,
+    ssh_port: u16,
+    ssh_user: String,
+    ssh_public_key: String,
+    ssh_host_key: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -129,6 +153,10 @@ pub(crate) struct LanPeer {
     pub address: String,
     pub port: u16,
     pub control_address: String,
+    pub ssh_port: u16,
+    pub ssh_user: String,
+    pub ssh_public_key: String,
+    pub ssh_host_key: String,
     pub online: bool,
     pub last_seen: u64,
 }
@@ -142,6 +170,16 @@ pub(crate) struct LanSnapshot {
     pub node_id: Option<String>,
     pub nickname: Option<String>,
     pub peers: Vec<LanPeer>,
+    pub connections: Vec<LanConnection>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct LanConnection {
+    pub node_id: String,
+    pub nickname: String,
+    pub ssh_command: String,
+    pub state: String,
+    pub connected_at: u64,
 }
 
 #[derive(Clone)]
@@ -153,7 +191,7 @@ struct PeerRecord {
 #[derive(NetworkBehaviour)]
 #[behaviour(to_swarm = "ControlEvent")]
 struct ControlBehaviour {
-    mdns: mdns::tokio::Behaviour,
+    mdns: Toggle<mdns::tokio::Behaviour>,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
 }
@@ -204,6 +242,13 @@ impl LanRuntime {
         self.profile.read().ok().and_then(|profile| profile.clone())
     }
 
+    pub(crate) fn discovery_running(&self) -> bool {
+        self.listener
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some()
+    }
+
     pub(crate) fn snapshot(&self) -> LanSnapshot {
         let profile = self.profile();
         let now = unix_now();
@@ -230,6 +275,7 @@ impl LanRuntime {
             node_id: profile.as_ref().map(|value| value.node_id.clone()),
             nickname: profile.as_ref().map(|value| value.nickname.clone()),
             peers: items,
+            connections: Vec::new(),
         }
     }
 
@@ -248,9 +294,18 @@ impl LanRuntime {
             nickname: profile.nickname.clone(),
             group_name: profile.group_name.clone(),
             proof: profile.proof_for(&profile.node_id),
+            ssh_port: profile.ssh_port,
+            ssh_user: profile.ssh_user.clone(),
+            ssh_public_key: profile.ssh_public_key.clone(),
+            ssh_host_key: profile.ssh_host_key.clone(),
         })?;
-        let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
-            .map_err(|error| anyhow::anyhow!("无法启动局域网 mDNS：{error}"))?;
+        let mdns = match mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id) {
+            Ok(behaviour) => Toggle::from(Some(behaviour)),
+            Err(error) => {
+                tracing::warn!(%error, "局域网 mDNS 不可用，将仅使用手动设备地址");
+                Toggle::from(None)
+            }
+        };
         let identify_config =
             identify::Config::new(LAN_PROTOCOL_VERSION.to_string(), keypair.public())
                 .with_agent_version(format!("starbridge-lan {announcement}"));
@@ -271,7 +326,9 @@ impl LanRuntime {
                 ),
             })?
             .with_swarm_config(|config| {
-                config.with_idle_connection_timeout(Duration::from_secs(PRESENCE_TIMEOUT_SECS))
+                // Ping is the liveness signal. Keep the libp2p connection alive
+                // long enough for a missed ping to be handled by the presence TTL.
+                config.with_idle_connection_timeout(Duration::from_secs(60 * 60))
             })
             .build();
         swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
@@ -315,6 +372,7 @@ impl LanRuntime {
                     })) => {
                         tracing::debug!(%peer_id, agent = %info.agent_version, "LAN identify received");
                         let Some(announcement) = parse_announcement(&info.agent_version) else {
+                            tracing::warn!(%peer_id, "LAN identify announcement could not be parsed");
                             let _ = swarm.disconnect_peer_id(peer_id);
                             continue;
                         };
@@ -328,6 +386,7 @@ impl LanRuntime {
                             || announcement.node_id == own_node_id
                             || announcement.proof != expected
                         {
+                            tracing::warn!(%peer_id, "LAN peer group proof rejected");
                             let _ = swarm.disconnect_peer_id(peer_id);
                             continue;
                         }
@@ -354,6 +413,10 @@ impl LanRuntime {
                                         address,
                                         port,
                                         control_address: control_address.to_string(),
+                                        ssh_port: announcement.ssh_port,
+                                        ssh_user: announcement.ssh_user,
+                                        ssh_public_key: announcement.ssh_public_key,
+                                        ssh_host_key: announcement.ssh_host_key,
                                         online: true,
                                         last_seen: unix_now(),
                                     },
@@ -366,6 +429,7 @@ impl LanRuntime {
                         result: Ok(_),
                         ..
                     })) => {
+                        tracing::debug!(%peer, "LAN ping succeeded");
                         let now = unix_now();
                         for record in peers
                             .write()
@@ -379,6 +443,7 @@ impl LanRuntime {
                         }
                     }
                     SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                        tracing::debug!(%peer_id, "LAN control connection closed");
                         peers
                             .write()
                             .unwrap_or_else(|error| error.into_inner())
@@ -453,6 +518,13 @@ impl LanRuntime {
 
     pub(crate) fn replace_profile(&self, profile: LanProfile) -> anyhow::Result<()> {
         self.start(profile)
+    }
+
+    pub(crate) fn set_profile(&self, profile: LanProfile) {
+        *self
+            .profile
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(profile);
     }
 
     pub(crate) fn resume(&self) -> anyhow::Result<()> {
@@ -530,6 +602,10 @@ mod tests {
             nickname: profile.nickname.clone(),
             group_name: profile.group_name.clone(),
             proof: profile.proof_for(&profile.node_id),
+            ssh_port: profile.ssh_port,
+            ssh_user: profile.ssh_user.clone(),
+            ssh_public_key: profile.ssh_public_key.clone(),
+            ssh_host_key: profile.ssh_host_key.clone(),
         })
         .unwrap();
         let parsed = parse_announcement(&format!("starbridge-lan {value}")).unwrap();
