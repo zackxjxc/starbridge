@@ -32,6 +32,7 @@ mod profile;
 #[cfg(feature = "desktop")]
 mod startup;
 pub mod data_directory;
+pub mod profiles;
 pub use identity::Identity;
 mod connections;
 mod diagnostics;
@@ -1479,6 +1480,7 @@ fn runtime_directory(root: &FsPath, executable_dir: Option<&FsPath>) -> PathBuf 
         .map(|directory| directory.join("Resources/runtime"));
     std::iter::once(local_runtime.clone())
         .chain(root.parent().map(|parent| parent.join("runtime")))
+        .chain(root.parent().and_then(|parent| parent.parent()).map(|parent| parent.join("runtime")))
         .chain(executable_dir.map(|directory| directory.join("runtime")))
         .chain(bundle_runtime)
         .find(|directory| directory.is_dir())
@@ -1984,6 +1986,17 @@ mod tests {
         std::fs::create_dir_all(&local).unwrap();
         assert_eq!(runtime_directory(&root, Some(&executable_dir)), local);
         std::fs::remove_dir_all(&temporary).unwrap();
+    }
+
+    #[test]
+    fn profile_runtime_finds_shared_runtime_at_profile_store_root() {
+        let temporary = std::env::temp_dir()
+            .join(format!("starbridge-profile-runtime-{}", uuid::Uuid::new_v4()));
+        let root = temporary.join("StarBridge/profiles/default");
+        let shared = temporary.join("StarBridge/runtime");
+        std::fs::create_dir_all(&shared).unwrap();
+        assert_eq!(runtime_directory(&root, None), shared);
+        std::fs::remove_dir_all(temporary).unwrap();
     }
 
     #[test]

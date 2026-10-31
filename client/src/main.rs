@@ -4,7 +4,7 @@
 )]
 
 use clap::Parser;
-use starbridge_client::{ClientApp, data_directory};
+use starbridge_client::{ClientApp, data_directory, profiles};
 use starbridge_protocol::Role;
 use std::{
     net::SocketAddr,
@@ -33,6 +33,12 @@ struct Args {
     /// Compatibility alias for --headless.
     #[arg(long, hide = true)]
     no_browser: bool,
+    /// Internal profile selector used by the account manager.
+    #[arg(long, hide = true, conflicts_with_all = ["data_dir", "import_data_dir", "new_profile"])]
+    profile_id: Option<String>,
+    /// Open a fresh login profile.
+    #[arg(long, hide = true, conflicts_with_all = ["data_dir", "import_data_dir", "profile_id"])]
+    new_profile: bool,
 }
 
 fn main() {
@@ -61,8 +67,11 @@ fn run() -> anyhow::Result<()> {
     let headless = args.headless || args.no_browser || !cfg!(feature = "desktop");
     let executable = std::env::current_exe()?;
     let executable_dir = executable.parent().ok_or_else(|| anyhow::anyhow!("无法确定程序目录"))?;
-    // Both desktop and headless launches share the same user profile and lifetime lock.
-    let _instance = data_directory::prepare_with_import(args.data_dir, args.import_data_dir, &[executable_dir.to_path_buf(), std::env::current_dir()?])?;
+    let _instance = if args.data_dir.is_some() || args.import_data_dir.is_some() {
+        data_directory::prepare_with_import(args.data_dir, args.import_data_dir, &[executable_dir.to_path_buf(), std::env::current_dir()?])?
+    } else {
+        profiles::prepare_auto(args.profile_id.as_deref(), args.new_profile)?.directory
+    };
     let root = _instance.root.clone();
     let runtime = tokio::runtime::Runtime::new()?;
     let loaded = runtime.block_on(ClientApp::load(role, root.clone()));

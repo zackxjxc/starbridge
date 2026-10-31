@@ -89,6 +89,10 @@ fn lock(root: &Path) -> anyhow::Result<File> {
     Ok(file)
 }
 
+pub(crate) fn is_instance_busy(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.to_string().contains("此数据目录已有客户端运行"))
+}
+
 fn has_identity(root: &Path) -> bool {
     root.join("identity.json").is_file() || root.join("identity.secure").is_file()
 }
