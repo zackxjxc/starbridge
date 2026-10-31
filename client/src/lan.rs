@@ -436,6 +436,7 @@ impl LanRuntime {
         let (command_tx, mut command_rx) = mpsc::unbounded_channel();
         let listener = tokio::spawn(async move {
             let mut discovered = HashMap::<PeerId, Multiaddr>::new();
+            let mut connected_addresses = HashMap::<PeerId, Multiaddr>::new();
             let mut pending = HashMap::<OutboundRequestId, LanCommand>::new();
             let mut outgoing = HashMap::<String, (PeerId, LanOccupancy)>::new();
             let mut keepalive = tokio::time::interval(Duration::from_secs(5));
@@ -517,6 +518,12 @@ impl LanRuntime {
                     break;
                 };
                 match event {
+                    SwarmEvent::ConnectionEstablished {
+                        peer_id, endpoint, ..
+                    } => {
+                        connected_addresses
+                            .insert(peer_id, endpoint.get_remote_address().clone());
+                    }
                     SwarmEvent::Behaviour(ControlEvent::Mdns(MdnsEvent::Discovered(items))) => {
                         tracing::debug!(count = items.len(), "LAN mDNS discovered peers");
                         for (peer, address) in items {
@@ -558,10 +565,13 @@ impl LanRuntime {
                             let _ = swarm.disconnect_peer_id(peer_id);
                             continue;
                         }
-                        let Some(control_address) = discovered
+                        let Some(control_address) = connected_addresses
                             .get(&peer_id)
                             .cloned()
-                            .or_else(|| info.listen_addrs.first().cloned())
+                            .or_else(|| discovered
+                            .get(&peer_id)
+                            .cloned()
+                            .or_else(|| info.listen_addrs.first().cloned()))
                         else {
                             continue;
                         };
@@ -739,6 +749,7 @@ impl LanRuntime {
                     }
                     SwarmEvent::ConnectionClosed { peer_id, .. } => {
                         tracing::debug!(%peer_id, "LAN control connection closed");
+                        connected_addresses.remove(&peer_id);
                         let disconnected_nodes: Vec<_> = peers
                             .read()
                             .unwrap_or_else(|error| error.into_inner())
