@@ -269,6 +269,11 @@ async fn client_lan_disconnect(app: tauri::State<'_, ClientApp>, form: LanDiscon
 }
 
 #[tauri::command]
+async fn client_lan_nickname(app: tauri::State<'_, ClientApp>, form: LanNicknameForm) -> Result<crate::lan::LanSnapshot, String> {
+    app.inner().update_lan_nickname(form).await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn client_save_config(
     app: tauri::State<'_, ClientApp>,
     config: ClientConfig,
@@ -480,6 +485,7 @@ pub fn run(loaded: anyhow::Result<ClientApp>, role: Role, root: PathBuf) -> anyh
             client_lan_connect,
             client_lan_connect_all,
             client_lan_disconnect,
+            client_lan_nickname,
             client_save_config,
             client_login,
             client_register,

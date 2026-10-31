@@ -250,6 +250,11 @@ pub struct LanDisconnectForm {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct LanNicknameForm {
+    pub nickname: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct LanAddPeerForm {
     pub address: String,
 }
@@ -426,6 +431,27 @@ impl ClientApp {
         let _ = tokio::fs::remove_file(root.join("ssh/lan-sshd_config")).await;
         let _ = tokio::fs::remove_dir_all(root.join("ssh/lan")).await;
         self.lan_connections.lock().await.clear();
+        Ok(self.lan_snapshot().await)
+    }
+
+    pub(crate) async fn update_lan_nickname(&self, form: LanNicknameForm) -> anyhow::Result<LanSnapshot> {
+        if self.lan.occupancy().is_some() || !self.lan_connections.lock().await.is_empty() {
+            anyhow::bail!("请先断开局域网连接，再修改本机昵称");
+        }
+        let nickname = form.nickname.trim().to_string();
+        if nickname.is_empty() {
+            anyhow::bail!("本机昵称不能为空");
+        }
+        let Some(mut profile) = self.lan.profile() else {
+            anyhow::bail!("请先加入局域网组");
+        };
+        profile.nickname = nickname;
+        self.persist_lan_profile(&profile).await;
+        if self.lan.discovery_running() {
+            self.lan.replace_profile(profile)?;
+        } else {
+            self.lan.set_profile(profile);
+        }
         Ok(self.lan_snapshot().await)
     }
 
@@ -902,6 +928,7 @@ impl ClientApp {
             .route("/api/v1/lan/connect", post(lan_connect))
             .route("/api/v1/lan/connect-all", post(lan_connect_all))
             .route("/api/v1/lan/disconnect", post(lan_disconnect))
+            .route("/api/v1/lan/nickname", post(lan_nickname))
             .route("/api/v1/config", get(get_config).put(update_config))
             .route("/api/v1/login", post(login))
             .route("/api/v1/register", post(register))
@@ -1310,6 +1337,10 @@ async fn lan_connect_all(State(app): State<ClientApp>) -> Result<Json<LanSnapsho
 
 async fn lan_disconnect(State(app): State<ClientApp>, Json(form): Json<LanDisconnectForm>) -> Result<Json<LanSnapshot>, ApiError> {
     app.disconnect_lan_peer(form).await.map(Json).map_err(ApiError::internal)
+}
+
+async fn lan_nickname(State(app): State<ClientApp>, Json(form): Json<LanNicknameForm>) -> Result<Json<LanSnapshot>, ApiError> {
+    app.update_lan_nickname(form).await.map(Json).map_err(ApiError::internal)
 }
 
 async fn get_config(State(app): State<ClientApp>) -> Json<ClientConfig> {
