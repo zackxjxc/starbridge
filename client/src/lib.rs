@@ -300,7 +300,8 @@ impl ClientApp {
         let lan = Arc::new(LanRuntime::new());
         if let Some(bytes) = secure_store::read_secret_with_interaction(&root, "lan-profile", interaction).await? {
             let mut profile: LanProfile = serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("局域网组凭据损坏，请重新加入局域网组"))?;
-            if profile.ensure_control_key() {
+            let migrated_invite = profile.migrate_invite_code();
+            if migrated_invite || profile.ensure_control_key() {
                 secure_store::write_secret_with_interaction(&root, "lan-profile", &serde_json::to_vec(&profile)?, secure_store::Interaction::Silent).await?;
             }
             if profile.discovery_paused {

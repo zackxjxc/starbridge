@@ -12,11 +12,15 @@ use libp2p::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use socket2::{Domain, Protocol as SocketProtocol, Socket as Socket2, Type};
 use std::{
     collections::HashMap,
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket as StdUdpSocket},
+    str::FromStr,
     sync::{Arc, Mutex, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -26,6 +30,10 @@ const LAN_PROTOCOL_VERSION: &str = "/starbridge/lan/1";
 const PRESENCE_TIMEOUT_SECS: u64 = 15;
 const OCCUPANCY_TIMEOUT_SECS: u64 = 20;
 const LAN_CONTROL_PROTOCOL: &str = "/starbridge/lan/control/1";
+const LAN_DISCOVERY_MULTICAST: Ipv4Addr = Ipv4Addr::new(239, 255, 0, 1);
+const LAN_DISCOVERY_PORT: u16 = 45_853;
+const INVITE_CODE_LEN: usize = 6;
+const INVITE_CODE_SPACE: u32 = 1_000_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct LanProfile {
@@ -51,10 +59,11 @@ pub(crate) struct LanProfile {
 
 impl LanProfile {
     pub(crate) fn new(group_name: String, node_id: String, nickname: String) -> Self {
+        let invite_secret = new_invite_secret();
         Self {
-            group_id: Uuid::new_v4().simple().to_string(),
+            group_id: group_id_for_invite_secret(&invite_secret),
             group_name,
-            invite_secret: Uuid::new_v4().simple().to_string(),
+            invite_secret,
             node_id,
             nickname,
             control_key: new_control_key(),
@@ -67,11 +76,16 @@ impl LanProfile {
     }
 
     pub(crate) fn invite_code(&self) -> String {
-        format!(
-            "SB1-{}-{}",
-            self.group_id.to_uppercase(),
-            self.invite_secret.to_uppercase()
-        )
+        self.invite_secret.clone()
+    }
+
+    pub(crate) fn migrate_invite_code(&mut self) -> bool {
+        let invite_secret = normalize_invite_secret(&self.invite_secret);
+        let group_id = group_id_for_invite_secret(&invite_secret);
+        let changed = self.invite_secret != invite_secret || self.group_id != group_id;
+        self.invite_secret = invite_secret;
+        self.group_id = group_id;
+        changed
     }
 
     pub(crate) fn proof_for(&self, node_id: &str) -> String {
@@ -81,19 +95,11 @@ impl LanProfile {
     pub(crate) fn parse_invite(code: &str) -> anyhow::Result<(String, String)> {
         let compact = code
             .trim()
-            .replace(['-', ' ', '\n', '\r', '\t'], "")
-            .to_uppercase();
-        if !compact.starts_with("SB1") || compact.len() != 67 {
+            .replace(['-', ' ', '\n', '\r', '\t'], "");
+        if compact.len() != INVITE_CODE_LEN || !compact.chars().all(|value| value.is_ascii_digit()) {
             anyhow::bail!("邀请码格式无效");
         }
-        let group_id = compact[3..35].to_lowercase();
-        let secret = compact[35..].to_lowercase();
-        if !group_id.chars().all(|c| c.is_ascii_hexdigit())
-            || !secret.chars().all(|c| c.is_ascii_hexdigit())
-        {
-            anyhow::bail!("邀请码格式无效");
-        }
-        Ok((group_id, secret))
+        Ok((group_id_for_invite_secret(&compact), compact))
     }
 
     pub(crate) fn from_invite(
@@ -138,6 +144,29 @@ fn new_control_key() -> Vec<u8> {
         .expect("ed25519 keypair encoding must succeed")
 }
 
+fn new_invite_secret() -> String {
+    let bytes = *Uuid::new_v4().as_bytes();
+    let value = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) % INVITE_CODE_SPACE;
+    format!("{value:06}")
+}
+
+fn normalize_invite_secret(secret: &str) -> String {
+    if secret.len() == INVITE_CODE_LEN && secret.chars().all(|value| value.is_ascii_digit()) {
+        return secret.to_string();
+    }
+    let digest = Sha256::digest(secret.as_bytes());
+    let value = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % INVITE_CODE_SPACE;
+    format!("{value:06}")
+}
+
+fn group_id_for_invite_secret(secret: &str) -> String {
+    let digest = Sha256::digest(secret.as_bytes());
+    digest[..16]
+        .iter()
+        .map(|value| format!("{value:02x}"))
+        .collect()
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct LanAnnouncement {
     version: u8,
@@ -150,6 +179,18 @@ struct LanAnnouncement {
     ssh_user: String,
     ssh_public_key: String,
     ssh_host_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LanBeacon {
+    version: u8,
+    group_id: String,
+    node_id: String,
+    nickname: String,
+    group_name: String,
+    proof: String,
+    peer_id: String,
+    control_port: u16,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -180,6 +221,15 @@ pub(crate) struct LanSnapshot {
     pub occupancy: Option<LanOccupancy>,
     pub peers: Vec<LanPeer>,
     pub connections: Vec<LanConnection>,
+    pub discovery: LanDiscoveryStatus,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct LanDiscoveryStatus {
+    pub mdns_available: bool,
+    pub fallback_available: bool,
+    pub fallback_port: u16,
+    pub message: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -306,6 +356,7 @@ pub(crate) struct LanRuntime {
     occupancy: Arc<RwLock<Option<LeaseState>>>,
     listener: Mutex<Option<JoinHandle<()>>>,
     commands: Mutex<Option<UnboundedSender<LanCommand>>>,
+    discovery: RwLock<LanDiscoveryStatus>,
 }
 
 impl LanRuntime {
@@ -316,6 +367,7 @@ impl LanRuntime {
             occupancy: Arc::new(RwLock::new(None)),
             listener: Mutex::new(None),
             commands: Mutex::new(None),
+            discovery: RwLock::new(LanDiscoveryStatus::default()),
         }
     }
 
@@ -365,6 +417,11 @@ impl LanRuntime {
             occupancy,
             peers: items,
             connections: Vec::new(),
+            discovery: self
+                .discovery
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone(),
         }
     }
 
@@ -389,12 +446,35 @@ impl LanRuntime {
             ssh_public_key: profile.ssh_public_key.clone(),
             ssh_host_key: profile.ssh_host_key.clone(),
         })?;
-        let mdns = match mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id) {
-            Ok(behaviour) => Toggle::from(Some(behaviour)),
+        let (mdns, mdns_available, mdns_error) =
+            match mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id) {
+                Ok(behaviour) => (Toggle::from(Some(behaviour)), true, None),
+                Err(error) => {
+                    tracing::warn!(%error, "局域网 mDNS 不可用，将使用 StarBridge 备用发现");
+                    (Toggle::from(None), false, Some(error.to_string()))
+                }
+            };
+        let fallback_socket = match create_fallback_discovery_socket() {
+            Ok(socket) => Some(socket),
             Err(error) => {
-                tracing::warn!(%error, "局域网 mDNS 不可用，将仅使用手动设备地址");
-                Toggle::from(None)
+                tracing::warn!(%error, port = LAN_DISCOVERY_PORT, "StarBridge 备用局域网发现不可用");
+                None
             }
+        };
+        let discovery_message = match (mdns_error, fallback_socket.is_some()) {
+            (Some(error), true) => Some(format!("mDNS 不可用，已切换 StarBridge 备用发现：{error}")),
+            (Some(error), false) => Some(format!("自动发现不可用：mDNS 和备用发现均失败：{error}")),
+            (None, false) => Some(format!("备用发现端口 {LAN_DISCOVERY_PORT} 不可用，仍可使用 mDNS 或手动添加")),
+            (None, true) => None,
+        };
+        *self
+            .discovery
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = LanDiscoveryStatus {
+            mdns_available,
+            fallback_available: fallback_socket.is_some(),
+            fallback_port: LAN_DISCOVERY_PORT,
+            message: discovery_message,
         };
         let identify_config =
             identify::Config::new(LAN_PROTOCOL_VERSION.to_string(), keypair.public())
@@ -433,13 +513,28 @@ impl LanRuntime {
 
         let peers = Arc::clone(&self.peers);
         let occupancy = Arc::clone(&self.occupancy);
+        let fallback_group_name = own_profile.group_name.clone();
         let (command_tx, mut command_rx) = mpsc::unbounded_channel();
         let listener = tokio::spawn(async move {
+            let fallback_socket = fallback_socket;
+            let fallback_beacon = LanBeacon {
+                version: 1,
+                group_id: own_group_id.clone(),
+                node_id: own_node_id.clone(),
+                nickname: own_nickname.clone(),
+                group_name: fallback_group_name,
+                proof: proof_for(&invite_secret, &own_group_id, &own_node_id),
+                peer_id: peer_id.to_string(),
+                control_port: 0,
+            };
             let mut discovered = HashMap::<PeerId, Multiaddr>::new();
             let mut connected_addresses = HashMap::<PeerId, Multiaddr>::new();
             let mut pending = HashMap::<OutboundRequestId, LanCommand>::new();
             let mut outgoing = HashMap::<String, (PeerId, LanOccupancy)>::new();
             let mut keepalive = tokio::time::interval(Duration::from_secs(5));
+            let mut beacon_tick = tokio::time::interval(Duration::from_secs(3));
+            let mut control_port = None;
+            let mut fallback_buffer = vec![0u8; 4096];
             loop {
                 let event = tokio::select! {
                     Some(command) = command_rx.recv() => {
@@ -509,6 +604,57 @@ impl LanRuntime {
                                 proof: proof_for(&invite_secret, &own_group_id, &own_node_id),
                             };
                             let _ = swarm.behaviour_mut().control.send_request(peer_id, request);
+                        }
+                        continue;
+                    }
+                    _ = beacon_tick.tick(), if fallback_socket.is_some() => {
+                        if let (Some(socket), Some(port)) = (fallback_socket.as_ref(), control_port) {
+                            let mut beacon = fallback_beacon.clone();
+                            beacon.control_port = port;
+                            if let Ok(payload) = serde_json::to_vec(&beacon) {
+                                let target = SocketAddr::V4(SocketAddrV4::new(
+                                    LAN_DISCOVERY_MULTICAST,
+                                    LAN_DISCOVERY_PORT,
+                                ));
+                                let _ = socket.send_to(&payload, target).await;
+                            }
+                        }
+                        continue;
+                    }
+                    result = async {
+                        match fallback_socket.as_ref() {
+                            Some(socket) => Some(socket.recv_from(&mut fallback_buffer).await),
+                            None => None,
+                        }
+                    }, if fallback_socket.is_some() => {
+                        let Some(Ok((size, source))) = result else { continue; };
+                        let Ok(beacon) = serde_json::from_slice::<LanBeacon>(&fallback_buffer[..size]) else {
+                            continue;
+                        };
+                        if beacon.version != 1
+                            || beacon.group_id != own_group_id
+                            || beacon.node_id == own_node_id
+                            || beacon.control_port == 0
+                            || beacon.proof != proof_for(&invite_secret, &beacon.group_id, &beacon.node_id)
+                        {
+                            continue;
+                        }
+                        let Ok(peer_id) = PeerId::from_str(&beacon.peer_id) else {
+                            continue;
+                        };
+                        let IpAddr::V4(ip) = source.ip() else {
+                            continue;
+                        };
+                        let address: Multiaddr = format!(
+                            "/ip4/{ip}/tcp/{}/p2p/{peer_id}",
+                            beacon.control_port
+                        )
+                        .parse()
+                        .expect("validated StarBridge fallback address");
+                        let changed = discovered.get(&peer_id) != Some(&address);
+                        discovered.insert(peer_id, address.clone());
+                        if changed && !connected_addresses.contains_key(&peer_id) {
+                            let _ = swarm.dial(address);
                         }
                         continue;
                     }
@@ -793,6 +939,9 @@ impl LanRuntime {
                     }
                     SwarmEvent::NewListenAddr { address, .. } => {
                         tracing::debug!(%address, "LAN control listener ready");
+                        if control_port.is_none() {
+                            control_port = socket_address(&address).map(|(_, port)| port);
+                        }
                     }
                     SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                         tracing::debug!(?peer_id, %error, "LAN control dial failed");
@@ -845,6 +994,10 @@ impl LanRuntime {
             .occupancy
             .write()
             .unwrap_or_else(|error| error.into_inner()) = None;
+        *self
+            .discovery
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = LanDiscoveryStatus::default();
     }
 
     pub(crate) fn dial_address(&self, address: &str) -> anyhow::Result<()> {
@@ -923,6 +1076,20 @@ impl LanRuntime {
         };
         self.start(profile)
     }
+}
+
+fn create_fallback_discovery_socket() -> anyhow::Result<UdpSocket> {
+    let socket = Socket2::new(Domain::IPV4, Type::DGRAM, Some(SocketProtocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    socket.bind(
+        &SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, LAN_DISCOVERY_PORT)
+            .into(),
+    )?;
+    socket.join_multicast_v4(&LAN_DISCOVERY_MULTICAST, &Ipv4Addr::UNSPECIFIED)?;
+    socket.set_multicast_ttl_v4(1)?;
+    socket.set_nonblocking(true)?;
+    let socket: StdUdpSocket = socket.into();
+    Ok(UdpSocket::from_std(socket)?)
 }
 
 fn parse_announcement(value: &str) -> Option<LanAnnouncement> {
@@ -1172,6 +1339,8 @@ mod tests {
     fn permanent_invite_round_trips_without_exposing_group_secret_in_discovery() {
         let profile = LanProfile::new("星桥实验组".into(), "node-a".into(), "办公本".into());
         let code = profile.invite_code();
+        assert_eq!(code.len(), INVITE_CODE_LEN);
+        assert!(code.chars().all(|value| value.is_ascii_digit()));
         let joined = LanProfile::from_invite(&code, "node-b".into(), "测试机".into()).unwrap();
         assert_eq!(joined.group_id, profile.group_id);
         assert_eq!(joined.invite_secret, profile.invite_secret);
@@ -1181,7 +1350,20 @@ mod tests {
 
     #[test]
     fn malformed_invite_is_rejected() {
-        assert!(LanProfile::from_invite("SB1-NOT-A-CODE", "node".into(), "name".into()).is_err());
+        assert!(LanProfile::from_invite("12345", "node".into(), "name".into()).is_err());
+        assert!(LanProfile::from_invite("12345A", "node".into(), "name".into()).is_err());
+    }
+
+    #[test]
+    fn legacy_invite_profile_migrates_to_a_stable_six_digit_code() {
+        let mut profile = LanProfile::new("group".into(), "node-a".into(), "a".into());
+        profile.invite_secret = "legacy-secret".into();
+        profile.group_id = "legacy-group".into();
+        assert!(profile.migrate_invite_code());
+        assert_eq!(profile.invite_code().len(), INVITE_CODE_LEN);
+        assert!(profile.invite_code().chars().all(|value| value.is_ascii_digit()));
+        assert_eq!(profile.group_id, group_id_for_invite_secret(&profile.invite_secret));
+        assert!(!profile.migrate_invite_code());
     }
 
     #[test]
