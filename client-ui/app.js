@@ -613,7 +613,9 @@
   function workModeCards() {
     return h('div', { class: 'work-mode-cards', role: 'radiogroup', 'aria-label': t("工作模式"), 'data-key': 'work-mode-cards' },
       ['internet', 'lan'].map(mode => { const info = workModeInfo(mode); const current = ui.workMode === mode; return h('button', { type: 'button', class: `work-mode-card${current ? ' chosen' : ''}`, 'data-action': 'select-work-mode', 'data-mode': mode, 'data-context': 'auth', 'aria-pressed': String(current) },
-        h('span', { class: 'work-mode-icon', 'aria-hidden': 'true' }, info.icon), h('span', { class: 'work-mode-copy' }, h('strong', {}, info.label), h('span', {}, info.short))); }));
+        h('span', { class: 'work-mode-icon', 'aria-hidden': 'true' }, info.icon),
+        h('span', { class: 'work-mode-copy' }, h('strong', {}, info.label), h('span', { class: 'work-mode-short' }, info.short), h('span', { class: 'work-mode-description' }, info.description)),
+        current ? h('span', { class: 'work-mode-check', 'aria-hidden': 'true' }, icon('check')) : null); }));
   }
   function workModeMenu() {
     return h('div', { class: 'work-mode-menu', role: 'menu', 'aria-label': t("切换工作模式"), 'data-key': 'work-mode-menu' },
