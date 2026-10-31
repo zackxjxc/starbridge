@@ -42,7 +42,7 @@
   const routes = {
     client_version: ['GET', '/api/health'],
     client_state: ['GET', '/api/v1/state'], client_lan_state: ['GET', '/api/v1/lan/state'], client_config: ['GET', '/api/v1/config'],
-    client_lan_create: ['POST', '/api/v1/lan/create'], client_lan_join: ['POST', '/api/v1/lan/join'], client_lan_leave: ['POST', '/api/v1/lan/leave'], client_lan_pause: ['POST', '/api/v1/lan/pause'], client_lan_resume: ['POST', '/api/v1/lan/resume'], client_lan_add_peer: ['POST', '/api/v1/lan/peers'],
+    client_lan_create: ['POST', '/api/v1/lan/create'], client_lan_join: ['POST', '/api/v1/lan/join'], client_lan_leave: ['POST', '/api/v1/lan/leave'], client_lan_pause: ['POST', '/api/v1/lan/pause'], client_lan_resume: ['POST', '/api/v1/lan/resume'], client_lan_add_peer: ['POST', '/api/v1/lan/peers'], client_lan_connect_all: ['POST', '/api/v1/lan/connect-all'],
     client_save_config: ['PUT', '/api/v1/config'], client_login: ['POST', '/api/v1/login'],
     client_register: ['POST', '/api/v1/register'], client_logout: ['POST', '/api/v1/logout'],
     client_update_device: ['PUT', '/api/v1/devices'], client_connect: ['POST', '/api/v1/connect'],
@@ -622,21 +622,21 @@
       ['internet', 'lan'].map(mode => { const info = workModeInfo(mode); const current = ui.workMode === mode; return button([h('span', { class: 'work-mode-menu-icon', 'aria-hidden': 'true' }, info.icon), h('span', { class: 'work-mode-menu-copy' }, h('strong', {}, info.label), h('span', {}, info.description)), current ? h('span', { class: 'work-mode-check', 'aria-hidden': 'true' }, icon('check')) : null], 'select-work-mode', { class: `work-mode-menu-item${current ? ' current' : ''}`, 'data-mode': mode, 'data-context': 'header', role: 'menuitemradio', 'aria-checked': current }); }));
   }
   function lanMainPage() {
-    const lan = ui.lanSnapshot || {}; const peers = lan.peers || []; const connections = lan.connections || []; const groupName = lan.group_name || peers.find(peer => peer.group_name)?.group_name || t("局域网组");
+    const lan = ui.lanSnapshot || {}; const peers = lan.peers || []; const connections = lan.connections || []; const occupancy = lan.occupancy || null; const groupName = lan.group_name || peers.find(peer => peer.group_name)?.group_name || t("局域网组");
     return h('div', { class: 'shell', 'data-key': 'lan-shell' }, header(false), h('div', { class: 'workspace lan-workspace', 'data-key': 'lan-workspace' },
       h('aside', { class: 'list-pane', 'aria-label': t("局域网设备") },
         h('div', { class: 'list-head' }, h('div', { class: 'list-title' }, h('h2', {}, t("局域网设备")), h('span', { class: 'muted' }, t("在线 {0}", peers.length))),
           h('label', { class: 'search' }, icon('search'), h('input', { type: 'search', placeholder: t("搜索设备"), 'aria-label': t("搜索设备"), disabled: true }))),
-        h('div', { class: 'local-block' }, h('div', { class: 'device-row active' }, h('span', { class: 'glyph' }, icon('monitor')), h('span', { class: 'identity' }, h('span', { class: 'device-name' }, `${lan.nickname || t("本机")}${t("（本机）")}`), h('span', { class: 'device-sub' }, t("在线 · 等待连接"))), h('span', { class: 'row-status good' }, t("在线")))),
-        h('div', { class: 'device-list' }, peers.length ? peers.map(peer => { const connection = connections.find(item => item.node_id === peer.node_id); return h('div', { class: 'device-row', 'data-key': peer.node_id, title: peer.control_address || '' }, h('span', { class: 'glyph' }, icon('monitor')), h('span', { class: 'identity' }, h('span', { class: 'device-name' }, peer.nickname), h('span', { class: 'device-sub' }, connection?.state === 'connected' ? t("已连接 · 可使用 SSH") : t("在线 · 可连接"))), connection?.state === 'connected' ? h('span', { class: 'row-actions' }, button(t("复制 SSH 命令"), 'lan-copy-ssh', { class: 'link', 'data-command': connection.ssh_command }), button(t("断开"), 'lan-disconnect', { class: 'link', 'data-id': peer.node_id })) : connection ? button(t("连接中"), '', { class: 'link', disabled: true }) : button(t("连接"), 'lan-connect', { class: 'link', 'data-id': peer.node_id, disabled: ui.busy.has(`lan-connect-${peer.node_id}`) }), h('span', { class: 'row-status good' }, t("在线"))); }) : h('div', { class: 'empty' }, t("未检测到其他用户"))),
+        h('div', { class: 'local-block' }, h('div', { class: 'device-row active' }, h('span', { class: 'glyph' }, icon('monitor')), h('span', { class: 'identity' }, h('span', { class: 'device-name' }, `${lan.nickname || t("本机")}${t("（本机）")}`), h('span', { class: 'device-sub' }, occupancy ? t("已被 {0} 连接", occupancy.holder_nickname) : t("在线 · 等待连接"))), h('span', { class: `row-status ${occupancy ? 'warn' : 'good'}` }, occupancy ? t("已占用") : t("在线")))),
+        h('div', { class: 'device-list' }, peers.length ? peers.map(peer => { const connection = connections.find(item => item.node_id === peer.node_id); const occupied = peer.occupied_by; return h('div', { class: 'device-row', 'data-key': peer.node_id, title: peer.control_address || '' }, h('span', { class: 'glyph' }, icon('monitor')), h('span', { class: 'identity' }, h('span', { class: 'device-name' }, peer.nickname), h('span', { class: 'device-sub' }, connection?.state === 'connected' ? t("已连接 · 可使用 SSH") : occupied ? t("已被 {0} 连接", occupied.holder_nickname) : t("在线 · 可连接"))), connection?.state === 'connected' ? h('span', { class: 'row-actions' }, button(t("复制 SSH 命令"), 'lan-copy-ssh', { class: 'link', 'data-command': connection.ssh_command }), button(t("断开"), 'lan-disconnect', { class: 'link', 'data-id': peer.node_id })) : connection ? button(t("连接中"), '', { class: 'link', disabled: true }) : button(occupied || occupancy ? t("不可连接") : t("连接"), 'lan-connect', { class: 'link', 'data-id': peer.node_id, disabled: !!occupied || !!occupancy || ui.busy.has(`lan-connect-${peer.node_id}`) }), h('span', { class: `row-status ${occupied ? 'warn' : 'good'}` }, occupied ? t("已占用") : t("在线"))); }) : h('div', { class: 'empty' }, t("未检测到其他用户"))),
         button(t("手动添加设备"), 'lan-manual-add', { class: 'local-test' })),
       h('main', { class: 'detail lan-detail', 'aria-label': t("局域网组信息") },
         heading(groupName, t("已加入局域网组")),
-        banner(t("局域网模式"), peers.length ? t("设备上线后会自动出现在列表中。") : t("当前只有本机在线，正在发现其他设备。"), peers.length ? 'good' : 'warn'),
+        banner(t("局域网模式"), occupancy ? t("本机已被 {0} 连接，暂时不能发起新的连接。", occupancy.holder_nickname) : peers.length ? t("设备上线后会自动出现在列表中。") : t("当前只有本机在线，正在发现其他设备。"), occupancy ? 'warn' : peers.length ? 'good' : 'warn'),
       h('div', { class: 'section' }, h('div', { class: 'section-title' }, h('span', {}, t("永久邀请码")), button(t("复制邀请码"), 'lan-copy-invite', { class: 'link', disabled: !lan.invite_code }, 'copy')),
           h('pre', { class: 'command', 'data-copyable': '' }, lan.invite_code || t("邀请码不可用")),
           h('p', { class: 'muted' }, t("组内设备输入正确的邀请码后即可加入，无需批准。"))),
-        h('div', { class: 'actions bottom' }, button(t("刷新设备"), 'lan-refresh'), button(t("退出局域网"), 'lan-leave', { class: 'button danger' })) )),
+        h('div', { class: 'actions bottom' }, button(t("连接所有可用设备"), 'lan-connect-all', { class: 'button primary', disabled: !!occupancy || !peers.some(peer => peer.online && !peer.occupied_by) }), button(t("刷新设备"), 'lan-refresh'), button(t("退出局域网"), 'lan-leave', { class: 'button danger' })) )),
       h('footer', { class: 'footbar' }, h('span', {}, peers.length ? t("正在发现局域网设备") : t("未检测到其他用户")), h('span', {}, t("组：{0}", groupName))));
   }
   function lanEntryPage() {
@@ -925,6 +925,7 @@
         modal.close(); await mutate('terminate', 'client_terminate', { form: { target_node_id: null } }); ui.workMode = target.dataset.mode; saveWorkMode(ui.workMode); ui.modeMenu = false; ui.modeEntry = ui.workMode === 'internet'; render(); break;
       case 'lan-copy-invite': if (ui.lanSnapshot?.invite_code) await writeClipboard(ui.lanSnapshot.invite_code); break;
       case 'lan-refresh': await refresh(); break;
+      case 'lan-connect-all': ui.busy.add('lan-connect-all'); render(); try { ui.lanSnapshot = await api('client_lan_connect_all'); toast(t("已完成局域网批量连接")); } finally { ui.busy.delete('lan-connect-all'); render(); } break;
       case 'lan-connect': ui.busy.add(`lan-connect-${id}`); render(); try { ui.lanSnapshot = await api('client_lan_connect', { form: { node_id: id } }); toast(t("局域网 SSH 已连接")); } finally { ui.busy.delete(`lan-connect-${id}`); render(); } break;
       case 'lan-disconnect': ui.lanSnapshot = await api('client_lan_disconnect', { form: { node_id: id } }); toast(t("局域网连接已断开")); break;
       case 'lan-copy-ssh': await writeClipboard(target.dataset.command || ''); break;

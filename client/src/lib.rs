@@ -361,13 +361,17 @@ impl ClientApp {
             .iter()
             .map(|peer| peer.node_id.as_str())
             .collect::<HashSet<_>>();
-        let stale_paths = {
+        let (stale_paths, stale_nodes) = {
             let mut connections = self.lan_connections.lock().await;
             let mut stale = Vec::new();
+            let mut stale_nodes = Vec::new();
             connections.retain(|node_id, record| {
-                let keep = online_nodes.contains(node_id.as_str());
+                let pending_too_long = record.view.state == "connecting"
+                    && now_unix().saturating_sub(record.view.connected_at) > 15;
+                let keep = online_nodes.contains(node_id.as_str()) && !pending_too_long;
                 if !keep {
                     stale.push(record.config_path.clone());
+                    stale_nodes.push(node_id.clone());
                 }
                 keep
             });
@@ -375,10 +379,13 @@ impl ClientApp {
                 .values()
                 .map(|record| record.view.clone())
                 .collect();
-            stale
+            (stale, stale_nodes)
         };
         for path in stale_paths {
             let _ = tokio::fs::remove_file(path).await;
+        }
+        for node_id in stale_nodes {
+            let _ = self.lan.release_peer(&node_id).await;
         }
         snapshot
     }
@@ -457,6 +464,9 @@ impl ClientApp {
 
     pub(crate) async fn connect_lan_peer(&self, form: LanConnectForm) -> anyhow::Result<LanSnapshot> {
         self.ensure_lan_runtime().await?;
+        if let Some(occupancy) = self.lan.occupancy() {
+            anyhow::bail!("本机已被 {} 连接，暂时不能发起新的局域网连接", occupancy.holder_nickname);
+        }
         let node_id = form.node_id.trim().to_string();
         let peer = self
             .lan
@@ -471,6 +481,12 @@ impl ClientApp {
             || peer.ssh_host_key.is_empty()
         {
             anyhow::bail!("设备尚未公布可用的 SSH 服务");
+        }
+        if let Some(occupancy) = &peer.occupied_by {
+            anyhow::bail!("设备已被 {} 连接", occupancy.holder_nickname);
+        }
+        if self.lan_connections.lock().await.contains_key(&node_id) {
+            anyhow::bail!("该设备已经存在局域网连接");
         }
         let (root, runtime) = {
             let inner = self.inner.read().await;
@@ -495,11 +511,9 @@ impl ClientApp {
             lan_ssh_client_config(&root, &config_dir, &alias, &peer),
         )
         .await?;
+        self.lan.reserve_peer(&node_id).await?;
         {
             let mut connections = self.lan_connections.lock().await;
-            if connections.contains_key(&node_id) {
-                anyhow::bail!("该设备已经存在局域网连接");
-            }
             connections.insert(
                 node_id.clone(),
                 LanConnectionRecord {
@@ -518,6 +532,8 @@ impl ClientApp {
         let verify = verify_ssh_command(&runtime, &config_path, &alias, &marker).await;
         if let Err(error) = verify {
             self.lan_connections.lock().await.remove(&node_id);
+            let _ = self.lan.release_peer(&node_id).await;
+            let _ = tokio::fs::remove_file(&config_path).await;
             anyhow::bail!("局域网 SSH 连接失败：{error}");
         }
         let ssh_command = format!(
@@ -533,11 +549,35 @@ impl ClientApp {
         Ok(self.lan_snapshot().await)
     }
 
+    pub(crate) async fn connect_lan_all(&self) -> anyhow::Result<LanSnapshot> {
+        if let Some(occupancy) = self.lan.occupancy() {
+            anyhow::bail!("本机已被 {} 连接，暂时不能发起新的局域网连接", occupancy.holder_nickname);
+        }
+        let node_ids = self
+            .lan
+            .snapshot()
+            .peers
+            .into_iter()
+            .filter(|peer| peer.online && peer.occupied_by.is_none())
+            .map(|peer| peer.node_id)
+            .collect::<Vec<_>>();
+        for node_id in node_ids {
+            if let Err(error) = self
+                .connect_lan_peer(LanConnectForm { node_id })
+                .await
+            {
+                tracing::warn!(%error, "局域网批量连接跳过设备");
+            }
+        }
+        Ok(self.lan_snapshot().await)
+    }
+
     pub(crate) async fn disconnect_lan_peer(&self, form: LanDisconnectForm) -> anyhow::Result<LanSnapshot> {
         let node_id = form.node_id.trim().to_string();
         if let Some(connection) = self.lan_connections.lock().await.remove(&node_id) {
             let _ = tokio::fs::remove_file(connection.config_path).await;
         }
+        let _ = self.lan.release_peer(&node_id).await;
         Ok(self.lan_snapshot().await)
     }
 
@@ -860,6 +900,7 @@ impl ClientApp {
             .route("/api/v1/lan/resume", post(lan_resume))
             .route("/api/v1/lan/peers", post(lan_add_peer))
             .route("/api/v1/lan/connect", post(lan_connect))
+            .route("/api/v1/lan/connect-all", post(lan_connect_all))
             .route("/api/v1/lan/disconnect", post(lan_disconnect))
             .route("/api/v1/config", get(get_config).put(update_config))
             .route("/api/v1/login", post(login))
@@ -1261,6 +1302,10 @@ async fn lan_add_peer(State(app): State<ClientApp>, Json(form): Json<LanAddPeerF
 
 async fn lan_connect(State(app): State<ClientApp>, Json(form): Json<LanConnectForm>) -> Result<Json<LanSnapshot>, ApiError> {
     app.connect_lan_peer(form).await.map(Json).map_err(ApiError::internal)
+}
+
+async fn lan_connect_all(State(app): State<ClientApp>) -> Result<Json<LanSnapshot>, ApiError> {
+    app.connect_lan_all().await.map(Json).map_err(ApiError::internal)
 }
 
 async fn lan_disconnect(State(app): State<ClientApp>, Json(form): Json<LanDisconnectForm>) -> Result<Json<LanSnapshot>, ApiError> {

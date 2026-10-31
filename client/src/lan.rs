@@ -3,8 +3,12 @@ use libp2p::{
     identify, identity,
     mdns::{self, Event as MdnsEvent},
     noise, ping,
+    request_response::{
+        self, json, Event as RequestResponseEvent, Message as RequestResponseMessage,
+        OutboundRequestId, ProtocolSupport,
+    },
     swarm::{behaviour::toggle::Toggle, NetworkBehaviour, SwarmEvent},
-    tcp, yamux, Multiaddr, PeerId, SwarmBuilder,
+    tcp, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -14,11 +18,14 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 const LAN_PROTOCOL_VERSION: &str = "/starbridge/lan/1";
 const PRESENCE_TIMEOUT_SECS: u64 = 15;
+const OCCUPANCY_TIMEOUT_SECS: u64 = 20;
+const LAN_CONTROL_PROTOCOL: &str = "/starbridge/lan/control/1";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct LanProfile {
@@ -157,6 +164,7 @@ pub(crate) struct LanPeer {
     pub ssh_user: String,
     pub ssh_public_key: String,
     pub ssh_host_key: String,
+    pub occupied_by: Option<LanOccupancy>,
     pub online: bool,
     pub last_seen: u64,
 }
@@ -169,6 +177,7 @@ pub(crate) struct LanSnapshot {
     pub invite_code: Option<String>,
     pub node_id: Option<String>,
     pub nickname: Option<String>,
+    pub occupancy: Option<LanOccupancy>,
     pub peers: Vec<LanPeer>,
     pub connections: Vec<LanConnection>,
 }
@@ -180,6 +189,68 @@ pub(crate) struct LanConnection {
     pub ssh_command: String,
     pub state: String,
     pub connected_at: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct LanOccupancy {
+    pub holder_node_id: String,
+    pub holder_nickname: String,
+    pub since: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+enum LanControlRequest {
+    Reserve {
+        group_id: String,
+        requester_node_id: String,
+        requester_nickname: String,
+        proof: String,
+    },
+    Release {
+        group_id: String,
+        requester_node_id: String,
+        proof: String,
+    },
+    KeepAlive {
+        group_id: String,
+        requester_node_id: String,
+        proof: String,
+    },
+    Status {
+        group_id: String,
+        node_id: String,
+        proof: String,
+        occupancy: Option<LanOccupancy>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LanControlResponse {
+    accepted: bool,
+    message: String,
+    occupancy: Option<LanOccupancy>,
+}
+
+type LanControlBehaviour = json::Behaviour<LanControlRequest, LanControlResponse>;
+type LanControlEvent = RequestResponseEvent<LanControlRequest, LanControlResponse>;
+
+#[derive(Debug)]
+enum LanCommand {
+    Dial(Multiaddr),
+    Reserve {
+        node_id: String,
+        response: oneshot::Sender<anyhow::Result<LanOccupancy>>,
+    },
+    Release {
+        node_id: String,
+        response: oneshot::Sender<anyhow::Result<()>>,
+    },
+}
+
+#[derive(Clone)]
+struct LeaseState {
+    view: LanOccupancy,
+    last_seen: u64,
 }
 
 #[derive(Clone)]
@@ -194,6 +265,7 @@ struct ControlBehaviour {
     mdns: Toggle<mdns::tokio::Behaviour>,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
+    control: LanControlBehaviour,
 }
 
 #[derive(Debug)]
@@ -201,6 +273,7 @@ enum ControlEvent {
     Mdns(MdnsEvent),
     Identify(identify::Event),
     Ping(ping::Event),
+    Control(LanControlEvent),
 }
 
 impl From<MdnsEvent> for ControlEvent {
@@ -221,11 +294,18 @@ impl From<ping::Event> for ControlEvent {
     }
 }
 
+impl From<LanControlEvent> for ControlEvent {
+    fn from(event: LanControlEvent) -> Self {
+        Self::Control(event)
+    }
+}
+
 pub(crate) struct LanRuntime {
     profile: RwLock<Option<LanProfile>>,
     peers: Arc<RwLock<HashMap<String, PeerRecord>>>,
+    occupancy: Arc<RwLock<Option<LeaseState>>>,
     listener: Mutex<Option<JoinHandle<()>>>,
-    dialer: Mutex<Option<UnboundedSender<Multiaddr>>>,
+    commands: Mutex<Option<UnboundedSender<LanCommand>>>,
 }
 
 impl LanRuntime {
@@ -233,8 +313,9 @@ impl LanRuntime {
         Self {
             profile: RwLock::new(None),
             peers: Arc::new(RwLock::new(HashMap::new())),
+            occupancy: Arc::new(RwLock::new(None)),
             listener: Mutex::new(None),
-            dialer: Mutex::new(None),
+            commands: Mutex::new(None),
         }
     }
 
@@ -252,6 +333,13 @@ impl LanRuntime {
     pub(crate) fn snapshot(&self) -> LanSnapshot {
         let profile = self.profile();
         let now = unix_now();
+        let occupancy = {
+            let current = self
+                .occupancy
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            current.as_ref().map(|lease| lease.view.clone())
+        };
         let mut peers = self
             .peers
             .write()
@@ -274,6 +362,7 @@ impl LanRuntime {
             invite_code: profile.as_ref().map(LanProfile::invite_code),
             node_id: profile.as_ref().map(|value| value.node_id.clone()),
             nickname: profile.as_ref().map(|value| value.nickname.clone()),
+            occupancy,
             peers: items,
             connections: Vec::new(),
         }
@@ -283,6 +372,7 @@ impl LanRuntime {
         self.stop_discovery();
         let own_group_id = profile.group_id.clone();
         let own_node_id = profile.node_id.clone();
+        let own_nickname = profile.nickname.clone();
         let invite_secret = profile.invite_secret.clone();
         let own_profile = profile.clone();
         let keypair = profile.control_keypair();
@@ -309,6 +399,13 @@ impl LanRuntime {
         let identify_config =
             identify::Config::new(LAN_PROTOCOL_VERSION.to_string(), keypair.public())
                 .with_agent_version(format!("starbridge-lan {announcement}"));
+        let control = LanControlBehaviour::new(
+            [(
+                StreamProtocol::new(LAN_CONTROL_PROTOCOL),
+                ProtocolSupport::Full,
+            )],
+            request_response::Config::default(),
+        );
         let mut swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_tcp(
@@ -324,6 +421,7 @@ impl LanRuntime {
                         .with_interval(Duration::from_secs(5))
                         .with_timeout(Duration::from_secs(10)),
                 ),
+                control,
             })?
             .with_swarm_config(|config| {
                 // Ping is the liveness signal. Keep the libp2p connection alive
@@ -334,13 +432,83 @@ impl LanRuntime {
         swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
 
         let peers = Arc::clone(&self.peers);
-        let (dial_tx, mut dial_rx) = mpsc::unbounded_channel();
+        let occupancy = Arc::clone(&self.occupancy);
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
         let listener = tokio::spawn(async move {
             let mut discovered = HashMap::<PeerId, Multiaddr>::new();
+            let mut pending = HashMap::<OutboundRequestId, LanCommand>::new();
+            let mut outgoing = HashMap::<String, (PeerId, LanOccupancy)>::new();
+            let mut keepalive = tokio::time::interval(Duration::from_secs(5));
             loop {
                 let event = tokio::select! {
-                    Some(address) = dial_rx.recv() => {
-                        let _ = swarm.dial(address);
+                    Some(command) = command_rx.recv() => {
+                        match command {
+                            LanCommand::Dial(address) => { let _ = swarm.dial(address); }
+                            LanCommand::Reserve { node_id, response } => {
+                                let Some(record) = peers.read().unwrap_or_else(|error| error.into_inner()).get(&node_id).cloned() else {
+                                    let _ = response.send(Err(anyhow::anyhow!("设备当前离线，已从列表移除")));
+                                    continue;
+                                };
+                                let request = LanControlRequest::Reserve {
+                                    group_id: own_group_id.clone(),
+                                    requester_node_id: own_node_id.clone(),
+                                    requester_nickname: own_nickname.clone(),
+                                    proof: proof_for(&invite_secret, &own_group_id, &own_node_id),
+                                };
+                                let request_id = swarm.behaviour_mut().control.send_request(&record.control_peer_id, request);
+                                pending.insert(request_id, LanCommand::Reserve { node_id, response });
+                            }
+                            LanCommand::Release { node_id, response } => {
+                                if let Some((peer_id, _)) = outgoing.remove(&node_id) {
+                                    let request = LanControlRequest::Release {
+                                        group_id: own_group_id.clone(),
+                                        requester_node_id: own_node_id.clone(),
+                                        proof: proof_for(&invite_secret, &own_group_id, &own_node_id),
+                                    };
+                                    let request_id = swarm.behaviour_mut().control.send_request(&peer_id, request);
+                                    pending.insert(request_id, LanCommand::Release { node_id, response });
+                                } else {
+                                    let _ = response.send(Ok(()));
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    _ = keepalive.tick() => {
+                        let expired = occupancy
+                            .read()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .as_ref()
+                            .map(|lease| unix_now().saturating_sub(lease.last_seen) > OCCUPANCY_TIMEOUT_SECS)
+                            .unwrap_or(false);
+                        if expired {
+                            *occupancy
+                                .write()
+                                .unwrap_or_else(|error| error.into_inner()) = None;
+                            let status = LanControlRequest::Status {
+                                group_id: own_group_id.clone(),
+                                node_id: own_node_id.clone(),
+                                proof: proof_for(&invite_secret, &own_group_id, &own_node_id),
+                                occupancy: None,
+                            };
+                            let targets: Vec<_> = peers
+                                .read()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .values()
+                                .map(|record| record.control_peer_id)
+                                .collect();
+                            for target in targets {
+                                let _ = swarm.behaviour_mut().control.send_request(&target, status.clone());
+                            }
+                        }
+                        for (peer_id, _) in outgoing.values() {
+                            let request = LanControlRequest::KeepAlive {
+                                group_id: own_group_id.clone(),
+                                requester_node_id: own_node_id.clone(),
+                                proof: proof_for(&invite_secret, &own_group_id, &own_node_id),
+                            };
+                            let _ = swarm.behaviour_mut().control.send_request(peer_id, request);
+                        }
                         continue;
                     }
                     event = swarm.next() => event,
@@ -417,13 +585,140 @@ impl LanRuntime {
                                         ssh_user: announcement.ssh_user,
                                         ssh_public_key: announcement.ssh_public_key,
                                         ssh_host_key: announcement.ssh_host_key,
+                                        occupied_by: None,
                                         online: true,
                                         last_seen: unix_now(),
                                     },
                                     control_peer_id: peer_id,
                                 },
                             );
+                        let status = LanControlRequest::Status {
+                            group_id: own_group_id.clone(),
+                            node_id: own_node_id.clone(),
+                            proof: proof_for(&invite_secret, &own_group_id, &own_node_id),
+                            occupancy: occupancy_view(&occupancy),
+                        };
+                        let _ = swarm.behaviour_mut().control.send_request(&peer_id, status);
                     }
+                    SwarmEvent::Behaviour(ControlEvent::Control(event)) => match event {
+                        RequestResponseEvent::Message { peer, message, .. } => match message {
+                            RequestResponseMessage::Request {
+                                request, channel, ..
+                            } => {
+                                let response = handle_incoming_control_request(
+                                    &peers,
+                                    &occupancy,
+                                    peer,
+                                    request,
+                                    &own_group_id,
+                                    &invite_secret,
+                                );
+                                let changed = response.1;
+                                let _ = swarm
+                                    .behaviour_mut()
+                                    .control
+                                    .send_response(channel, response.0);
+                                if changed {
+                                    let status = LanControlRequest::Status {
+                                        group_id: own_group_id.clone(),
+                                        node_id: own_node_id.clone(),
+                                        proof: proof_for(
+                                            &invite_secret,
+                                            &own_group_id,
+                                            &own_node_id,
+                                        ),
+                                        occupancy: occupancy_view(&occupancy),
+                                    };
+                                    let targets: Vec<_> = peers
+                                        .read()
+                                        .unwrap_or_else(|error| error.into_inner())
+                                        .values()
+                                        .map(|record| record.control_peer_id)
+                                        .filter(|target| *target != peer)
+                                        .collect();
+                                    for target in targets {
+                                        let _ = swarm
+                                            .behaviour_mut()
+                                            .control
+                                            .send_request(&target, status.clone());
+                                    }
+                                }
+                            }
+                            RequestResponseMessage::Response {
+                                request_id,
+                                response,
+                            } => {
+                                if let Some(command) = pending.remove(&request_id) {
+                                    let accepted = response.accepted;
+                                    let message = response.message.clone();
+                                    match command {
+                                        LanCommand::Reserve {
+                                            node_id,
+                                            response: reply,
+                                        } => {
+                                            if accepted {
+                                                let lease =
+                                                    response.occupancy.unwrap_or(LanOccupancy {
+                                                        holder_node_id: own_node_id.clone(),
+                                                        holder_nickname: own_nickname.clone(),
+                                                        since: unix_now(),
+                                                    });
+                                                outgoing
+                                                    .insert(node_id.clone(), (peer, lease.clone()));
+                                                if let Some(record) = peers
+                                                    .write()
+                                                    .unwrap_or_else(|error| error.into_inner())
+                                                    .get_mut(&node_id)
+                                                {
+                                                    record.peer.occupied_by = Some(lease.clone());
+                                                }
+                                                let _ = reply.send(Ok(lease));
+                                            } else {
+                                                let _ = reply.send(Err(anyhow::anyhow!(message)));
+                                            }
+                                        }
+                                        LanCommand::Release {
+                                            node_id,
+                                            response: reply,
+                                        } => {
+                                            if let Some(record) = peers
+                                                .write()
+                                                .unwrap_or_else(|error| error.into_inner())
+                                                .get_mut(&node_id)
+                                            {
+                                                record.peer.occupied_by = None;
+                                            }
+                                            let _ = reply.send(if accepted {
+                                                Ok(())
+                                            } else {
+                                                Err(anyhow::anyhow!(message))
+                                            });
+                                        }
+                                        LanCommand::Dial(_) => {}
+                                    }
+                                } else {
+                                    update_peer_occupancy(&peers, peer, response.occupancy);
+                                }
+                            }
+                        },
+                        RequestResponseEvent::OutboundFailure {
+                            request_id, error, ..
+                        } => {
+                            if let Some(command) = pending.remove(&request_id) {
+                                let message = anyhow::anyhow!("局域网控制请求失败：{error}");
+                                match command {
+                                    LanCommand::Reserve { response, .. } => {
+                                        let _ = response.send(Err(message));
+                                    }
+                                    LanCommand::Release { response, .. } => {
+                                        let _ = response.send(Err(message));
+                                    }
+                                    LanCommand::Dial(_) => {}
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
                     SwarmEvent::Behaviour(ControlEvent::Ping(ping::Event {
                         peer,
                         result: Ok(_),
@@ -444,10 +739,46 @@ impl LanRuntime {
                     }
                     SwarmEvent::ConnectionClosed { peer_id, .. } => {
                         tracing::debug!(%peer_id, "LAN control connection closed");
+                        let disconnected_nodes: Vec<_> = peers
+                            .read()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .values()
+                            .filter(|record| record.control_peer_id == peer_id)
+                            .map(|record| record.peer.node_id.clone())
+                            .collect();
                         peers
                             .write()
                             .unwrap_or_else(|error| error.into_inner())
                             .retain(|_, record| record.control_peer_id != peer_id);
+                        if occupancy_holder_matches_peer(&occupancy, &disconnected_nodes) {
+                            *occupancy.write().unwrap_or_else(|error| error.into_inner()) = None;
+                            let status = LanControlRequest::Status {
+                                group_id: own_group_id.clone(),
+                                node_id: own_node_id.clone(),
+                                proof: proof_for(&invite_secret, &own_group_id, &own_node_id),
+                                occupancy: None,
+                            };
+                            let targets: Vec<_> = peers
+                                .read()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .values()
+                                .map(|record| record.control_peer_id)
+                                .collect();
+                            for target in targets {
+                                let _ = swarm
+                                    .behaviour_mut()
+                                    .control
+                                    .send_request(&target, status.clone());
+                            }
+                        }
+                        outgoing.retain(|node_id, (target, _)| {
+                            if *target == peer_id {
+                                tracing::debug!(%node_id, "LAN outbound occupancy released after control disconnect");
+                                false
+                            } else {
+                                true
+                            }
+                        });
                     }
                     SwarmEvent::NewListenAddr { address, .. } => {
                         tracing::debug!(%address, "LAN control listener ready");
@@ -468,9 +799,9 @@ impl LanRuntime {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(listener);
         *self
-            .dialer
+            .commands
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(dial_tx);
+            .unwrap_or_else(|error| error.into_inner()) = Some(command_tx);
         Ok(())
     }
 
@@ -483,7 +814,7 @@ impl LanRuntime {
     }
 
     pub(crate) fn stop_discovery(&self) {
-        self.dialer
+        self.commands
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take();
@@ -499,6 +830,10 @@ impl LanRuntime {
             .write()
             .unwrap_or_else(|error| error.into_inner())
             .clear();
+        *self
+            .occupancy
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = None;
     }
 
     pub(crate) fn dial_address(&self, address: &str) -> anyhow::Result<()> {
@@ -506,14 +841,58 @@ impl LanRuntime {
             .parse()
             .map_err(|error| anyhow::anyhow!("手动设备地址无效：{error}"))?;
         let sender = self
-            .dialer
+            .commands
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone()
             .ok_or_else(|| anyhow::anyhow!("局域网发现尚未启动"))?;
         sender
-            .send(address)
+            .send(LanCommand::Dial(address))
             .map_err(|_| anyhow::anyhow!("局域网控制通道已停止"))
+    }
+
+    pub(crate) fn occupancy(&self) -> Option<LanOccupancy> {
+        self.snapshot().occupancy
+    }
+
+    pub(crate) async fn reserve_peer(&self, node_id: &str) -> anyhow::Result<LanOccupancy> {
+        let sender = self
+            .commands
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("局域网控制通道已停止"))?;
+        let (response_tx, response_rx) = oneshot::channel();
+        sender
+            .send(LanCommand::Reserve {
+                node_id: node_id.to_string(),
+                response: response_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("局域网控制通道已停止"))?;
+        tokio::time::timeout(Duration::from_secs(5), response_rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("等待局域网设备占用确认超时"))?
+            .map_err(|_| anyhow::anyhow!("局域网设备占用确认通道已关闭"))?
+    }
+
+    pub(crate) async fn release_peer(&self, node_id: &str) -> anyhow::Result<()> {
+        let sender = self
+            .commands
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("局域网控制通道已停止"))?;
+        let (response_tx, response_rx) = oneshot::channel();
+        sender
+            .send(LanCommand::Release {
+                node_id: node_id.to_string(),
+                response: response_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("局域网控制通道已停止"))?;
+        tokio::time::timeout(Duration::from_secs(5), response_rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("等待局域网设备释放超时"))?
+            .map_err(|_| anyhow::anyhow!("局域网设备释放通道已关闭"))?
     }
 
     pub(crate) fn replace_profile(&self, profile: LanProfile) -> anyhow::Result<()> {
@@ -553,6 +932,208 @@ fn socket_address(address: &Multiaddr) -> Option<(String, u16)> {
         }
     }
     Some((host?, port?))
+}
+
+fn occupancy_view(occupancy: &Arc<RwLock<Option<LeaseState>>>) -> Option<LanOccupancy> {
+    occupancy
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        .map(|lease| lease.view.clone())
+}
+
+fn occupancy_holder_matches_peer(
+    occupancy: &Arc<RwLock<Option<LeaseState>>>,
+    node_ids: &[String],
+) -> bool {
+    occupancy
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        .map(|lease| {
+            node_ids
+                .iter()
+                .any(|node_id| node_id == &lease.view.holder_node_id)
+        })
+        .unwrap_or(false)
+}
+
+fn update_peer_occupancy(
+    peers: &Arc<RwLock<HashMap<String, PeerRecord>>>,
+    control_peer_id: PeerId,
+    occupancy: Option<LanOccupancy>,
+) {
+    for record in peers
+        .write()
+        .unwrap_or_else(|error| error.into_inner())
+        .values_mut()
+    {
+        if record.control_peer_id == control_peer_id {
+            record.peer.occupied_by = occupancy.clone();
+        }
+    }
+}
+
+fn handle_incoming_control_request(
+    peers: &Arc<RwLock<HashMap<String, PeerRecord>>>,
+    occupancy: &Arc<RwLock<Option<LeaseState>>>,
+    control_peer_id: PeerId,
+    request: LanControlRequest,
+    own_group_id: &str,
+    invite_secret: &str,
+) -> (LanControlResponse, bool) {
+    let now = unix_now();
+    let peer_node_id = peers
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .values()
+        .find(|record| record.control_peer_id == control_peer_id)
+        .map(|record| record.peer.node_id.clone());
+    let Some(peer_node_id) = peer_node_id else {
+        return (
+            LanControlResponse {
+                accepted: false,
+                message: "局域网设备尚未完成身份握手".into(),
+                occupancy: occupancy_view(occupancy),
+            },
+            false,
+        );
+    };
+    let proof_valid = |node_id: &str, proof: &str| {
+        node_id == peer_node_id && proof_for(invite_secret, own_group_id, node_id) == proof
+    };
+    let mut changed = false;
+    let response = match request {
+        LanControlRequest::Reserve {
+            group_id,
+            requester_node_id,
+            requester_nickname,
+            proof,
+        } => {
+            if group_id != own_group_id || !proof_valid(&requester_node_id, &proof) {
+                LanControlResponse {
+                    accepted: false,
+                    message: "局域网组凭据无效".into(),
+                    occupancy: occupancy_view(occupancy),
+                }
+            } else {
+                let mut current = occupancy.write().unwrap_or_else(|error| error.into_inner());
+                if let Some(lease) = current.as_mut() {
+                    if lease.view.holder_node_id == requester_node_id {
+                        lease.last_seen = now;
+                        LanControlResponse {
+                            accepted: true,
+                            message: "设备已由本机占用".into(),
+                            occupancy: Some(lease.view.clone()),
+                        }
+                    } else {
+                        LanControlResponse {
+                            accepted: false,
+                            message: format!("设备已被 {} 连接", lease.view.holder_nickname),
+                            occupancy: Some(lease.view.clone()),
+                        }
+                    }
+                } else {
+                    let view = LanOccupancy {
+                        holder_node_id: requester_node_id,
+                        holder_nickname: requester_nickname,
+                        since: now,
+                    };
+                    *current = Some(LeaseState {
+                        view: view.clone(),
+                        last_seen: now,
+                    });
+                    changed = true;
+                    LanControlResponse {
+                        accepted: true,
+                        message: "设备占用成功".into(),
+                        occupancy: Some(view),
+                    }
+                }
+            }
+        }
+        LanControlRequest::Release {
+            group_id,
+            requester_node_id,
+            proof,
+        } => {
+            if group_id != own_group_id || !proof_valid(&requester_node_id, &proof) {
+                LanControlResponse {
+                    accepted: false,
+                    message: "局域网组凭据无效".into(),
+                    occupancy: occupancy_view(occupancy),
+                }
+            } else {
+                let mut current = occupancy.write().unwrap_or_else(|error| error.into_inner());
+                if current
+                    .as_ref()
+                    .map(|lease| lease.view.holder_node_id == requester_node_id)
+                    .unwrap_or(false)
+                {
+                    *current = None;
+                    changed = true;
+                    LanControlResponse {
+                        accepted: true,
+                        message: "设备占用已释放".into(),
+                        occupancy: None,
+                    }
+                } else {
+                    LanControlResponse {
+                        accepted: true,
+                        message: "设备占用已经释放".into(),
+                        occupancy: occupancy_view(occupancy),
+                    }
+                }
+            }
+        }
+        LanControlRequest::KeepAlive {
+            group_id,
+            requester_node_id,
+            proof,
+        } => {
+            if group_id != own_group_id || !proof_valid(&requester_node_id, &proof) {
+                LanControlResponse {
+                    accepted: false,
+                    message: "局域网组凭据无效".into(),
+                    occupancy: occupancy_view(occupancy),
+                }
+            } else {
+                let mut current = occupancy.write().unwrap_or_else(|error| error.into_inner());
+                if let Some(lease) = current.as_mut() {
+                    if lease.view.holder_node_id == requester_node_id {
+                        lease.last_seen = now;
+                    }
+                }
+                LanControlResponse {
+                    accepted: true,
+                    message: "占用仍然有效".into(),
+                    occupancy: current.as_ref().map(|lease| lease.view.clone()),
+                }
+            }
+        }
+        LanControlRequest::Status {
+            group_id,
+            node_id,
+            proof,
+            occupancy: remote_occupancy,
+        } => {
+            if group_id != own_group_id || !proof_valid(&node_id, &proof) {
+                LanControlResponse {
+                    accepted: false,
+                    message: "局域网组凭据无效".into(),
+                    occupancy: occupancy_view(occupancy),
+                }
+            } else {
+                update_peer_occupancy(peers, control_peer_id, remote_occupancy);
+                LanControlResponse {
+                    accepted: true,
+                    message: "状态已同步".into(),
+                    occupancy: occupancy_view(occupancy),
+                }
+            }
+        }
+    };
+    (response, changed)
 }
 
 fn proof_for(invite_secret: &str, group_id: &str, node_id: &str) -> String {
