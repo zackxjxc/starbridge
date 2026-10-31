@@ -53,7 +53,7 @@ class PortablePackageTests(unittest.TestCase):
     def test_portable_archive_contains_client_and_licenses(self):
         self.assertEqual(self.package(), 0)
         self.assertEqual((self.output / "starbridge.exe").read_bytes(), b"test-client")
-        self.assertEqual((self.output / self.session_launcher.name).read_bytes(), b"test-session-launcher")
+        self.assertEqual((self.output / "bin" / self.session_launcher.name).read_bytes(), b"test-session-launcher")
         self.assertFalse((self.output / "runtime" / "frps.exe").exists())
         manifest = json.loads((self.output / "runtime" / "runtime-manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(len(manifest), 1)
@@ -68,8 +68,8 @@ class PortablePackageTests(unittest.TestCase):
         self.assertIn("双击 starbridge.exe", readme)
         self.assertNotIn(".bat", readme)
         self.assertEqual({path.name for path in self.output.iterdir()},
-                         {"starbridge.exe", "starbridge-ssh-session.exe", "README.txt", "runtime", "licenses"})
-        expected_files = {"starbridge.exe", "starbridge-ssh-session.exe", "README.txt", "runtime/runtime-manifest.json"}
+                         {"starbridge.exe", "bin", "README.txt", "runtime", "licenses"})
+        expected_files = {"starbridge.exe", "bin/starbridge-ssh-session.exe", "README.txt", "runtime/runtime-manifest.json"}
         expected_files.update(f"runtime/{name}" for name in package_windows.CLIENT_RUNTIME)
         for component, (_, names) in package_windows.LICENSES.items():
             expected_files.update(f"licenses/{component}/{name}" for name in names)
@@ -78,7 +78,7 @@ class PortablePackageTests(unittest.TestCase):
         with zipfile.ZipFile(self.output.with_suffix(".zip")) as archive:
             self.assertIsNone(archive.testzip())
             self.assertEqual({name.split("/")[0] for name in archive.namelist()},
-                             {"starbridge.exe", "starbridge-ssh-session.exe", "README.txt", "runtime", "licenses"})
+                             {"starbridge.exe", "bin", "README.txt", "runtime", "licenses"})
             self.assertEqual({entry.filename for entry in archive.infolist() if not entry.is_dir()},
                              expected_files)
             for name in expected_files:

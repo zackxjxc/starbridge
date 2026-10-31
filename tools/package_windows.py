@@ -99,9 +99,11 @@ def main() -> int:
     if args.output.exists():
         shutil.rmtree(args.output)
     runtime = args.output / "runtime"
+    bin_dir = args.output / "bin"
     runtime.mkdir(parents=True)
+    bin_dir.mkdir(parents=True)
     shutil.copy2(args.binary, args.output / "starbridge.exe")
-    shutil.copy2(session_launcher, args.output / session_launcher.name)
+    shutil.copy2(session_launcher, bin_dir / session_launcher.name)
     for name in CLIENT_RUNTIME:
         shutil.copy2(args.runtime / name, runtime / name)
     # Publish only runtime metadata, never unrelated fields from a used directory.

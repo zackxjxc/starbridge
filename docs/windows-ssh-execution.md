@@ -4,7 +4,7 @@ StarBridge 内置的 Windows OpenSSH 以当前用户运行。仅给最外层 `ss
 `CREATE_NO_WINDOW` 不足以避免远程命令弹窗：OpenSSH 会分离认证前后会话进程的控制台，
 之后的 `cmd.exe` 可能重新创建可见窗口。`ssh -T` 只关闭 PTY 请求，不控制 Windows 窗口。
 
-Windows 客户端通过 `SshdSessionPath` 指定随包提供的 `starbridge-ssh-session.exe`。
+Windows 客户端通过 `SshdSessionPath` 指定随包提供的 `bin/starbridge-ssh-session.exe`。
 这个 GUI 子系统启动器使用 `CREATE_NEW_CONSOLE` 和创建时的 `SW_HIDE` 启动官方
 `sshd-session.exe`，让普通 shell 和控制台程序继承隐藏控制台。它保留 OpenSSH 传入的
 标准句柄和 CRT 文件描述符表，并等待会话退出、返回原始退出码。启动原程序时保留启动器
@@ -15,7 +15,7 @@ Windows 客户端通过 `SshdSessionPath` 指定随包提供的 `starbridge-ssh-
 macOS/Linux 继续使用原有启动方式；`STARBRIDGE_SSH_PORT` 指定的外部 SSH 服务由该服务负责窗口行为。
 
 构建 Windows 客户端时执行 `cargo build --locked --release -p starbridge-client`，
-同时生成客户端和会话启动器。便携包包含两者；请完整解压，更新时同时替换。
+同时生成客户端和会话启动器。便携包包含两者，会话启动器位于 `bin/` 子目录；请完整解压，更新时同时替换。
 只构建 `--bin starbridge-client` 会缺少启动器，启动内置 SSH 时将明确报错。
 手动使用 `cargo run` 前，也需先运行 `cargo build --locked -p starbridge-client --bins`；
 仓库的 Windows 批处理入口和 `tools/start-local.ps1` 已包含这一步。

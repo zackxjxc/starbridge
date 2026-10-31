@@ -1521,7 +1521,17 @@ fn sshd_command(program: &FsPath) -> anyhow::Result<tokio::process::Command> {
 
 #[cfg(windows)]
 fn sshd_session_launcher() -> anyhow::Result<PathBuf> {
-    Ok(std::env::current_exe()?.with_file_name("starbridge-ssh-session.exe"))
+    let executable = std::env::current_exe()?;
+    let directory = executable
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("无法确定客户端程序目录"))?;
+    let packaged = directory.join("bin").join("starbridge-ssh-session.exe");
+    if packaged.is_file() {
+        return Ok(packaged);
+    }
+    // Development builds place cargo's second binary next to the client. Keep
+    // that layout working while portable packages use the cleaner bin/ folder.
+    Ok(directory.join("starbridge-ssh-session.exe"))
 }
 
 fn pick_port(start: u16, end: u16) -> anyhow::Result<u16> {
